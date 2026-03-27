@@ -13,7 +13,6 @@ from slicer.ScriptedLoadableModule import (
     ScriptedLoadableModuleLogic,
 )
 from slicer.util import VTKObservationMixin
-import SampleData
 from models import cfg
 from collections import deque
 from PIL import Image
@@ -72,7 +71,6 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         global breastModelPredict
         global ct_segmentator
         global torch
-        global cv2
         global timm
         global einops
         global gdown
@@ -187,13 +185,6 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             ):
                 slicer.util.pip_install("blosc2")
 
-        try:
-            import totalsegmentator
-        except ModuleNotFoundError:
-            if slicer.util.confirmOkCancelDisplay(
-                "totalsegmentator package is missing. Click OK to install it now!"
-            ):
-                slicer.util.pip_install("totalsegmentator --user")
 
         
         try:
@@ -362,18 +353,6 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         except ModuleNotFoundError:
             raise RuntimeError("There is a problem about the installation of 'segment-anything' package. Please try again to install!")
         
-        try:
-            import cv2
-        except ModuleNotFoundError:
-            if slicer.util.confirmOkCancelDisplay(
-                "'open-cv' is missing. Click OK to install it now!"
-            ): 
-                slicer.util.pip_install("opencv-python")
-
-        try: 
-            import cv2
-        except ModuleNotFoundError:
-            raise RuntimeError("There is a problem about the installation of 'open-cv' package. Please try again to install!")
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print("Working on", self.device)
@@ -409,6 +388,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         """
         Called when the user opens the module the first time and the widget is initialized.
         """
+        #DO　NOT DELETE THIS -- otherwise the "reload button will disappear"
         ScriptedLoadableModuleWidget.setup(self)
 
         uiWidget = slicer.util.loadUI(self.resourcePath("UI/SegmentHumanBody.ui"))
@@ -440,7 +420,17 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.modelDropDown.connect("currentIndexChanged(int)", self.updateParameterNodeFromGUI)
 
         self.segmentIdToSegmentationMask = {}
+        
+        self.ui.modelDropDown.blockSignals(True)
+        self.ui.maskDropDown.blockSignals(True)
+        self.ui.segmentationDropDown.blockSignals(True)
+
         self.initializeParameterNode()
+
+        self.ui.modelDropDown.blockSignals(False)
+        self.ui.maskDropDown.blockSignals(False)
+        self.ui.segmentationDropDown.blockSignals(False)
+        print('reloaded')
 
     def cleanup(self):
         """
@@ -453,7 +443,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         Called each time the user opens this module.
         """
         # Make sure parameter node exists and observed
-        self.initializeParameterNode()
+        # self.initializeParameterNode()
 
     def exit(self):
         """
@@ -481,50 +471,109 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         """
         Ensure parameter node exists and observed.
         """
-        # Parameter node stores all user choices in parameter values, node selections, etc.
-        # so that when the scene is saved and reloaded, these settings are restored.
-        #         
+
         self.setParameterNode(self.logic.getParameterNode())
 
+        # --- Create nodes if missing ---
         if not self._parameterNode.GetNodeReferenceID("positivePromptPointsNode"):
-            newPromptPointNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode", "positive")
+            newPromptPointNode = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLMarkupsFiducialNode", "positive"
+            )
             newPromptPointNode.GetDisplayNode().SetSelectedColor(0, 1, 0)
-            self._parameterNode.SetNodeReferenceID("positivePromptPointsNode", newPromptPointNode.GetID())
+            self._parameterNode.SetNodeReferenceID(
+                "positivePromptPointsNode", newPromptPointNode.GetID()
+            )
 
         if not self._parameterNode.GetNodeReferenceID("negativePromptPointsNode"):
-            newPromptPointNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode", "negative")
+            newPromptPointNode = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLMarkupsFiducialNode", "negative"
+            )
             newPromptPointNode.GetDisplayNode().SetSelectedColor(1, 0, 0)
-            self._parameterNode.SetNodeReferenceID("negativePromptPointsNode", newPromptPointNode.GetID())
+            self._parameterNode.SetNodeReferenceID(
+                "negativePromptPointsNode", newPromptPointNode.GetID()
+            )
 
-        self.ui.positivePrompts.setCurrentNode(self._parameterNode.GetNodeReference("positivePromptPointsNode"))
-        self.ui.negativePrompts.setCurrentNode(self._parameterNode.GetNodeReference("negativePromptPointsNode"))
+        self.ui.positivePrompts.setCurrentNode(
+            self._parameterNode.GetNodeReference("positivePromptPointsNode")
+        )
+        self.ui.negativePrompts.setCurrentNode(
+            self._parameterNode.GetNodeReference("negativePromptPointsNode")
+        )
 
+        # --- Create segmentation node if missing ---
         if not self._parameterNode.GetNodeReferenceID("SAMSegmentationNode"):
+            self.samSegmentationNode = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLSegmentationNode", "Segmentation"
+            )
+            self.samSegmentationNode.CreateDefaultDisplayNodes()
+            firstSegmentId = self.samSegmentationNode.GetSegmentation().AddEmptySegment("bone")
 
-            self.samSegmentationNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLSegmentationNode', 'Segmentation')
-            self.samSegmentationNode.CreateDefaultDisplayNodes() 
-            self.firstSegmentId = self.samSegmentationNode.GetSegmentation().AddEmptySegment("bone")
-            
-            self._parameterNode.SetNodeReferenceID("SAMSegmentationNode", self.samSegmentationNode.GetID())
-            self._parameterNode.SetParameter("SAMCurrentSegment", self.firstSegmentId)
+            self._parameterNode.SetNodeReferenceID(
+                "SAMSegmentationNode", self.samSegmentationNode.GetID()
+            )
+            self._parameterNode.SetParameter("SAMCurrentSegment", firstSegmentId)
             self._parameterNode.SetParameter("SAMCurrentMask", "Mask-1")
+            self._parameterNode.SetParameter("SAMCurrentModel", "SegmentAnyBone")
 
-            self.ui.segmentationDropDown.addItem(self.samSegmentationNode.GetSegmentation().GetNthSegment(0).GetName())
-            for i in range(2):
-                self.ui.maskDropDown.addItem("Mask-" + str(i+1))
 
-            self.ui.modelDropDown.addItem("SegmentAnyBone")
-            self.ui.modelDropDown.addItem("Breast Segmentation Model")
-            self.ui.modelDropDown.addItem("SegmentAnyMuscle")
-            self.ui.modelDropDown.addItem("CT Segmentation")
+        # Block signals to avoid unwanted callbacks
+        self.ui.segmentationDropDown.blockSignals(True)
+        self.ui.maskDropDown.blockSignals(True)
+        self.ui.modelDropDown.blockSignals(True)
 
-            self.ui.ctSegmentationModelDropdown.addItem("Custom")
-            self.ui.ctSegmentationModelDropdown.addItem("2D")
-            self.ui.ctSegmentationModelDropdown.addItem("3D")
-            self.ui.ctSegmentationModelDropdown.addItem("Both")
-            
+        # --- Segmentation dropdown ---
+        self.ui.segmentationDropDown.clear()
+        segmentationNode = self._parameterNode.GetNodeReference("SAMSegmentationNode")
 
-            self.ui.modelDropDown.addItem("SLM-SAM 2")
+        if segmentationNode:
+            seg = segmentationNode.GetSegmentation()
+            for i in range(seg.GetNumberOfSegments()):
+                self.ui.segmentationDropDown.addItem(seg.GetNthSegment(i).GetName())
+
+        # --- Mask dropdown ---
+        self.ui.maskDropDown.clear()
+        for i in range(2):
+            self.ui.maskDropDown.addItem(f"Mask-{i+1}")
+
+        # --- Model dropdown ---
+        self.ui.modelDropDown.clear()
+        self.ui.modelDropDown.addItems([
+            "SegmentAnyBone",
+            "Breast Segmentation Model",
+            "SegmentAnyMuscle",
+            "CT Segmentation",
+            "SLM-SAM 2"
+        ])
+
+        # --- CT model dropdown ---
+        self.ui.ctSegmentationModelDropdown.clear()
+        self.ui.ctSegmentationModelDropdown.addItems([
+            "Custom",
+            "2D",
+            "3D",
+            "Both"
+        ])
+
+        # --- Restore selections ---
+        if self._parameterNode.GetParameter("SAMCurrentSegment"):
+            segId = self._parameterNode.GetParameter("SAMCurrentSegment")
+            segName = segmentationNode.GetSegmentation().GetSegment(segId).GetName()
+            self.ui.segmentationDropDown.setCurrentText(segName)
+
+        if self._parameterNode.GetParameter("SAMCurrentMask"):
+            self.ui.maskDropDown.setCurrentText(
+                self._parameterNode.GetParameter("SAMCurrentMask")
+            )
+
+        if self._parameterNode.GetParameter("SAMCurrentModel"):
+            self.ui.modelDropDown.setCurrentText(
+                self._parameterNode.GetParameter("SAMCurrentModel")
+            )
+
+        # Re-enable signals
+        self.ui.segmentationDropDown.blockSignals(False)
+        self.ui.maskDropDown.blockSignals(False)
+        self.ui.modelDropDown.blockSignals(False)
 
             
     def setParameterNode(self, inputParameterNode):
@@ -786,31 +835,6 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             )
 
 
-    """def sam2AnnotationToolTraining(self):
-        
-        img_vol_data, mask_vol_data = self.sam2AnnotationTool.load_data(
-            img_path=self.resourcePath("UI") + "/../../models/sam2_annotation_tool/example_train_data/img.npy",
-            mask_path=self.resourcePath("UI") + "/../../models/sam2_annotation_tool/example_train_data/mask.npy"
-        )
-
-        self.sam2AnnotationTool.train(
-            data_save_directory=self.resourcePath("UI") + "/../../models/sam2_annotation_tool/example_train_data/",
-            img_save_directory=self.resourcePath("UI") + "/../../models/sam2_annotation_tool/example_train_data/images",
-            mask_save_directory=self.resourcePath("UI") + "/../../models/sam2_annotation_tool/example_train_data/masks",
-            volume_name="volume",
-            img_vol_data=img_vol_data,
-            mask_vol_data=mask_vol_data,
-            config=self.resourcePath("UI") + "/../../models/sam2_annotation_tool/sam2/configs/sam2.1_training/lstm_sam2.1_hiera_t_mobile.yaml",
-            use_cluster=0,
-            partition=None,
-            account=None,
-            qos=None,
-            num_gpus=1,
-            num_nodes=None
-        )
-    """
-
-
     def getSliceBasedOnSliceAccessorDimension(self, sliceIndex):
         if self.sliceAccessorDimension == 0:
             return self.volume[sliceIndex, :, :]
@@ -839,7 +863,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             #if filename in ('slice_68.npy', 'slice_69.npy', 'slice_70.npy'):
             image = np.load(self.slicesFolder + "/" + filename)
             image = (255 * (image - np.min(image)) / np.ptp(image)).astype(np.uint8)
-            image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+            image = np.stack([image]*3, axis=-1)
             self.sam.set_image(image)
 
             with open(self.featuresFolder + "/" + os.path.splitext(filename)[0] + "_features.pkl", "wb") as f:
