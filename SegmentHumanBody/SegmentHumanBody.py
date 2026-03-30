@@ -365,8 +365,10 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def changeModel(self, modelName):
         self.modelName = modelName
 
-        if modelName == "SegmentAnyBone":
+        if modelName == "SLM-SAM 2":
+            self.initializeVariables()
 
+        elif modelName == "SegmentAnyBone":
             model = sab_model_registry[self.modelVersion](args,checkpoint=self.modelCheckpoint,num_classes=2)
             model.to(device=self.device).eval()
             self.sam = SabPredictor(model)
@@ -377,9 +379,6 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         elif modelName == "Breast Segmentation Model":
             
             pass
-
-        elif modelName == "SLM-SAM 2":
-            self.initializeVariables()
 
         elif modelName == "CT Segmentation":
             pass
@@ -411,7 +410,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.runAutomaticSegmentation.connect("clicked(bool)", self.onAutomaticSegmentation)
         self.ui.assignLabel2D.connect('clicked(bool)', self.onAssignLabel2D)
         self.ui.assignLabel3D.connect('clicked(bool)', self.onAssignLabelIn3D)
-        #self.ui.startTrainingForSAM2ToolButton.connect('clicked(bool)', self.sam2AnnotationToolTraining)
+        # self.ui.startTrainingForSAM2ToolButton.connect('clicked(bool)', self.sam2AnnotationToolTraining)
         self.ui.startInferenceForSAM2ToolButton.connect('clicked(bool)', self.sam2AnnotationToolInference)
         self.ui.segmentButton.connect("clicked(bool)", self.onStartSegmentation)
         self.ui.stopSegmentButton.connect("clicked(bool)", self.onStopSegmentButton)
@@ -430,7 +429,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.modelDropDown.blockSignals(False)
         self.ui.maskDropDown.blockSignals(False)
         self.ui.segmentationDropDown.blockSignals(False)
-        print('reloaded')
+        print('loaded')
+
 
     def cleanup(self):
         """
@@ -443,7 +443,6 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         Called each time the user opens this module.
         """
         # Make sure parameter node exists and observed
-        # self.initializeParameterNode()
 
     def exit(self):
         """
@@ -538,6 +537,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # --- Model dropdown ---
         self.ui.modelDropDown.clear()
         self.ui.modelDropDown.addItems([
+            'SPX-Assisted Annotation',
             "SegmentAnyBone",
             "Breast Segmentation Model",
             "SegmentAnyMuscle",
@@ -570,10 +570,15 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 self._parameterNode.GetParameter("SAMCurrentModel")
             )
 
+        self.render_Widgets_by_Method(self.ui.modelDropDown.currentText)
         # Re-enable signals
         self.ui.segmentationDropDown.blockSignals(False)
         self.ui.maskDropDown.blockSignals(False)
         self.ui.modelDropDown.blockSignals(False)
+        
+        
+
+
 
             
     def setParameterNode(self, inputParameterNode):
@@ -629,6 +634,52 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         self._updatingGUIFromParameterNode = False
 
+    def render_minimalist_layout(self):
+        self.ui.assignLabel2D.hide()
+        self.ui.assignLabel3D.hide()
+        self.ui.goToMarkupsButton.hide()
+        self.ui.segmentButton.hide()
+        self.ui.stopSegmentButton.hide()
+        self.ui.segmentationDropDown.hide()
+        self.ui.maskDropDown.hide()
+        self.ui.ctSegmentationModelDropdown.hide()
+        self.ui.startTrainingForSAM2ToolButton.hide()
+        self.ui.startInferenceForSAM2ToolButton.hide()
+        self.ui.runAutomaticSegmentation.hide()
+    
+    def render_interactive_seg_layout(self):
+        self.ui.assignLabel2D.show()
+        self.ui.assignLabel3D.show()
+        self.ui.goToMarkupsButton.show()
+        self.ui.segmentButton.show()
+        self.ui.stopSegmentButton.show()
+        self.ui.segmentationDropDown.show()
+        self.ui.maskDropDown.show()
+    
+    
+    def render_Widgets_by_Method(self, methodName):
+        self.render_minimalist_layout()
+        if methodName == 'SPX-Assisted Annotation':
+            self.ui.runAutomaticSegmentation.show()
+
+        elif self.ui.modelDropDown.currentText == "Breast Segmentation Model" or self.ui.modelDropDown.currentText == "SegmentAnyMuscle":
+            self.ui.runAutomaticSegmentation.show()
+
+        elif self.ui.modelDropDown.currentText == "SegmentAnyBone":
+            self.render_interactive_seg_layout()
+
+
+        elif self.ui.modelDropDown.currentText == "CT Segmentation":
+            self.ui.ctSegmentationModelDropdown.show()
+            self.ui.runAutomaticSegmentation.show()
+
+        elif self.ui.modelDropDown.currentText == "SLM-SAM 2":
+            self.ui.ctSegmentationModelDropdown.show()
+            self.ui.startInferenceForSAM2ToolButton.show()
+        else:
+            assert False, 'Invalid Method Name'
+
+
     def updateParameterNodeFromGUI(self, caller=None, event=None):
         """
         This method is called when the user makes any change in the GUI.
@@ -637,61 +688,15 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if self._parameterNode is None or self._updatingGUIFromParameterNode:
             return
 
-        if self._parameterNode.GetParameter("SAMCurrentModel") != self.ui.modelDropDown.currentText:
-            print(self._parameterNode.GetParameter("SAMCurrentModel"), "=>", self.ui.modelDropDown.currentText)
-            self.changeModel(self.ui.modelDropDown.currentText)
-            if self.ui.modelDropDown.currentText == "Breast Segmentation Model" or self.ui.modelDropDown.currentText == "SegmentAnyMuscle":
-                self.ui.assignLabel2D.hide()
-                self.ui.assignLabel3D.hide()
-                self.ui.goToMarkupsButton.hide()
-                self.ui.segmentButton.hide()
-                self.ui.stopSegmentButton.hide()
-                self.ui.segmentationDropDown.hide()
-                self.ui.maskDropDown.hide()
-                self.ui.ctSegmentationModelDropdown.hide()
-                self.ui.startTrainingForSAM2ToolButton.hide()
-                self.ui.startInferenceForSAM2ToolButton.hide()
+        newMethodName = self.ui.modelDropDown.currentText
+        if self._parameterNode.GetParameter("SAMCurrentModel") != newMethodName:
+            
+            print(self._parameterNode.GetParameter("SAMCurrentModel"), "=>", newMethodName)
+            
+            self.changeModel(newMethodName)
+            self.render_Widgets_by_Method(newMethodName)
 
-            if self.ui.modelDropDown.currentText == "SegmentAnyBone":
-                self.ui.assignLabel2D.show()
-                self.ui.assignLabel3D.show()
-                self.ui.goToMarkupsButton.show()
-                self.ui.segmentButton.show()
-                self.ui.stopSegmentButton.show()
-                self.ui.segmentationDropDown.show()
-                self.ui.maskDropDown.show()
-                self.ui.ctSegmentationModelDropdown.hide()
-                self.ui.startTrainingForSAM2ToolButton.hide()
-                self.ui.startInferenceForSAM2ToolButton.hide()
-
-
-            if self.ui.modelDropDown.currentText == "CT Segmentation":
-                self.ui.assignLabel2D.hide()
-                self.ui.assignLabel3D.hide()
-                self.ui.goToMarkupsButton.hide()
-                self.ui.segmentButton.hide()
-                self.ui.stopSegmentButton.hide()
-                self.ui.segmentationDropDown.hide()
-                self.ui.maskDropDown.hide()
-                self.ui.ctSegmentationModelDropdown.show()
-                self.ui.startTrainingForSAM2ToolButton.hide()
-                self.ui.startInferenceForSAM2ToolButton.hide()
-
-            if self.ui.modelDropDown.currentText == "SLM-SAM 2":
-                self.ui.assignLabel2D.hide()
-                self.ui.assignLabel3D.hide()
-                self.ui.goToMarkupsButton.hide()
-                self.ui.segmentButton.hide()
-                self.ui.stopSegmentButton.hide()
-                self.ui.segmentationDropDown.hide()
-                self.ui.maskDropDown.hide()
-                self.ui.ctSegmentationModelDropdown.show()
-                self.ui.startTrainingForSAM2ToolButton.hide()
-                self.ui.runAutomaticSegmentation.hide()
-                self.ui.ctSegmentationModelDropdown.hide()
-                self.ui.startInferenceForSAM2ToolButton.show()
-
-            self._parameterNode.SetParameter("SAMCurrentModel", self.ui.modelDropDown.currentText)
+            self._parameterNode.SetParameter("SAMCurrentModel", newMethodName)
 
         if not self._parameterNode.GetNodeReference("SAMSegmentationNode") or not hasattr(self, 'volumeShape'):
             return
@@ -1081,7 +1086,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def onAutomaticSegmentation(self):
         if not self.initializeVariables():
-            return
+            return    
+
         
         if self.modelName == "SegmentAnyBone":
 
