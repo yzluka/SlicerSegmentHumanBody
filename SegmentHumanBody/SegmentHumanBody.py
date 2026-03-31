@@ -62,6 +62,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         """
         Called when the user opens the module the first time and the widget is initialized.
         """
+        self._isInitializing = True
         global sam_model_registry
         global SamPredictor
         global sab_model_registry
@@ -395,6 +396,10 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui = slicer.util.childWidgetVariables(uiWidget)
         uiWidget.setMRMLScene(slicer.mrmlScene)
         self.logic = SegmentHumanBodyLogic()
+        self.segmentIdToSegmentationMask = {}
+        
+        self.initializeParameterNode()
+
 
         # Connections
         self.addObserver(slicer.mrmlScene, slicer.mrmlScene.StartCloseEvent, self.onSceneStartClose)
@@ -418,17 +423,6 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.maskDropDown.connect("currentIndexChanged(int)", self.updateParameterNodeFromGUI)
         self.ui.modelDropDown.connect("currentIndexChanged(int)", self.updateParameterNodeFromGUI)
 
-        self.segmentIdToSegmentationMask = {}
-        
-        self.ui.modelDropDown.blockSignals(True)
-        self.ui.maskDropDown.blockSignals(True)
-        self.ui.segmentationDropDown.blockSignals(True)
-
-        self.initializeParameterNode()
-
-        self.ui.modelDropDown.blockSignals(False)
-        self.ui.maskDropDown.blockSignals(False)
-        self.ui.segmentationDropDown.blockSignals(False)
         print('loaded')
 
 
@@ -1223,7 +1217,6 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             outputPath = self.resourcePath("UI") + "/../../models/ct_segmentation/results"
             slicer.util.saveNode(volumeNode, inputPath)
 
-            #segmentation, metrics = ct_segmentator.segmentVolume(input_path=inputPath.replace("\\", "/"), body_composition_type="custom", output_path=outputPath.replace("\\", "/"))
             os.system("python C:/Users/zafry/SlicerSegmentHumanBody/SegmentHumanBody/models/ct_segmentation/predict_muscle_fat.py")
             
 
