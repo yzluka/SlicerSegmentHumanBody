@@ -23,3 +23,10 @@ def extract_connected_component(mask: np.ndarray, point_xy):
     seed_mask[seed] = True
 
     return binary_propagation(seed_mask, mask=mask)
+
+
+def call_if_exists(obj, method):
+    if hasattr(obj, method):
+        getattr(obj, method)()
+    else:
+        print(f"[Missing] {method}")

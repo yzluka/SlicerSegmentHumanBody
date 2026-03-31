@@ -1,6 +1,4 @@
-import numpy as np
 import qt
-import vtk
 import slicer
 from slicer.ScriptedLoadableModule import (
     ScriptedLoadableModule,
@@ -8,83 +6,53 @@ from slicer.ScriptedLoadableModule import (
     ScriptedLoadableModuleLogic,
 )
 from slicer.util import VTKObservationMixin
-from behavior import InteractiveBehavior, SPXBehavior, AutoBehavior
-# =========================
+
+from shb_models import BaseModel, InteractiveModel, SPXModel, AutoModel
+from utils import call_if_exists
+
+
+#
 # Module
-# =========================
+#
 
 class SegmentHumanBody(ScriptedLoadableModule):
     def __init__(self, parent):
         super().__init__(parent)
-        self.parent.title = "SegmentHumanBody (Modular Stub)"
+        self.parent.title = "SegmentHumanBody (Final Template)"
         self.parent.categories = ["Segmentation"]
 
 
-# =========================
-# Interaction State
-# =========================
-
-class InteractionState:
-    def __init__(self):
-        self.segment = None
-        self.mask = None
-        self.mode = None
-
-    def update(self, segment, mask, mode):
-        self.segment = segment
-        self.mask = mask
-        self.mode = mode
-        print(f"[State] seg={segment}, mask={mask}, mode={mode}")
-
-
-# =========================
-# Prompt Collector
-# =========================
-
-class PromptCollector:
-    def __init__(self, paramNode):
-        self.paramNode = paramNode
-
-    def get_positive_points(self):
-        node = self.paramNode.GetNodeReference("positivePromptPointsNode")
-        n = node.GetNumberOfControlPoints()
-        print(f"[Points] {n}")
-        return node
-
-    def get_rois(self):
-        rois = slicer.util.getNodesByClass("vtkMRMLMarkupsROINode")
-        print(f"[ROIs] {len(rois)}")
-        return rois
-
-
-# =========================
-# Renderer (loop)
-# =========================
+#
+# Renderer (kept here)
+#
 
 class SegmentationRenderer:
     def __init__(self, widget):
         self.widget = widget
+        self.running = False
 
     def start(self):
-        self.widget.currentlySegmenting = True
+        print("[Renderer] start")
+        self.running = True
         self.update()
 
     def stop(self):
-        self.widget.currentlySegmenting = False
+        print("[Renderer] stop")
+        self.running = False
 
     def update(self):
-        if self.widget.currentlySegmenting:
+        if self.running:
             print("[Renderer] updating...")
 
-            self.widget.prompts.get_positive_points()
-            self.widget.prompts.get_rois()
+            # optional: model-specific render hook
+            call_if_exists(self.widget.model, "on_render")
 
         qt.QTimer.singleShot(100, self.update)
 
 
-# =========================
+#
 # Widget
-# =========================
+#
 
 class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
@@ -94,154 +62,168 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         self.logic = SegmentHumanBodyLogic()
         self._parameterNode = None
-        self._updatingGUIFromParameterNode = False
 
-        self.currentlySegmenting = False
-
-        # modular components
-        self.state = InteractionState()
-        self.prompts = None
-        self.renderer = None
+        # model system
+        self.model = None
+        self.model_cache = {}
 
     # -------------------------
     # Setup
     # -------------------------
     def setup(self):
         super().setup()
-        self.behavior = SegmentHumanBodyBehavior(self)
 
         uiWidget = slicer.util.loadUI(self.resourcePath("UI/SegmentHumanBody.ui"))
         self.layout.addWidget(uiWidget)
         self.ui = slicer.util.childWidgetVariables(uiWidget)
-        uiWidget.setMRMLScene(slicer.mrmlScene)
 
-        self.initializeParameterNode()
+        # --- model registry ---
+        self.model_classes = {
+            "Interactive": InteractiveModel,
+            "SPX-Assisted Annotation": SPXModel,
+            "Auto": AutoModel,
+        }
 
-        # modules
-        self.prompts = PromptCollector(self._parameterNode)
+        # --- renderer ---
         self.renderer = SegmentationRenderer(self)
 
+        self.initializeUI()
         self.connectSignals()
-
-        print("[Setup] complete")
+        print("[Setup complete]")
 
     # -------------------------
-    # Connections
+    # Signals
     # -------------------------
     def connectSignals(self):
-        self.ui.segmentButton.connect("clicked(bool)", self.onStart)
-        self.ui.stopSegmentButton.connect("clicked(bool)", self.onStop)
 
-        self.ui.modelDropDown.connect("currentIndexChanged(int)", self.onUIChanged)
-        self.ui.maskDropDown.connect("currentIndexChanged(int)", self.onUIChanged)
-        self.ui.segmentationDropDown.connect("currentIndexChanged(int)", self.onUIChanged)
+        connections = [
+            ("segmentButton", "on_start"),
+            ("stopSegmentButton", "on_stop"),
+            ("assignLabel2D", "on_assign_2d"),
+            ("assignLabel3D", "on_assign_3d"),
+            ("goToSegmentEditorButton", "on_go_to_editor"),
+            ("goToMarkupsButton", "on_go_to_markups"),
+        ]
 
-        self.ui.positivePrompts.connect("markupsNodeChanged()", self.onUIChanged)
-        self.ui.negativePrompts.connect("markupsNodeChanged()", self.onUIChanged)
+        for ui_name, method in connections:
+            widget = getattr(self.ui, ui_name)
 
-    # -------------------------
-    # Parameter Node
-    # -------------------------
-    def initializeParameterNode(self):
-        self.setParameterNode(self.logic.getParameterNode())
+            widget.connect(
+                "clicked(bool)",
+                lambda _, m=method: call_if_exists(self.model, m)
+            )
 
-        # Input volume
-        if not self._parameterNode.GetNodeReference("InputVolume"):
-            volumeNode = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLScalarVolumeNode")
-            if volumeNode:
-                self._parameterNode.SetNodeReferenceID("InputVolume", volumeNode.GetID())
-
-        # Prompt nodes
-        if not self._parameterNode.GetNodeReferenceID("positivePromptPointsNode"):
-            node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode", "positive")
-            node.GetDisplayNode().SetSelectedColor(0, 1, 0)
-            self._parameterNode.SetNodeReferenceID("positivePromptPointsNode", node.GetID())
-
-        if not self._parameterNode.GetNodeReferenceID("negativePromptPointsNode"):
-            node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode", "negative")
-            node.GetDisplayNode().SetSelectedColor(1, 0, 0)
-            self._parameterNode.SetNodeReferenceID("negativePromptPointsNode", node.GetID())
-
-        self.ui.positivePrompts.setCurrentNode(
-            self._parameterNode.GetNodeReference("positivePromptPointsNode")
-        )
-        self.ui.negativePrompts.setCurrentNode(
-            self._parameterNode.GetNodeReference("negativePromptPointsNode")
+        # dropdown handled separately
+        self.ui.modelDropDown.connect(
+            "currentIndexChanged(int)", self.onModeChanged
         )
 
-        # Segmentation
-        if not self._parameterNode.GetNodeReferenceID("SegmentationNode"):
-            segNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode")
-            segNode.CreateDefaultDisplayNodes()
-            segId = segNode.GetSegmentation().AddEmptySegment("Segment_1")
+    def updateUIVisibility(self):
+        mapping = [
+            ("assignLabel2D", "on_assign_2d"),
+            ("assignLabel3D", "on_assign_3d"),
+            ("segmentButton", "on_start"),
+            ("stopSegmentButton", "on_stop"),
+        ]
 
-            self._parameterNode.SetNodeReferenceID("SegmentationNode", segNode.GetID())
-            self._parameterNode.SetParameter("CurrentSegment", segId)
+        for ui_name, method in mapping:
+            widget = getattr(self.ui, ui_name)
+            widget.setVisible(hasattr(self.model, method))
+    
+    def initializeUI(self):
+        """Populate all dropdowns"""
 
-        # Dropdowns
-        self.ui.segmentationDropDown.clear()
-        segNode = self._parameterNode.GetNodeReference("SegmentationNode")
-        if segNode:
-            seg = segNode.GetSegmentation()
-            for i in range(seg.GetNumberOfSegments()):
-                self.ui.segmentationDropDown.addItem(seg.GetNthSegment(i).GetName())
+        # -------------------------
+        # Block signals (prevent early triggers)
+        # -------------------------
+        dropdowns = [
+            "modelDropDown",
+            "maskDropDown",
+            "segmentationDropDown",
+            "ctSegmentationModelDropdown",
+        ]
 
-        self.ui.maskDropDown.clear()
-        self.ui.maskDropDown.addItems(["Mask-1", "Mask-2"])
+        for name in dropdowns:
+            if hasattr(self.ui, name):
+                getattr(self.ui, name).blockSignals(True)
 
-        self.ui.modelDropDown.clear()
-        self.ui.modelDropDown.addItems([
-            "SPX-Assisted Annotation",
-            "Interactive",
-            "Auto"
-        ])
+        # -------------------------
+        # Model dropdown (auto from registry)
+        # -------------------------
+        if hasattr(self.ui, "modelDropDown"):
+            self.ui.modelDropDown.clear()
+            self.ui.modelDropDown.addItems(list(self.model_classes.keys()))
+            self.ui.modelDropDown.setCurrentIndex(0)
+
+        # -------------------------
+        # Mask dropdown
+        # -------------------------
+        if hasattr(self.ui, "maskDropDown"):
+            self.ui.maskDropDown.clear()
+            self.ui.maskDropDown.addItems(["Mask-1", "Mask-2"])
+            self.ui.maskDropDown.setCurrentIndex(0)
+
+        # -------------------------
+        # Segmentation dropdown
+        # -------------------------
+        if hasattr(self.ui, "segmentationDropDown"):
+            self.ui.segmentationDropDown.clear()
+
+            segNode = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLSegmentationNode")
+
+            if segNode:
+                seg = segNode.GetSegmentation()
+                for i in range(seg.GetNumberOfSegments()):
+                    self.ui.segmentationDropDown.addItem(seg.GetNthSegment(i).GetName())
+
+            # fallback if none exists
+            if self.ui.segmentationDropDown.count == 0:
+                segNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode")
+                segNode.CreateDefaultDisplayNodes()
+                segNode.GetSegmentation().AddEmptySegment("Segment_1")
+
+                self.ui.segmentationDropDown.addItem("Segment_1")
+
+            self.ui.segmentationDropDown.setCurrentIndex(0)
+
+        # -------------------------
+        # Optional CT dropdown
+        # -------------------------
         if hasattr(self.ui, "ctSegmentationModelDropdown"):
             self.ui.ctSegmentationModelDropdown.clear()
             self.ui.ctSegmentationModelDropdown.addItems([
-                "Custom",
-                "2D",
-                "3D",
-                "Both"
+                "Custom", "2D", "3D", "Both"
             ])
+            self.ui.ctSegmentationModelDropdown.setCurrentIndex(0)
 
-    def setParameterNode(self, node):
-        self._parameterNode = node
+        # -------------------------
+        # Re-enable signals
+        # -------------------------
+        for name in dropdowns:
+            if hasattr(self.ui, name):
+                getattr(self.ui, name).blockSignals(False)
 
-    # -------------------------
-    # UI → State
-    # -------------------------
-    def onUIChanged(self, *args):
-        segNode = self._parameterNode.GetNodeReference("SegmentationNode")
-
-        segId = None
-        if segNode:
-            segId = segNode.GetSegmentation().GetSegmentIdBySegmentName(
-                self.ui.segmentationDropDown.currentText
-            )
-
-        self.state.update(
-            segId,
-            self.ui.maskDropDown.currentText,
-            self.ui.modelDropDown.currentText
-        )
-
-        print("[UI Changed]")
+        print("[UI Initialized]")
 
     # -------------------------
-    # Buttons
+    # Mode switching (lazy init)
     # -------------------------
-    def onStart(self):
-        print("[Start]")
-        self.renderer.start()
+    def onModeChanged(self, *args):
+        mode = self.ui.modelDropDown.currentText
+        print(f"[Mode Changed] {mode}")
 
-    def onStop(self):
-        print("[Stop]")
-        self.renderer.stop()
+        if mode not in self.model_cache:
+            ModelClass = self.model_classes.get(mode, BaseModel)
+            self.model_cache[mode] = ModelClass(self)
+
+        self.model = self.model_cache[mode]
+
+        print("[Model Ready]")
 
 
-# =========================
+#
 # Logic
-# =========================
+#
 
 class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
     def setDefaultParameters(self, parameterNode):
