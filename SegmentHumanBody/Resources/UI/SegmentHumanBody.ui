@@ -24,17 +24,14 @@
 					<item row="3" column="0" colspan="2">
 						<layout class="QHBoxLayout">
 							<item>
-								<widget class="QComboBox" name="modelDropDown"/>
+								<widget class="QComboBox" name="modelFamilyDropdown"/>
 							</item>
 						</layout>
 					</item>
 
-					<item row="3" column="0" colspan="2">
-						<widget class="QComboBox" name="segmentationDropDown"/>
-					</item>
 
 					<item row="3" column="3" colspan="2">
-						<widget class="QComboBox" name="maskDropDown">
+						<widget class="QComboBox" name="samMaskDropdown">
 							<property name="toolTip">
 								<string>SAM produces 3 masks for the same set of prompt inputs. You can select the most accurate mask among them:</string>
 							</property>
@@ -47,21 +44,22 @@
 				<layout class="QVBoxLayout">
 					<item>
 						<layout class="QHBoxLayout">
-							<item row="0" column="0" colspan="2">
-								<widget class="QPushButton" name="runAutomaticSegmentation">
-									<property name="text">
-										<string>Run Automatic Segmentation</string>
-									</property>
-								</widget>
-							</item>
 
 							<item row="0" column="3" colspan="2">
 								<layout class="QHBoxLayout">
 									<item>
-										<widget class="QComboBox" name="ctSegmentationModelDropdown"/>
+										<widget class="QComboBox" name="modelVariantDropdown"/>
 									</item>
 								</layout>
 							</item>
+
+							<item row="0" column="3" colspan="2">
+								<widget class="QPushButton" name="confirmModelSelection">
+									<property name="text">
+										<string>Confirm Model Selection</string>
+									</property>
+								</widget>
+							</item>							
 
 							<item row="0" column="3" colspan="2">
 								<widget class="QPushButton" name="assignLabel2D">
@@ -108,16 +106,16 @@
 					<item row="0" column="0" colspan="2">
 						<layout class="QHBoxLayout">
 							<item row="0" column="0" colspan="3">
-								<widget class="QPushButton" name="segmentButton">
+								<widget class="QPushButton" name="enterInteractiveModeButton">
 									<property name="text">
-										<string>Start Segmentation for Current Slice</string>
+										<string>Enter Interactive Mode</string>
 									</property>
 								</widget>
 							</item>
 							<item row="0" column="3" colspan="3">
-								<widget class="QPushButton" name="stopSegmentButton">
+								<widget class="QPushButton" name="stopInteractiveModeButton">
 									<property name="text">
-										<string>Stop Segmentation for Current Slice</string>
+										<string>Stop Interactive Mode</string>
 									</property>
 								</widget>
 							</item>
@@ -127,16 +125,16 @@
 					<item row="0" column="0" colspan="2">
 						<layout class="QHBoxLayout">
 							<item row="0" column="0" colspan="3">
-								<widget class="QPushButton" name="startTrainingForSAM2ToolButton">
+								<widget class="QPushButton" name="propagateSelectedLabelButton">
 									<property name="text">
-										<string>Start Training</string>
+										<string>Propogate Selected Label</string>
 									</property>
 								</widget>
 							</item>
 							<item row="0" column="3" colspan="3">
-								<widget class="QPushButton" name="startInferenceForSAM2ToolButton">
+								<widget class="QPushButton" name="runAutomaticSegmentation">
 									<property name="text">
-										<string>Start Inference</string>
+										<string>Run Automatic Segmentation</string>
 									</property>
 								</widget>
 							</item>

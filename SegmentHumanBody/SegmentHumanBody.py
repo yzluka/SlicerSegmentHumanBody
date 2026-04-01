@@ -1,5 +1,6 @@
-import qt
-import slicer
+import qt, vtk, slicer
+import logging
+
 from slicer.ScriptedLoadableModule import (
     ScriptedLoadableModule,
     ScriptedLoadableModuleWidget,
@@ -7,8 +8,14 @@ from slicer.ScriptedLoadableModule import (
 )
 from slicer.util import VTKObservationMixin
 
-from shb_models import BaseModel, InteractiveModel, SPXModel, AutoModel
-from utils import call_if_exists
+from core.modelFamilies import BaseModelFamily, InteractiveModelFamily, SPXModelFamily, AutoModelFamily
+from core.utils import call_if_exists
+
+
+log = logging.getLogger(__name__)
+
+POS_NODE = 'positivePromptPointsNode'
+NEG_NODE = 'negativePromptPointsNode'
 
 
 #
@@ -18,36 +25,30 @@ from utils import call_if_exists
 class SegmentHumanBody(ScriptedLoadableModule):
     def __init__(self, parent):
         super().__init__(parent)
-        self.parent.title = "SegmentHumanBody (Final Template)"
-        self.parent.categories = ["Segmentation"]
+        self.parent.title = 'SegmentHumanBody (Optimized)'
+        self.parent.categories = ['Segmentation']
 
 
 #
-# Renderer (kept here)
+# Renderer
 #
 
 class SegmentationRenderer:
     def __init__(self, widget):
         self.widget = widget
-        self.running = False
+        self.timer = qt.QTimer()
+        self.timer.timeout.connect(self.update)
 
     def start(self):
-        print("[Renderer] start")
-        self.running = True
-        self.update()
+        log.debug('[Renderer] start')
+        self.timer.start(100)
 
     def stop(self):
-        print("[Renderer] stop")
-        self.running = False
+        log.debug('[Renderer] stop')
+        self.timer.stop()
 
     def update(self):
-        if self.running:
-            print("[Renderer] updating...")
-
-            # optional: model-specific render hook
-            call_if_exists(self.widget.model, "on_render")
-
-        qt.QTimer.singleShot(100, self.update)
+        call_if_exists(self.widget.modelFamily, 'on_render')
 
 
 #
@@ -63,9 +64,9 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.logic = SegmentHumanBodyLogic()
         self._parameterNode = None
 
-        # model system
-        self.model = None
-        self.model_cache = {}
+        self.modelFamily = None
+
+        self._updatingGUI = False
 
     # -------------------------
     # Setup
@@ -73,152 +74,295 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def setup(self):
         super().setup()
 
-        uiWidget = slicer.util.loadUI(self.resourcePath("UI/SegmentHumanBody.ui"))
+        uiWidget = slicer.util.loadUI(self.resourcePath('UI/SegmentHumanBody.ui'))
+        uiWidget.setMRMLScene(slicer.mrmlScene)
+
         self.layout.addWidget(uiWidget)
         self.ui = slicer.util.childWidgetVariables(uiWidget)
 
-        # --- model registry ---
         self.model_classes = {
-            "Interactive": InteractiveModel,
-            "SPX-Assisted Annotation": SPXModel,
-            "Auto": AutoModel,
+            'None': BaseModelFamily,
+            'Interactive': InteractiveModelFamily,
+            'SPX-Assisted Annotation': SPXModelFamily,
+            'Auto': AutoModelFamily,
         }
 
-        # --- renderer ---
         self.renderer = SegmentationRenderer(self)
 
         self.initializeUI()
         self.connectSignals()
-        print("[Setup complete]")
+
+        # Lock selectors
+        self.ui.positivePrompts.setNodeSelectorVisible(False)
+        self.ui.negativePrompts.setNodeSelectorVisible(False)
+
+        qt.QTimer.singleShot(0, self._initializeAfterSetup)
+
+        log.debug('[Setup complete]')
+
+    def _initializeAfterSetup(self):
+        if not slicer.mrmlScene:
+            return
+
+        nodes = slicer.mrmlScene.GetNodesByClass('vtkMRMLMarkupsFiducialNode')
+
+        log.debug('[Existing markups nodes]:')
+        for i in range(nodes.GetNumberOfItems()):
+            node = nodes.GetItemAsObject(i)
+            log.debug(f' - {node.GetName()}')
+
+        self.initializeParameterNode()
+        self.setParameterNode(self._parameterNode)
+        self.onModelFamilyChanged()
 
     # -------------------------
     # Signals
     # -------------------------
     def connectSignals(self):
+        ui = self.ui
 
-        connections = [
-            ("segmentButton", "on_start"),
-            ("stopSegmentButton", "on_stop"),
-            ("assignLabel2D", "on_assign_2d"),
-            ("assignLabel3D", "on_assign_3d"),
-            ("goToSegmentEditorButton", "on_go_to_editor"),
-            ("goToMarkupsButton", "on_go_to_markups"),
+        button_connections = [
+            ('enterInteractiveModeButton', 'on_enter_interactive'),
+            ('stopInteractiveModeButton', 'on_stop_interactive'),
+            ('assignLabel2D', 'on_assign_2d'),
+            ('assignLabel3D', 'on_assign_3d'),
+            ('goToSegmentEditorButton', 'on_go_to_editor'),
+            ('goToMarkupsButton', 'on_go_to_markups'),
+            ('propagateSelectedLabelButton', 'on_propagate'),
+            ('runAutomaticSegmentation', 'on_automatic_segmentation'),            
         ]
 
-        for ui_name, method in connections:
-            widget = getattr(self.ui, ui_name)
+        for ui_name, method_name in button_connections:
+            widget = getattr(ui, ui_name)
 
             widget.connect(
-                "clicked(bool)",
-                lambda _, m=method: call_if_exists(self.model, m)
+                'clicked(bool)',
+                lambda _, name=method_name: call_if_exists(self.modelFamily, name)
             )
 
-        # dropdown handled separately
-        self.ui.modelDropDown.connect(
-            "currentIndexChanged(int)", self.onModeChanged
-        )
+        # model family and varaint dropdown
+        ui.modelFamilyDropdown.connect('currentIndexChanged(int)', self.onModelFamilyChanged)
+        ui.modelVariantDropdown.connect('currentIndexChanged(int)', self.onVariantChanged)
+ 
+        # model confirmation (dependency + loading)
+        self.ui.confirmModelSelection.connect( 'clicked(bool)', self.onConfirmClicked)
 
+    # -------------------------
+    # Observers
+    # -------------------------
+    def _observeMarkupsNodes(self):
+        self.removeObservers()
+
+        posNode = self._parameterNode.GetNodeReference(POS_NODE)
+        negNode = self._parameterNode.GetNodeReference(NEG_NODE)
+
+        for node in [posNode, negNode]:
+            if node:
+                self.addObserver(
+                    node,
+                    vtk.vtkCommand.ModifiedEvent,
+                    self.updateParameterNodeFromGUI
+                )
+
+    # -------------------------
+    # UI
+    # -------------------------
     def updateUIVisibility(self):
         mapping = [
-            ("assignLabel2D", "on_assign_2d"),
-            ("assignLabel3D", "on_assign_3d"),
-            ("segmentButton", "on_start"),
-            ("stopSegmentButton", "on_stop"),
+            ('assignLabel2D', 'on_assign_2d'),
+            ('assignLabel3D', 'on_assign_3d'),
+            ('enterInteractiveModeButton', 'on_enter_interactive'),
+            ('stopInteractiveModeButton', 'on_stop_interactive'),
+            ('propagateSelectedLabelButton', 'on_propagate'),
+            ('runAutomaticSegmentation', 'on_automatic_segmentation'),
+            ('goToMarkupsButton', 'on_go_to_markups'),
+
         ]
 
-        for ui_name, method in mapping:
-            widget = getattr(self.ui, ui_name)
-            widget.setVisible(hasattr(self.model, method))
-    
-    def initializeUI(self):
-        """Populate all dropdowns"""
+        ui = self.ui
 
-        # -------------------------
-        # Block signals (prevent early triggers)
-        # -------------------------
+        for ui_name, method in mapping:
+            widget = getattr(ui, ui_name)
+            widget.setVisible(hasattr(self.modelFamily, method))
+
+    def initializeUI(self):
         dropdowns = [
-            "modelDropDown",
-            "maskDropDown",
-            "segmentationDropDown",
-            "ctSegmentationModelDropdown",
+            'modelFamilyDropdown',
+            'samMaskDropdown',
+            'modelVariantDropdown'
         ]
 
         for name in dropdowns:
             if hasattr(self.ui, name):
                 getattr(self.ui, name).blockSignals(True)
 
-        # -------------------------
-        # Model dropdown (auto from registry)
-        # -------------------------
-        if hasattr(self.ui, "modelDropDown"):
-            self.ui.modelDropDown.clear()
-            self.ui.modelDropDown.addItems(list(self.model_classes.keys()))
-            self.ui.modelDropDown.setCurrentIndex(0)
+        self.ui.modelFamilyDropdown.clear()
+        self.ui.modelFamilyDropdown.addItems(list(self.model_classes.keys()))
 
-        # -------------------------
-        # Mask dropdown
-        # -------------------------
-        if hasattr(self.ui, "maskDropDown"):
-            self.ui.maskDropDown.clear()
-            self.ui.maskDropDown.addItems(["Mask-1", "Mask-2"])
-            self.ui.maskDropDown.setCurrentIndex(0)
+        self.ui.samMaskDropdown.clear()
+        self.ui.samMaskDropdown.addItems(['Mask-1', 'Mask-2', 'Mask-3'])
 
-        # -------------------------
-        # Segmentation dropdown
-        # -------------------------
-        if hasattr(self.ui, "segmentationDropDown"):
-            self.ui.segmentationDropDown.clear()
-
-            segNode = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLSegmentationNode")
-
-            if segNode:
-                seg = segNode.GetSegmentation()
-                for i in range(seg.GetNumberOfSegments()):
-                    self.ui.segmentationDropDown.addItem(seg.GetNthSegment(i).GetName())
-
-            # fallback if none exists
-            if self.ui.segmentationDropDown.count == 0:
-                segNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode")
-                segNode.CreateDefaultDisplayNodes()
-                segNode.GetSegmentation().AddEmptySegment("Segment_1")
-
-                self.ui.segmentationDropDown.addItem("Segment_1")
-
-            self.ui.segmentationDropDown.setCurrentIndex(0)
-
-        # -------------------------
-        # Optional CT dropdown
-        # -------------------------
-        if hasattr(self.ui, "ctSegmentationModelDropdown"):
-            self.ui.ctSegmentationModelDropdown.clear()
-            self.ui.ctSegmentationModelDropdown.addItems([
-                "Custom", "2D", "3D", "Both"
-            ])
-            self.ui.ctSegmentationModelDropdown.setCurrentIndex(0)
-
-        # -------------------------
-        # Re-enable signals
-        # -------------------------
         for name in dropdowns:
             if hasattr(self.ui, name):
                 getattr(self.ui, name).blockSignals(False)
 
-        print("[UI Initialized]")
+    # -------------------------
+    # Parameter Node
+    # -------------------------
+    def initializeParameterNode(self):
+        self._parameterNode = self.logic.getParameterNode()
+
+        if not self._parameterNode:
+            self._parameterNode = slicer.mrmlScene.AddNewNodeByClass(
+                'vtkMRMLScriptedModuleNode'
+            )
+
+        self.logic.setDefaultParameters(self._parameterNode)
+        self._ensurePromptNodesExist()
+    
+    def setParameterNode(self, inputParameterNode):
+        if self._parameterNode:
+            self.removeObserver(
+                self._parameterNode,
+                vtk.vtkCommand.ModifiedEvent,
+                self.updateGUIFromParameterNode
+            )
+
+        self._parameterNode = inputParameterNode
+
+        if self._parameterNode:
+            self.addObserver(
+                self._parameterNode,
+                vtk.vtkCommand.ModifiedEvent,
+                self.updateGUIFromParameterNode
+            )
+            self._observeMarkupsNodes()
+
+        qt.QTimer.singleShot(0, self.updateGUIFromParameterNode)
+
+    def _ensurePromptNodesExist(self):
+        configs = {
+            POS_NODE: ([0, 1, 0], 'positive'),
+            NEG_NODE: ([1, 0, 0], 'negative'),
+        }
+
+        for ref_name, (color, label) in configs.items():
+            if not self._parameterNode.GetNodeReference(ref_name):
+                node = slicer.mrmlScene.AddNewNodeByClass(
+                    'vtkMRMLMarkupsFiducialNode', label
+                )
+
+                node.CreateDefaultDisplayNodes()
+                displayNode = node.GetDisplayNode()
+
+                displayNode.SetSelectedColor(*color)
+                displayNode.SetColor(*color)
+                displayNode.SetActiveColor(*color)
+
+                node.SetHideFromEditors(True)
+
+                self._parameterNode.SetNodeReferenceID(
+                    ref_name, node.GetID()
+                )
+
+    def updateGUIFromParameterNode(self, caller=None, event=None):
+        if not self._parameterNode or self._updatingGUI:
+            return
+
+        self._updatingGUI = True
+        try:
+            self.ui.positivePrompts.setCurrentNode(
+                self._parameterNode.GetNodeReference(POS_NODE)
+            )
+            self.ui.negativePrompts.setCurrentNode(
+                self._parameterNode.GetNodeReference(NEG_NODE)
+            )
+        finally:
+            self._updatingGUI = False
+
+    def updateParameterNodeFromGUI(self, caller=None, event=None):
+        if not self._parameterNode:
+            return
+
+        posNode = self.ui.positivePrompts.currentNode()
+        negNode = self.ui.negativePrompts.currentNode()
+
+        self._parameterNode.SetNodeReferenceID(
+            POS_NODE, posNode.GetID() if posNode else None
+        )
+        self._parameterNode.SetNodeReferenceID(
+            NEG_NODE, negNode.GetID() if negNode else None
+        )
 
     # -------------------------
-    # Mode switching (lazy init)
+    # Model Switching
     # -------------------------
-    def onModeChanged(self, *args):
-        mode = self.ui.modelDropDown.currentText
-        print(f"[Mode Changed] {mode}")
+    def onModelFamilyChanged(self, *args):
+        self.setConfirmState(False)
+        modelFamilyName = self.ui.modelFamilyDropdown.currentText
 
-        if mode not in self.model_cache:
-            ModelClass = self.model_classes.get(mode, BaseModel)
-            self.model_cache[mode] = ModelClass(self)
+        ModelClass = self.model_classes.get(modelFamilyName, BaseModelFamily)
 
-        self.model = self.model_cache[mode]
+        # 🔥 create fresh instance (no cache)
+        self.modelFamily = ModelClass(self)
 
-        print("[Model Ready]")
+        # update variants AFTER creation
+        self.updateModelVariants()
+
+        # update UI buttons
+        self.updateUIVisibility()
+    
+    def updateModelVariants(self):
+        dropdown = self.ui.modelVariantDropdown
+
+        dropdown.blockSignals(True)
+        dropdown.clear()
+
+        if self.modelFamily and hasattr(self.modelFamily, "VARIANTS"):
+            variants = self.modelFamily.VARIANTS
+        else:
+            variants = ["None"]
+
+        dropdown.addItems(variants)
+
+        if variants:
+            dropdown.setCurrentIndex(0)
+
+        dropdown.blockSignals(False)
+    
+
+    def onVariantChanged(self, *args):
+        self.setConfirmState(False)
+        if not self.modelFamily:
+            return
+
+        variant = self.ui.modelVariantDropdown.currentText
+
+        if not variant:
+            return
+
+        self.modelFamily.variant = variant
+        
+    
+    def onConfirmClicked(self, *args):
+        if not self.modelFamily:
+            return
+
+        # 🔥 call model logic (unchanged)
+        call_if_exists(self.modelFamily, 'on_confirm_model_selection')
+
+        # 🔥 update UI state ONLY (widget responsibility)
+        self.setConfirmState(True)
+    
+    def setConfirmState(self, confirmed: bool):
+        button = self.ui.confirmModelSelection
+
+        if confirmed:
+            button.setEnabled(False)
+            button.setText("Model Confirmed")
+        else:
+            button.setEnabled(True)
+            button.setText("Confirm Model Selection")
 
 
 #
