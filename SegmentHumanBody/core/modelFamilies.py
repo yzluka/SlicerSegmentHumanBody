@@ -1,8 +1,10 @@
+from .modelRegistry import ModelRegistry
+
 class BaseModelFamily:
     VARIANTS = ['None']
     def __init__(self, widget):
         self.widget = widget
-        self.variant = None
+        self.model = None
         print(f"INIT CALLED: {type(self).__name__}")
 
     def on_confirm_model_selection(self):
@@ -11,18 +13,11 @@ class BaseModelFamily:
         if not variant:
             print("[Confirm] No variant selected")
             return
-        
-        self.variant = variant  
+          
 
-        print(f"[Confirm] {type(self).__name__} → {self.variant}")
+        print(f"[Confirm] {type(self).__name__} → {variant}")
 
-        self._check_dependencies()
-        self._load_model()
-    def _check_dependencies(self):
-        print(f"[Dependencies] Checking for {self.variant}")
-
-    def _load_model(self):
-        print(f"[Load] Loading model {self.variant}")
+        self.model = ModelRegistry.get_model(variant)
 
 # ------------------------
 # Interactive Model
