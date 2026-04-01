@@ -26,7 +26,23 @@ def extract_connected_component(mask: np.ndarray, point_xy):
 
 
 def call_if_exists(obj, method):
-    if hasattr(obj, method):
+    if callable(method):
+        method()
+        return
+
+    if obj and hasattr(obj, method):
         getattr(obj, method)()
     else:
         print(f"[Missing] {method}")
+
+
+def make_model_callback(widget, method_name):
+    def callback(*args):
+        call_if_exists(widget.modelFamily, method_name)
+    return callback
+
+
+def make_widget_callback(widget, method):
+    def callback(*args):
+        call_if_exists(None, method)
+    return callback

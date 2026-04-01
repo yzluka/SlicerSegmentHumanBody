@@ -9,7 +9,7 @@ from slicer.ScriptedLoadableModule import (
 from slicer.util import VTKObservationMixin
 
 from core.modelFamilies import BaseModelFamily, InteractiveModelFamily, SPXModelFamily, AutoModelFamily
-from core.utils import call_if_exists
+from core.utils import call_if_exists, make_model_callback, make_widget_callback
 
 
 log = logging.getLogger(__name__)
@@ -121,23 +121,35 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def connectSignals(self):
         ui = self.ui
 
-        button_connections = [
+        model_button_connections = [
             ('enterInteractiveModeButton', 'on_enter_interactive'),
             ('stopInteractiveModeButton', 'on_stop_interactive'),
             ('assignLabel2D', 'on_assign_2d'),
             ('assignLabel3D', 'on_assign_3d'),
-            ('goToSegmentEditorButton', 'on_go_to_editor'),
-            ('goToMarkupsButton', 'on_go_to_markups'),
             ('propagateSelectedLabelButton', 'on_propagate'),
-            ('runAutomaticSegmentation', 'on_automatic_segmentation'),            
+            ('runAutomaticSegmentation', 'on_automatic_segmentation'),
         ]
 
-        for ui_name, method_name in button_connections:
-            widget = getattr(ui, ui_name)
+        for ui_name, method_name in model_button_connections:
+            widget_btn = getattr(ui, ui_name)
 
-            widget.connect(
+            widget_btn.connect(
                 'clicked(bool)',
-                lambda _, name=method_name: call_if_exists(self.modelFamily, name)
+                make_model_callback(self, method_name)
+            )
+
+        widget_button_connections = [
+            ('goToSegmentEditorButton', self.on_go_to_editor),
+            ('goToMarkupsButton', self.on_go_to_markups),
+            ('confirmModelSelection', self.onConfirmClicked),
+        ]
+
+        for ui_name, method in widget_button_connections:
+            widget_btn = getattr(ui, ui_name)
+
+            widget_btn.connect(
+                'clicked(bool)',
+                make_widget_callback(self, method)
             )
 
         # model family and varaint dropdown
@@ -303,7 +315,6 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         ModelClass = self.model_classes.get(modelFamilyName, BaseModelFamily)
 
-        # 🔥 create fresh instance (no cache)
         self.modelFamily = ModelClass(self)
 
         # update variants AFTER creation
@@ -348,10 +359,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if not self.modelFamily:
             return
 
-        # 🔥 call model logic (unchanged)
         call_if_exists(self.modelFamily, 'on_confirm_model_selection')
 
-        # 🔥 update UI state ONLY (widget responsibility)
         self.setConfirmState(True)
     
     def setConfirmState(self, confirmed: bool):
@@ -363,6 +372,13 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         else:
             button.setEnabled(True)
             button.setText("Confirm Model Selection")
+    
+    def on_go_to_editor(self, *args):
+        slicer.util.selectModule('SegmentEditor')
+    
+    def on_go_to_markups(self, *args):
+        slicer.util.selectModule('Markups')
+    
 
 
 #

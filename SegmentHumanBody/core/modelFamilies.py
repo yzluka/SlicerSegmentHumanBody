@@ -11,8 +11,8 @@ class BaseModelFamily:
         if not variant:
             print("[Confirm] No variant selected")
             return
-
-        self.variant = variant  # 🔥 sync here
+        
+        self.variant = variant  
 
         print(f"[Confirm] {type(self).__name__} → {self.variant}")
 
@@ -58,6 +58,7 @@ class SPXModelFamily(BaseModelFamily):
 
     def on_assign_2d(self, *args):
         print("[SPX] superpixel assign")
+
     
     def on_propagate(self, *args):
         print("[SPX] propagate")
