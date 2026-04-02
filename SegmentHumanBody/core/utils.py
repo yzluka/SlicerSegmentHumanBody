@@ -13,10 +13,9 @@ def extract_connected_component(mask: np.ndarray, point_xy):
         Boolean mask of the connected component
     """
     x, y = point_xy
-    seed = (y, x)  # convert to (row, col)
+    seed = (y, x)  
 
     if not mask[seed]:
-        # optional: avoid flooding background
         return np.zeros_like(mask, dtype=bool)
 
     seed_mask = np.zeros_like(mask, dtype=bool)
@@ -25,24 +24,26 @@ def extract_connected_component(mask: np.ndarray, point_xy):
     return binary_propagation(seed_mask, mask=mask)
 
 
-def call_if_exists(obj, method):
-    if callable(method):
-        method()
-        return
+def call_if_exists(obj, method_name, *args, **kwargs):
+    if obj and hasattr(obj, method_name):
+        return getattr(obj, method_name)(*args, **kwargs)
 
-    if obj and hasattr(obj, method):
-        getattr(obj, method)()
+
+def get_slice_from_volume(volume_array, axis, slice_index):
+    
+    if axis == 2:
+        return volume_array[:, :, slice_index]
+    elif axis == 1:
+        return volume_array[:, slice_index, :]
     else:
-        print(f"[Missing] {method}")
+        return volume_array[slice_index, :, :]
 
 
-def make_model_callback(widget, method_name):
-    def callback(*args):
-        call_if_exists(widget.modelFamily, method_name)
-    return callback
-
-
-def make_widget_callback(widget, method):
-    def callback(*args):
-        call_if_exists(None, method)
-    return callback
+def write_slice_to_volume(target_array, slice_data, axis, slice_index):
+    
+    if axis == 2:
+        target_array[:, :, slice_index] = slice_data
+    elif axis == 1:
+        target_array[:, slice_index, :] = slice_data
+    else:
+        target_array[slice_index, :, :] = slice_data

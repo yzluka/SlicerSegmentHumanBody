@@ -1,6 +1,6 @@
 import qt, vtk, slicer
 import logging
-
+import numpy as np
 from slicer.ScriptedLoadableModule import (
     ScriptedLoadableModule,
     ScriptedLoadableModuleWidget,
@@ -9,7 +9,7 @@ from slicer.ScriptedLoadableModule import (
 from slicer.util import VTKObservationMixin
 
 from core.modelFamilies import BaseModelFamily, InteractiveModelFamily, SPXModelFamily, AutoModelFamily
-from core.utils import call_if_exists, make_model_callback, make_widget_callback
+from core.utils import call_if_exists, get_slice_from_volume, write_slice_to_volume
 
 log = logging.getLogger(__name__)
 
@@ -66,12 +66,17 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.modelFamily = None
 
         self._updatingGUI = False
+        self.currentViewName = None  # default
+
 
     # -------------------------
     # Setup
     # -------------------------
     def setup(self):
         super().setup()
+
+        self.currentViewName = "Red"
+        
 
         uiWidget = slicer.util.loadUI(self.resourcePath('UI/SegmentHumanBody.ui'))
         uiWidget.setMRMLScene(slicer.mrmlScene)
@@ -86,7 +91,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             'Auto': AutoModelFamily,
         }
 
-        self.renderer = SegmentationRenderer(self)
+        # self.renderer = SegmentationRenderer(self)
+        self.renderer = None
 
         self.initializeUI()
         self.connectSignals()
@@ -130,11 +136,9 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         ]
 
         for ui_name, method_name in model_button_connections:
-            widget_btn = getattr(ui, ui_name)
-
-            widget_btn.connect(
+            getattr(ui, ui_name).connect(
                 'clicked(bool)',
-                make_model_callback(self, method_name)
+                self.bind(method_name, target="logic")
             )
 
         widget_button_connections = [
@@ -145,14 +149,11 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         for ui_name, method in widget_button_connections:
             widget_btn = getattr(ui, ui_name)
-
-            widget_btn.connect(
-                'clicked(bool)',
-                make_widget_callback(self, method)
-            )
+            widget_btn.connect('clicked(bool)', lambda *args, m=method: m())
 
         ui.modelFamilyDropdown.connect('currentIndexChanged(int)', self.onModelFamilyChanged)
         ui.modelVariantDropdown.connect('currentIndexChanged(int)', self.onVariantChanged)
+        ui.sliceViewDropdown.connect('currentTextChanged(QString)', self.onSliceViewChanged)
 
     # -------------------------
     # Observers
@@ -179,6 +180,11 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.ui.positivePrompts.currentNode(),
             self.ui.negativePrompts.currentNode(),
         )
+    
+    def onSliceViewChanged(self, viewName):
+        self.currentViewName = viewName
+        print(f"[UI] Selected view: {viewName}")
+    
 
     # -------------------------
     # UI
@@ -216,6 +222,9 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         self.ui.samMaskDropdown.clear()
         self.ui.samMaskDropdown.addItems(['Mask-1', 'Mask-2', 'Mask-3'])
+        self.ui.sliceViewDropdown.clear()
+        self.ui.sliceViewDropdown.addItems(["Red", "Green", "Yellow"])
+        self.ui.sliceViewDropdown.setCurrentText("Red")
 
         for name in dropdowns:
             if hasattr(self.ui, name):
@@ -282,12 +291,17 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     # -------------------------
     def onModelFamilyChanged(self, *args):
         self.setConfirmState(False)
-        modelFamilyName = self.ui.modelFamilyDropdown.currentText
 
+        modelFamilyName = self.ui.modelFamilyDropdown.currentText
         ModelClass = self.model_classes.get(modelFamilyName, BaseModelFamily)
-        self.modelFamily = ModelClass(self)
+
+        self.modelFamily = ModelClass()
 
         self.updateModelVariants()
+
+        if hasattr(self.modelFamily, "VARIANTS") and self.modelFamily.VARIANTS:
+            self.modelFamily.variant = self.modelFamily.VARIANTS[0]
+
         self.updateUIVisibility()
 
     def updateModelVariants(self):
@@ -310,22 +324,20 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def onVariantChanged(self, *args):
         self.setConfirmState(False)
+
         if not self.modelFamily:
             return
 
         variant = self.ui.modelVariantDropdown.currentText
-
-        if not variant:
-            return
-
         self.modelFamily.variant = variant
 
     def onConfirmClicked(self, *args):
         if not self.modelFamily:
             return
 
-        self.logic.onModelConfirmed(self.modelFamily)
+        self.logic.on_confirm_model(self)
         self.setConfirmState(True)
+
 
     def setConfirmState(self, confirmed: bool):
         button = self.ui.confirmModelSelection
@@ -342,6 +354,16 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def on_go_to_markups(self, *args):
         slicer.util.selectModule('Markups')
+    
+    def bind(self, method_name, target="logic"):
+        if target == "logic":
+            return lambda _=None: getattr(self.logic, method_name)(self)
+
+        elif target == "model":
+            return lambda _=None: call_if_exists(self.modelFamily, method_name)
+
+        else:  # widget
+            return getattr(self, method_name)
 
 
 #
@@ -356,6 +378,7 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
     # -------------------------
     # Prompt Nodes
     # -------------------------
+    
     def ensurePromptNodesExist(self, parameterNode):
         configs = {
             POS_NODE: ([0, 1, 0], 'positive'),
@@ -406,3 +429,159 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
 
     def onModelConfirmed(self, modelFamily):
         call_if_exists(modelFamily, 'on_confirm_model_selection')
+
+    def on_confirm_model(self, widget):
+        if not widget.modelFamily:
+            return
+
+        widget.modelFamily.confirm_model()
+        
+    def on_propagate(self, widget):
+        print("[SPX] Propagate clicked")
+
+        modelFamily = widget.modelFamily
+
+        if not modelFamily:
+            slicer.util.warningDisplay("Please select a model first.")
+            return
+
+        if not getattr(modelFamily, "model", None):
+            slicer.util.warningDisplay("Please click 'Confirm Model Selection' before running.")
+            return
+
+        volumeNode = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLScalarVolumeNode")
+        if not volumeNode:
+            slicer.util.warningDisplay("No input volume found.")
+            return
+
+        volumeArray = slicer.util.arrayFromVolume(volumeNode)
+
+        axis, sliceIndex = self.getAxisAndSlice(widget)
+
+        img = get_slice_from_volume(volumeArray, axis, sliceIndex)
+
+        print("[SPX] Running model...")
+
+        output = modelFamily.model.forward(img=img)
+
+        self.showLabelMap(output, volumeNode, sliceIndex, axis)
+    
+    
+    def on_enter_interactive(self, widget):
+        print("[Logic] start interactive")
+
+        if not widget.renderer:
+            widget.renderer = SegmentationRenderer(widget)
+
+        widget.renderer.start()
+
+
+    def on_stop_interactive(self, widget):
+        print("[Logic] stop interactive")
+
+        if widget.renderer:
+            widget.renderer.stop()
+
+    def on_assign_2d(self, widget):
+        call_if_exists(widget.modelFamily, 'on_assign_2d')
+
+    def on_assign_3d(self, widget):
+        call_if_exists(widget.modelFamily, 'on_assign_3d')
+    
+    def on_automatic_segmentation(self, widget):
+        call_if_exists(widget.modelFamily, 'run')
+
+
+    def _ras_to_ijk(self, volumeNode, scrib):
+        rasToIjk = vtk.vtkMatrix4x4()
+        volumeNode.GetRASToIJKMatrix(rasToIjk)
+
+        def convert(points):
+            ijk_pts = []
+            for p in points:
+                ras = list(p) + [1]
+                ijk = rasToIjk.MultiplyPoint(ras)
+                ijk_pts.append([int(ijk[0]), int(ijk[1])])
+            return ijk_pts
+
+        return {
+            "positive": convert(scrib["positive"]),
+            "negative": convert(scrib["negative"])
+        }
+
+    def updateSegmentationFromArray(self, mask, volumeNode, sliceIndex):
+        import numpy as np
+
+        print("[SPX] Rendering segmentation...")
+
+        # --- create segmentation node ---
+        segNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode")
+        segNode.CreateDefaultDisplayNodes()
+        segNode.SetReferenceImageGeometryParameterFromVolumeNode(volumeNode)
+
+        # --- create segment ---
+        segmentID = segNode.GetSegmentation().AddEmptySegment("SPX")
+
+        # --- make full 3D mask ---
+        volumeArray = slicer.util.arrayFromVolume(volumeNode)
+        fullMask = np.zeros_like(volumeArray, dtype=np.uint8)
+
+        axis = self.getSliceAccessorDimension(volumeNode)
+
+        write_slice_to_volume(fullMask, mask, axis, sliceIndex)
+
+        # --- push to slicer ---
+        slicer.util.updateSegmentBinaryLabelmapFromArray(
+            fullMask,
+            segNode,
+            segmentID,
+            volumeNode
+        )
+
+        print("[SPX] Done.")
+    
+
+    def showLabelMap(self, mask, volumeNode, sliceIndex, axis):
+
+        print("[SPX] Showing labelmap...")
+
+        volumeArray = slicer.util.arrayFromVolume(volumeNode)
+        labelVolume = np.zeros_like(volumeArray, dtype=np.int32)
+
+        write_slice_to_volume(labelVolume, mask, axis, sliceIndex)
+
+        labelNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLabelMapVolumeNode")
+        labelNode.CopyOrientation(volumeNode)
+
+        slicer.util.updateVolumeFromArray(labelNode, labelVolume)
+
+        slicer.util.setSliceViewerLayers(
+            background=volumeNode,
+            label=labelNode,
+            labelOpacity=0.6
+        )
+
+        print("[SPX] Labelmap displayed.")
+
+
+    def getAxisAndSlice(self, widget):
+        viewName = widget.currentViewName
+
+        lm = slicer.app.layoutManager()
+        sliceWidget = lm.sliceWidget(viewName)
+        logic = sliceWidget.sliceLogic()
+
+        offset = logic.GetSliceOffset()
+        sliceIndex = logic.GetSliceIndexFromOffset(offset) - 1
+
+        if viewName == "Red":
+            axis = 0   
+        elif viewName == "Green":
+            axis = 1   
+        else:
+            axis = 2   
+
+        print(f"[SPX] View={viewName}, axis={axis}, slice={sliceIndex}")
+
+        return axis, sliceIndex
+    
