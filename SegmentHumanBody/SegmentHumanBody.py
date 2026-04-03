@@ -15,7 +15,8 @@ log = logging.getLogger(__name__)
 
 POS_NODE = 'positivePromptPointsNode'
 NEG_NODE = 'negativePromptPointsNode'
-
+INPUT_VOLUME = "InputVolume"
+SEGMENTATION = "Segmentation"
 
 #
 # Module
@@ -26,7 +27,6 @@ class SegmentHumanBody(ScriptedLoadableModule):
         super().__init__(parent)
         self.parent.title = 'SegmentHumanBody (Optimized)'
         self.parent.categories = ['Segmentation']
-
 
 #
 # Renderer
@@ -83,6 +83,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         self.layout.addWidget(uiWidget)
         self.ui = slicer.util.childWidgetVariables(uiWidget)
+        self.ui.sourceVolumeSelector.setMRMLScene(slicer.mrmlScene)
+        self.ui.segmentSelector.setMRMLScene(slicer.mrmlScene)
 
         self.model_classes = {
             'None': BaseModelFamily,
@@ -154,6 +156,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         ui.modelFamilyDropdown.connect('currentIndexChanged(int)', self.onModelFamilyChanged)
         ui.modelVariantDropdown.connect('currentIndexChanged(int)', self.onVariantChanged)
         ui.sliceViewDropdown.connect('currentTextChanged(QString)', self.onSliceViewChanged)
+        ui.sourceVolumeSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.updateParameterNodeFromGUI)
+
 
     # -------------------------
     # Observers
@@ -198,6 +202,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             ('propagateSelectedLabelButton', 'on_propagate'),
             ('runAutomaticSegmentation', 'on_automatic_segmentation'),
             ('goToMarkupsButton', 'on_go_to_markups'),
+            ('samMaskDropdown','get_requested_mask')
         ]
 
         ui = self.ui
@@ -271,9 +276,13 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._updatingGUI = True
         try:
             posNode, negNode = self.logic.getPromptNodes(self._parameterNode)
+            volumeNode, segNode = self.logic.getVolumeAndSegmentation(self._parameterNode)
 
             self.ui.positivePrompts.setCurrentNode(posNode)
             self.ui.negativePrompts.setCurrentNode(negNode)
+
+            self.ui.sourceVolumeSelector.setCurrentNode(volumeNode)
+
         finally:
             self._updatingGUI = False
 
@@ -285,6 +294,12 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self._parameterNode,
             self.ui.positivePrompts.currentNode(),
             self.ui.negativePrompts.currentNode(),
+        )
+
+        self.logic.setVolumeAndSegmentation(
+            self._parameterNode,
+            self.ui.sourceVolumeSelector.currentNode(),
+            self.ui.segmentSelector.currentNode(),
         )
     # -------------------------
     # Model Switching
@@ -378,6 +393,17 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
     # -------------------------
     # Prompt Nodes
     # -------------------------
+    def setVolumeAndSegmentation(self, parameterNode, volumeNode, segmentationNode):
+        if volumeNode:
+            parameterNode.SetNodeReferenceID(INPUT_VOLUME, volumeNode.GetID())
+        if segmentationNode:
+            parameterNode.SetNodeReferenceID(SEGMENTATION, segmentationNode.GetID())
+
+    def getVolumeAndSegmentation(self, parameterNode):
+        return (
+            parameterNode.GetNodeReference(INPUT_VOLUME),
+            parameterNode.GetNodeReference(SEGMENTATION),
+        )
     
     def ensurePromptNodesExist(self, parameterNode):
         configs = {
@@ -449,22 +475,32 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
             slicer.util.warningDisplay("Please click 'Confirm Model Selection' before running.")
             return
 
-        volumeNode = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLScalarVolumeNode")
+        volumeNode = widget.ui.sourceVolumeSelector.currentNode()
+        segNode = widget.ui.segmentSelector.currentNode()
+        segmentID = widget.ui.segmentSelector.currentSegmentID()
+
         if not volumeNode:
-            slicer.util.warningDisplay("No input volume found.")
+            slicer.util.warningDisplay("Please select a source volume.")
+            return
+
+        if not segNode or not segmentID:
+            slicer.util.warningDisplay("Please select a segmentation and segment.")
+            return
+
+        if not segmentID:
+            slicer.util.warningDisplay("No segment selected.")
             return
 
         volumeArray = slicer.util.arrayFromVolume(volumeNode)
 
         axis, sliceIndex = self.getAxisAndSlice(widget)
-
         img = get_slice_from_volume(volumeArray, axis, sliceIndex)
 
         print("[SPX] Running model...")
 
-        output = modelFamily.model.forward(img=img)
+        labels = modelFamily.model.forward(img=img)
 
-        self.showLabelMap(output, volumeNode, sliceIndex, axis)
+        self.expandSegWithSPX(segNode, segmentID, volumeNode, labels, axis, sliceIndex)
     
     
     def on_enter_interactive(self, widget):
@@ -532,36 +568,9 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
 
         # --- push to slicer ---
         slicer.util.updateSegmentBinaryLabelmapFromArray(
-            fullMask,
-            segNode,
-            segmentID,
-            volumeNode
+            fullMask, segNode, segmentID, volumeNode
         )
 
-        print("[SPX] Done.")
-    
-
-    def showLabelMap(self, mask, volumeNode, sliceIndex, axis):
-
-        print("[SPX] Showing labelmap...")
-
-        volumeArray = slicer.util.arrayFromVolume(volumeNode)
-        labelVolume = np.zeros_like(volumeArray, dtype=np.int32)
-
-        write_slice_to_volume(labelVolume, mask, axis, sliceIndex)
-
-        labelNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLabelMapVolumeNode")
-        labelNode.CopyOrientation(volumeNode)
-
-        slicer.util.updateVolumeFromArray(labelNode, labelVolume)
-
-        slicer.util.setSliceViewerLayers(
-            background=volumeNode,
-            label=labelNode,
-            labelOpacity=0.6
-        )
-
-        print("[SPX] Labelmap displayed.")
 
 
     def getAxisAndSlice(self, widget):
@@ -584,4 +593,32 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         print(f"[SPX] View={viewName}, axis={axis}, slice={sliceIndex}")
 
         return axis, sliceIndex
+    
+    def getCurrentSegment(self, widget):
+        segNode = widget.ui.segmentSelector.currentNode()
+        segmentID = widget.ui.segmentSelector.currentSegmentID()
+
+        if not segmentID and segNode:
+            segmentation = segNode.GetSegmentation()
+            if segmentation.GetNumberOfSegments() > 0:
+                segmentID = segmentation.GetNthSegmentID(0)
+
+        return segNode, segmentID
+
+
+    def expandSegWithSPX(self, segNode, segmentID, volumeNode, labels, axis, sliceIndex):
+
+        mask3d = slicer.util.arrayFromSegmentBinaryLabelmap(segNode, segmentID, volumeNode)
+
+        sliceMask = get_slice_from_volume(mask3d, axis, sliceIndex)
+
+        selected_labels = np.unique(labels[sliceMask > 0])
+        expanded = np.isin(labels, selected_labels).astype(np.uint8)
+
+        fullMask = np.zeros_like(mask3d, dtype=np.uint8)
+        write_slice_to_volume(fullMask, expanded, axis, sliceIndex)
+
+        slicer.util.updateSegmentBinaryLabelmapFromArray(
+            fullMask, segNode, segmentID, volumeNode
+        )
     

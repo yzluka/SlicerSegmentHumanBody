@@ -39,17 +39,21 @@ class InteractiveModelFamily(BaseModelFamily):
 
     def on_stop_interactive(self, **kwargs):
         print("[Interactive] stop")
+    
+    def get_requested_mask(self, **kwargs):
+        pass
 
 # ------------------------
 # SPX Model
 # ------------------------
 
 class SPXModelFamily(BaseModelFamily):
-    VARIANTS = ['SLIC', 'Felzenszwalb']
+    VARIANTS = ['SLIC', 'Felzenszwalb','Naive_Grid']
 
     MODEL_MAP = {
-        'SLIC': 'SPX_Tester',
-        'Felzenszwalb': 'SPX_Tester',
+        'SLIC': None,
+        'Felzenszwalb': None,
+        'Naive_Grid': 'SPX_Tester'
     }
 
     def confirm_model(self):

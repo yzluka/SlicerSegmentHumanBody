@@ -5,6 +5,38 @@
 
     <layout class="QVBoxLayout">
 
+      <!-- Source Volume -->
+      <item>
+        <widget class="qMRMLNodeComboBox" name="sourceVolumeSelector">
+          <property name="nodeTypes">
+            <stringlist>
+              <string>vtkMRMLScalarVolumeNode</string>
+            </stringlist>
+          </property>
+          <property name="selectNodeUponCreation">
+            <bool>true</bool>
+          </property>
+          <property name="addEnabled">
+            <bool>false</bool>
+          </property>
+          <property name="removeEnabled">
+            <bool>false</bool>
+          </property>
+          <property name="noneEnabled">
+            <bool>false</bool>
+          </property>
+        </widget>
+      </item>
+
+      <!-- Segment + Segmentation (combined, no duplication) -->
+      <item>
+        <widget class="qMRMLSegmentSelectorWidget" name="segmentSelector">
+          <property name="noneEnabled">
+            <bool>false</bool>
+          </property>
+        </widget>
+      </item>
+
       <!-- ================= MODEL SELECTION ================= -->
       <item>
         <widget class="QLabel" name="label_1">
@@ -179,6 +211,11 @@
       <class>qSlicerSimpleMarkupsWidget</class>
       <extends>QWidget</extends>
       <header>qSlicerSimpleMarkupsWidget.h</header>
+    </customwidget>
+    <customwidget>
+      <class>qMRMLSegmentSelectorWidget</class>
+      <extends>QWidget</extends>
+      <header>qMRMLSegmentSelectorWidget.h</header>
     </customwidget>
   </customwidgets>
 
