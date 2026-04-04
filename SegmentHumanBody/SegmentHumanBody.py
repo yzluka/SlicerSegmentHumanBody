@@ -201,7 +201,6 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     
     def onSliceViewChanged(self, viewName):
         self.currentViewName = viewName
-        print(f"[UI] Selected view: {viewName}")
 
     # -------------------------
     # UI
@@ -283,9 +282,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         qt.QTimer.singleShot(0, self.updateGUIFromParameterNode)
 
     def updateGUIFromParameterNode(self, caller=None, event=None):
-        print("[DEBUG] updateGUIFromParameterNode called")
-        volumeNode, segNode = self.logic.getVolumeAndSegmentation(self._parameterNode)
-        print("[DEBUG] segNode in GUI update:", segNode)
+        
         if not self._parameterNode:
             return
 
@@ -299,15 +296,13 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.ui.sourceVolumeSelector.setCurrentNode(volumeNode)
             self.ui.segmentationNodeSelector.setCurrentNode(segNode)
             self.ui.segmentSelector.setCurrentNode(segNode)
-            print("[DEBUG] enabling button:", segNode is not None)
             self.ui.addSegmentButton.setEnabled(segNode is not None)
 
         finally:
             self._updatingGUI = False
 
     def updateParameterNodeFromGUI(self, caller=None, event=None):
-        print("[DEBUG] updateParameterNodeFromGUI called")
-        print("[DEBUG] seg selector:", self.ui.segmentationNodeSelector.currentNode())
+        
         if not self._parameterNode:
             return
 
@@ -327,10 +322,9 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         self.logic.setVolumeAndSegmentation(self._parameterNode, volumeNode, segNode)
 
-        # 🔥 THIS LINE FIXES YOUR ISSUE
         self._parameterNode.Modified()
         self.updateGUIFromParameterNode()
-        print("[DEBUG] parameterNode.Modified() called")
+        
     # -------------------------
     # Model Switching
     # -------------------------
@@ -637,7 +631,6 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         widget.modelFamily.confirm_model()
         
     def on_propagate(self, widget):
-        print("[SPX] Propagate clicked")
 
         modelFamily = widget.modelFamily
 
@@ -670,16 +663,13 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         axis, sliceIndex = self.getAxisAndSlice(widget)
         img = get_slice_from_volume(volumeArray, axis, sliceIndex)
 
-        print("[SPX] Running model...")
-
         labels = modelFamily.model.forward(img=img)
 
         self.expandSegWithSPX(segNode, segmentID, volumeNode, labels, axis, sliceIndex)
     
     
     def on_enter_interactive(self, widget):
-        print("[Logic] start interactive")
-
+    
         if not widget.renderer:
             widget.renderer = SegmentationRenderer(widget)
 
@@ -687,7 +677,6 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
 
 
     def on_stop_interactive(self, widget):
-        print("[Logic] stop interactive")
 
         if widget.renderer:
             widget.renderer.stop()
@@ -715,7 +704,6 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
 
                 i, j, k = int(ijk[0]), int(ijk[1]), int(ijk[2])
 
-                # 🔥 Map to correct 2D slice coordinates
                 if axis == 0:        # Red (Z slice)
                     pt2d = [i, j]
                 elif axis == 1:      # Yellow (Y slice)
@@ -733,9 +721,6 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         }
 
     def updateSegmentationFromArray(self, mask, volumeNode, sliceIndex):
-        import numpy as np
-
-        print("[SPX] Rendering segmentation...")
 
         # --- create segmentation node ---
         segNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode")
@@ -776,8 +761,6 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
             axis = 1   
         else:
             axis = 2   
-
-        print(f"[SPX] View={viewName}, axis={axis}, slice={sliceIndex}")
 
         return axis, sliceIndex
     

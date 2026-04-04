@@ -13,8 +13,6 @@ class SPX_Tester:
         else:
             H, W = img.shape
 
-        print("[SPX] H, W =", H, W)
-
         gh, gw = 9, 9
 
         y_coords = np.linspace(0, gh, H, endpoint=False).astype(int)
@@ -25,8 +23,6 @@ class SPX_Tester:
         for i in range(H):
             for j in range(W):
                 labels[i, j] = y_coords[i] * gw + x_coords[j] + 1
-
-        print("[SPX] unique labels:", len(np.unique(labels)))
 
         return labels
 
