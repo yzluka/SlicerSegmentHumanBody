@@ -8,7 +8,7 @@ from slicer.ScriptedLoadableModule import (
 )
 from slicer.util import VTKObservationMixin
 
-from core.modelFamilies import BaseModelFamily, InteractiveModelFamily, SPXModelFamily, AutoModelFamily
+from core.modelFamilies import BaseModelFamily, SAMFamily, SPXModelFamily, AutoModelFamily
 from core.utils import call_if_exists, get_slice_from_volume, write_slice_to_volume
 
 log = logging.getLogger(__name__)
@@ -47,9 +47,14 @@ class SegmentationRenderer:
         self.timer.stop()
 
     def update(self):
-        self.widget.logic.onRender(self.widget.modelFamily)
+        if self.widget._pauseRender or self.widget._isRendering:
+            return
 
-
+        self.widget._isRendering = True
+        try:
+            self.widget.logic.onRender(self.widget.modelFamily, self.widget)
+        finally:
+            self.widget._isRendering = False
 #
 # Widget
 #
@@ -67,6 +72,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         self._updatingGUI = False
         self.currentViewName = None  # default
+        self._isRendering = False
+        self._pauseRender = False
 
 
     # -------------------------
@@ -84,16 +91,18 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.layout.addWidget(uiWidget)
         self.ui = slicer.util.childWidgetVariables(uiWidget)
         self.ui.sourceVolumeSelector.setMRMLScene(slicer.mrmlScene)
+        self.ui.segmentationNodeSelector.setMRMLScene(slicer.mrmlScene)
         self.ui.segmentSelector.setMRMLScene(slicer.mrmlScene)
-
+        self.ui.segmentSelector.segmentationNodeSelectorVisible = False
+        
+        
         self.model_classes = {
             'None': BaseModelFamily,
-            'Interactive': InteractiveModelFamily,
+            'SAM-Style': SAMFamily,
             'SPX-Assisted Annotation': SPXModelFamily,
             'Auto': AutoModelFamily,
         }
 
-        # self.renderer = SegmentationRenderer(self)
         self.renderer = None
 
         self.initializeUI()
@@ -122,6 +131,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.setParameterNode(self._parameterNode)
         self.onModelFamilyChanged()
 
+        qt.QTimer.singleShot(0, self.updateGUIFromParameterNode)
+
     # -------------------------
     # Signals
     # -------------------------
@@ -147,17 +158,20 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             ('goToSegmentEditorButton', self.on_go_to_editor),
             ('goToMarkupsButton', self.on_go_to_markups),
             ('confirmModelSelection', self.onConfirmClicked),
+            ('addSegmentButton', self.onAddSegment),
+            ('removeSegmentButton', self.onRemoveSegment),
+        
         ]
 
         for ui_name, method in widget_button_connections:
-            widget_btn = getattr(ui, ui_name)
-            widget_btn.connect('clicked(bool)', lambda *args, m=method: m())
+            getattr(ui, ui_name).connect('clicked(bool)', method)
 
         ui.modelFamilyDropdown.connect('currentIndexChanged(int)', self.onModelFamilyChanged)
         ui.modelVariantDropdown.connect('currentIndexChanged(int)', self.onVariantChanged)
         ui.sliceViewDropdown.connect('currentTextChanged(QString)', self.onSliceViewChanged)
         ui.sourceVolumeSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.updateParameterNodeFromGUI)
-
+        ui.segmentationNodeSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.updateParameterNodeFromGUI)
+        ui.segmentSelector.connect("currentSegmentChanged(QString)", self.onSegmentChanged)
 
     # -------------------------
     # Observers
@@ -188,7 +202,6 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def onSliceViewChanged(self, viewName):
         self.currentViewName = viewName
         print(f"[UI] Selected view: {viewName}")
-    
 
     # -------------------------
     # UI
@@ -270,7 +283,10 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         qt.QTimer.singleShot(0, self.updateGUIFromParameterNode)
 
     def updateGUIFromParameterNode(self, caller=None, event=None):
-        if not self._parameterNode or self._updatingGUI:
+        print("[DEBUG] updateGUIFromParameterNode called")
+        volumeNode, segNode = self.logic.getVolumeAndSegmentation(self._parameterNode)
+        print("[DEBUG] segNode in GUI update:", segNode)
+        if not self._parameterNode:
             return
 
         self._updatingGUI = True
@@ -280,15 +296,28 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
             self.ui.positivePrompts.setCurrentNode(posNode)
             self.ui.negativePrompts.setCurrentNode(negNode)
-
             self.ui.sourceVolumeSelector.setCurrentNode(volumeNode)
+            self.ui.segmentationNodeSelector.setCurrentNode(segNode)
+            self.ui.segmentSelector.setCurrentNode(segNode)
+            print("[DEBUG] enabling button:", segNode is not None)
+            self.ui.addSegmentButton.setEnabled(segNode is not None)
 
         finally:
             self._updatingGUI = False
 
     def updateParameterNodeFromGUI(self, caller=None, event=None):
+        print("[DEBUG] updateParameterNodeFromGUI called")
+        print("[DEBUG] seg selector:", self.ui.segmentationNodeSelector.currentNode())
         if not self._parameterNode:
             return
+
+        volumeNode = self.ui.sourceVolumeSelector.currentNode()
+        segNode = self.ui.segmentationNodeSelector.currentNode()
+
+        if volumeNode and not segNode:
+            segNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode")
+            segNode.CreateDefaultDisplayNodes()
+            segNode.SetReferenceImageGeometryParameterFromVolumeNode(volumeNode)
 
         self.logic.updateParameterNodeFromMarkups(
             self._parameterNode,
@@ -296,11 +325,12 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.ui.negativePrompts.currentNode(),
         )
 
-        self.logic.setVolumeAndSegmentation(
-            self._parameterNode,
-            self.ui.sourceVolumeSelector.currentNode(),
-            self.ui.segmentSelector.currentNode(),
-        )
+        self.logic.setVolumeAndSegmentation(self._parameterNode, volumeNode, segNode)
+
+        # 🔥 THIS LINE FIXES YOUR ISSUE
+        self._parameterNode.Modified()
+        self.updateGUIFromParameterNode()
+        print("[DEBUG] parameterNode.Modified() called")
     # -------------------------
     # Model Switching
     # -------------------------
@@ -379,6 +409,89 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         else:  # widget
             return getattr(self, method_name)
+    
+    def onSegmentChanged(self, segmentID):
+        if not segmentID:
+            return
+
+        self._pauseRender = True
+        try:
+            self.clearPrompts()
+        finally:
+            self._pauseRender = False
+    
+    def clearPrompts(self):
+        posNode = self.ui.positivePrompts.currentNode()
+        negNode = self.ui.negativePrompts.currentNode()
+
+        if posNode:
+            posNode.RemoveAllControlPoints()
+
+        if negNode:
+            negNode.RemoveAllControlPoints()
+
+    def onAddSegment(self, *args):
+        self._pauseRender = True
+        try:
+            segNode = self.getOrCreateSegmentationNode()
+
+            if not segNode:
+                slicer.util.warningDisplay("Please select a volume first.")
+                return
+
+            segmentation = segNode.GetSegmentation()
+            existing = {
+                segmentation.GetNthSegment(i).GetName()
+                for i in range(segmentation.GetNumberOfSegments())
+            }
+
+            index = 1
+            while f"Segment_{index}" in existing:
+                index += 1
+
+            name = f"Segment_{index}"
+
+            segmentID = segmentation.AddEmptySegment(name)
+
+            self.ui.segmentSelector.setCurrentSegmentID(segmentID)
+
+        finally:
+            self._pauseRender = False
+    
+    def onRemoveSegment(self, *args):
+        self._pauseRender = True
+        try:
+            segNode = self.ui.segmentationNodeSelector.currentNode()
+            segmentID = self.ui.segmentSelector.currentSegmentID()
+
+            if not segNode or not segmentID:
+                slicer.util.warningDisplay("No segment selected.")
+                return
+
+            segNode.GetSegmentation().RemoveSegment(segmentID)
+
+        finally:
+            self._pauseRender = False
+    
+    def getOrCreateSegmentationNode(self):
+        volumeNode = self.ui.sourceVolumeSelector.currentNode()
+
+        segNode = self.ui.segmentationNodeSelector.currentNode()
+
+        # fallback to parameter node
+        if not segNode and self._parameterNode:
+            _, segNode = self.logic.getVolumeAndSegmentation(self._parameterNode)
+
+        # create if needed
+        if not segNode and volumeNode:
+            segNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode")
+            segNode.CreateDefaultDisplayNodes()
+            segNode.SetReferenceImageGeometryParameterFromVolumeNode(volumeNode)
+
+            self.logic.setVolumeAndSegmentation(self._parameterNode, volumeNode, segNode)
+            self._parameterNode.Modified()
+
+        return segNode
 
 
 #
@@ -450,8 +563,69 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
     # -------------------------
     # Model Interaction
     # -------------------------
-    def onRender(self, modelFamily):
-        call_if_exists(modelFamily, 'on_render')
+    def onRender(self, modelFamily, widget):
+        if not modelFamily or not modelFamily.model:
+            return
+
+        parameterNode = widget._parameterNode
+        posNode, negNode = self.getPromptNodes(parameterNode)
+
+        # --- Extract points ---
+        pos_points = [
+            posNode.GetNthControlPointPosition(i)
+            for i in range(posNode.GetNumberOfControlPoints())
+        ] if posNode else []
+
+        neg_points = [
+            negNode.GetNthControlPointPosition(i)
+            for i in range(negNode.GetNumberOfControlPoints())
+        ] if negNode else []
+
+        if not pos_points and not neg_points:
+            return
+
+        # --- Get image ---
+        volumeNode = widget.ui.sourceVolumeSelector.currentNode()
+        if not volumeNode:
+            return
+
+        volumeArray = slicer.util.arrayFromVolume(volumeNode)
+        axis, sliceIndex = self.getAxisAndSlice(widget)
+        img = get_slice_from_volume(volumeArray, axis, sliceIndex)
+
+        # --- Convert coordinates ---
+        scribbles = {
+            "positive": pos_points,
+            "negative": neg_points,
+        }
+        scribbles_ijk = self._ras_to_ijk(volumeNode, scribbles, axis)
+
+        # --- Call model family (PURE) ---
+        result = call_if_exists(modelFamily, "onRender", img=img,
+            pos_points=scribbles_ijk["positive"],
+            neg_points=scribbles_ijk["negative"],
+        )
+
+        # --- Handle result (back to slicer) ---
+        if result is not None:
+            self.applyResult(widget, result, axis, sliceIndex)
+    
+    def applyResult(self, widget, mask2d, axis, sliceIndex):
+        volumeNode = widget.ui.sourceVolumeSelector.currentNode()
+        segNode = widget.ui.segmentSelector.currentNode()
+        segmentID = widget.ui.segmentSelector.currentSegmentID()
+
+        if not volumeNode or not segNode or not segmentID:
+            return
+
+        mask3d = slicer.util.arrayFromSegmentBinaryLabelmap(segNode, segmentID, volumeNode)
+
+        fullMask = mask3d.copy()
+        write_slice_to_volume(fullMask, mask2d, axis, sliceIndex)
+
+        slicer.util.updateSegmentBinaryLabelmapFromArray(
+            fullMask, segNode, segmentID, volumeNode
+        )
 
     def onModelConfirmed(self, modelFamily):
         call_if_exists(modelFamily, 'on_confirm_model_selection')
@@ -528,16 +702,29 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         call_if_exists(widget.modelFamily, 'run')
 
 
-    def _ras_to_ijk(self, volumeNode, scrib):
+    def _ras_to_ijk(self, volumeNode, scrib, axis):
         rasToIjk = vtk.vtkMatrix4x4()
         volumeNode.GetRASToIJKMatrix(rasToIjk)
 
         def convert(points):
             ijk_pts = []
+
             for p in points:
                 ras = list(p) + [1]
                 ijk = rasToIjk.MultiplyPoint(ras)
-                ijk_pts.append([int(ijk[0]), int(ijk[1])])
+
+                i, j, k = int(ijk[0]), int(ijk[1]), int(ijk[2])
+
+                # 🔥 Map to correct 2D slice coordinates
+                if axis == 0:        # Red (Z slice)
+                    pt2d = [i, j]
+                elif axis == 1:      # Yellow (Y slice)
+                    pt2d = [i, k]
+                elif axis == 2:      # Green (X slice)
+                    pt2d = [j, k]
+
+                ijk_pts.append(pt2d)
+
             return ijk_pts
 
         return {

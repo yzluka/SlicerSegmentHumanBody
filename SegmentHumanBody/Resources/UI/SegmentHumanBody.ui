@@ -1,237 +1,305 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <ui version="4.0">
-  <class>SegmentHumanBody</class>
-  <widget class="qMRMLWidget" name="SegmentHumanBody">
-
-    <layout class="QVBoxLayout">
-
-      <!-- Source Volume -->
-      <item>
-        <widget class="qMRMLNodeComboBox" name="sourceVolumeSelector">
-          <property name="nodeTypes">
-            <stringlist>
-              <string>vtkMRMLScalarVolumeNode</string>
-            </stringlist>
-          </property>
-          <property name="selectNodeUponCreation">
-            <bool>true</bool>
-          </property>
-          <property name="addEnabled">
-            <bool>false</bool>
-          </property>
-          <property name="removeEnabled">
-            <bool>false</bool>
-          </property>
-          <property name="noneEnabled">
-            <bool>false</bool>
-          </property>
-        </widget>
-      </item>
-
-      <!-- Segment + Segmentation (combined, no duplication) -->
-      <item>
-        <widget class="qMRMLSegmentSelectorWidget" name="segmentSelector">
-          <property name="noneEnabled">
-            <bool>false</bool>
-          </property>
-        </widget>
-      </item>
-
-      <!-- ================= MODEL SELECTION ================= -->
-      <item>
-        <widget class="QLabel" name="label_1">
-          <property name="text">
-            <string>Select the model:</string>
-          </property>
-        </widget>
-      </item>
-
-      <item>
-        <layout class="QHBoxLayout">
-          <item>
-            <widget class="QComboBox" name="modelFamilyDropdown"/>
-          </item>
-          <item>
-            <widget class="QComboBox" name="samMaskDropdown">
-              <property name="toolTip">
-                <string>Select SAM output mask</string>
-              </property>
-            </widget>
-          </item>
-        </layout>
-      </item>
-
-      <item>
-        <layout class="QHBoxLayout">
-          <item>
-            <widget class="QComboBox" name="modelVariantDropdown"/>
-          </item>
-          <item>
-            <widget class="QPushButton" name="confirmModelSelection">
-              <property name="text">
-                <string>Confirm Model</string>
-              </property>
-            </widget>
-          </item>
-        </layout>
-      </item>
-
-      <!-- ================= VIEW SELECTION ================= -->
-      <item>
-        <layout class="QHBoxLayout">
-          <item>
-            <widget class="QLabel">
-              <property name="text">
-                <string>Slice View:</string>
-              </property>
-            </widget>
-          </item>
-          <item>
-            <widget class="QComboBox" name="sliceViewDropdown"/>
-          </item>
-        </layout>
-      </item>
-
-      <!-- ================= LABEL ASSIGNMENT ================= -->
-      <item>
-        <layout class="QHBoxLayout">
-          <item>
-            <widget class="QPushButton" name="assignLabel2D">
-              <property name="text">
-                <string>Assign Label (2D)</string>
-              </property>
-            </widget>
-          </item>
-          <item>
-            <widget class="QPushButton" name="assignLabel3D">
-              <property name="text">
-                <string>Assign Label (3D)</string>
-              </property>
-            </widget>
-          </item>
-        </layout>
-      </item>
-
-      <!-- ================= NAVIGATION ================= -->
-      <item>
-        <layout class="QHBoxLayout">
-          <item>
-            <widget class="QPushButton" name="goToMarkupsButton">
-              <property name="text">
-                <string>Create Box Prompt</string>
-              </property>
-            </widget>
-          </item>
-          <item>
-            <widget class="QPushButton" name="goToSegmentEditorButton">
-              <property name="text">
-                <string>Configure Labels</string>
-              </property>
-            </widget>
-          </item>
-        </layout>
-      </item>
-
-      <!-- ================= INTERACTIVE ================= -->
-      <item>
-        <layout class="QHBoxLayout">
-          <item>
-            <widget class="QPushButton" name="enterInteractiveModeButton">
-              <property name="text">
-                <string>Enter Interactive</string>
-              </property>
-            </widget>
-          </item>
-          <item>
-            <widget class="QPushButton" name="stopInteractiveModeButton">
-              <property name="text">
-                <string>Stop Interactive</string>
-              </property>
-            </widget>
-          </item>
-        </layout>
-      </item>
-
-      <!-- ================= RUN ================= -->
-      <item>
-        <layout class="QHBoxLayout">
-          <item>
-            <widget class="QPushButton" name="propagateSelectedLabelButton">
-              <property name="text">
-                <string>Propagate</string>
-              </property>
-            </widget>
-          </item>
-          <item>
-            <widget class="QPushButton" name="runAutomaticSegmentation">
-              <property name="text">
-                <string>Run Auto</string>
-              </property>
-            </widget>
-          </item>
-        </layout>
-      </item>
-
-      <!-- ================= PROMPTS ================= -->
-      <item>
-        <widget class="QLabel">
-          <property name="text">
-            <string>Positive Prompt</string>
-          </property>
-        </widget>
-      </item>
-
-      <item>
-        <widget class="qSlicerSimpleMarkupsWidget" name="positivePrompts"/>
-      </item>
-
-      <item>
-        <widget class="QLabel">
-          <property name="text">
-            <string>Negative Prompt</string>
-          </property>
-        </widget>
-      </item>
-
-      <item>
-        <widget class="qSlicerSimpleMarkupsWidget" name="negativePrompts"/>
-      </item>
-
+ <class>SegmentHumanBody</class>
+ <widget class="qMRMLWidget" name="SegmentHumanBody">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>274</width>
+    <height>808</height>
+   </rect>
+  </property>
+  <layout class="QVBoxLayout">
+   <item>
+    <widget class="QLabel" name="label_1">
+     <property name="text">
+      <string>Select the model:</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <layout class="QHBoxLayout">
+     <item>
+      <widget class="QComboBox" name="modelFamilyDropdown"/>
+     </item>
+     <item>
+      <widget class="QComboBox" name="samMaskDropdown">
+       <property name="toolTip">
+        <string>Select SAM output mask</string>
+       </property>
+      </widget>
+     </item>
     </layout>
+   </item>
+   <item>
+    <layout class="QHBoxLayout">
+     <item>
+      <widget class="QComboBox" name="modelVariantDropdown"/>
+     </item>
+     <item>
+      <widget class="QPushButton" name="confirmModelSelection">
+       <property name="text">
+        <string>Confirm Model</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <layout class="QHBoxLayout">
+     <item>
+      <widget class="QLabel" name="label">
+       <property name="text">
+        <string>Slice View:</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QComboBox" name="sliceViewDropdown"/>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <layout class="QHBoxLayout">
+     <item>
+      <widget class="QPushButton" name="assignLabel2D">
+       <property name="text">
+        <string>Assign Label (2D)</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="assignLabel3D">
+       <property name="text">
+        <string>Assign Label (3D)</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <layout class="QHBoxLayout">
+     <item>
+      <widget class="QPushButton" name="goToMarkupsButton">
+       <property name="text">
+        <string>Create Box Prompt</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="goToSegmentEditorButton">
+       <property name="text">
+        <string>Configure Labels</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <layout class="QHBoxLayout">
+     <item>
+      <widget class="QPushButton" name="enterInteractiveModeButton">
+       <property name="text">
+        <string>Enter Interactive</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="stopInteractiveModeButton">
+       <property name="text">
+        <string>Stop Interactive</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <layout class="QHBoxLayout">
+     <item>
+      <widget class="QPushButton" name="propagateSelectedLabelButton">
+       <property name="text">
+        <string>Propagate</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="runAutomaticSegmentation">
+       <property name="text">
+        <string>Run Auto</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <widget class="QLabel" name="label_2">
+     <property name="text">
+      <string>Select Image Volume and Segmentation Mask:</string>
+     </property>
+     </widget>
+   </item>
+     
+<item>
+  <widget class="qMRMLNodeComboBox" name="sourceVolumeSelector">
+    <property name="nodeTypes">
+      <stringlist>
+        <string>vtkMRMLScalarVolumeNode</string>
+      </stringlist>
+    </property>
+    <property name="noneEnabled">
+      <bool>false</bool>
+    </property>
+    <property name="addEnabled">
+      <bool>false</bool>
+    </property>
+    <property name="removeEnabled">
+      <bool>false</bool>
+    </property>
+    <property name="selectNodeUponCreation">
+      <bool>true</bool>
+    </property>
   </widget>
+</item>
 
-  <customwidgets>
-    <customwidget>
-      <class>qMRMLWidget</class>
-      <extends>QWidget</extends>
-      <header>qMRMLWidget.h</header>
-      <container>1</container>
-    </customwidget>
-    <customwidget>
-      <class>qSlicerSimpleMarkupsWidget</class>
-      <extends>QWidget</extends>
-      <header>qSlicerSimpleMarkupsWidget.h</header>
-    </customwidget>
-    <customwidget>
-      <class>qMRMLSegmentSelectorWidget</class>
-      <extends>QWidget</extends>
-      <header>qMRMLSegmentSelectorWidget.h</header>
-    </customwidget>
-  </customwidgets>
+<item>
+  <widget class="qMRMLNodeComboBox" name="segmentationNodeSelector">
+    <property name="nodeTypes">
+      <stringlist>
+        <string>vtkMRMLSegmentationNode</string>
+      </stringlist>
+    </property>
+    <property name="addEnabled">
+      <bool>true</bool>
+    </property>
+    <property name="removeEnabled">
+      <bool>true</bool>
+    </property>
+    <property name="noneEnabled">
+      <bool>false</bool>
+    </property>
+    <property name="selectNodeUponCreation">
+      <bool>true</bool>
+    </property>
+  </widget>
+</item>
 
-  <connections>
-    <connection>
-      <sender>SegmentHumanBody</sender>
-      <signal>mrmlSceneChanged(vtkMRMLScene*)</signal>
-      <receiver>positivePrompts</receiver>
-      <slot>setMRMLScene(vtkMRMLScene*)</slot>
-    </connection>
-    <connection>
-      <sender>SegmentHumanBody</sender>
-      <signal>mrmlSceneChanged(vtkMRMLScene*)</signal>
-      <receiver>negativePrompts</receiver>
-      <slot>setMRMLScene(vtkMRMLScene*)</slot>
-    </connection>
-  </connections>
+<item>
+  <layout class="QHBoxLayout">
+    <item>
+      <widget class="qMRMLSegmentSelectorWidget" name="segmentSelector">
+        <property name="noneEnabled">
+          <bool>false</bool>
+        </property>
+      </widget>
+    </item>
 
+    <item>
+      <widget class="QPushButton" name="addSegmentButton">
+        <property name="text">
+          <string>+</string>
+        </property>
+        <property name="toolTip">
+          <string>Add new segment</string>
+        </property>
+        <property name="maximumWidth">
+          <number>32</number>
+        </property>
+      </widget>
+    </item>
+
+    <item>
+      <widget class="QPushButton" name="removeSegmentButton">
+        <property name="text">
+          <string>-</string>
+        </property>
+        <property name="toolTip">
+          <string>Remove selected segment</string>
+        </property>
+        <property name="maximumWidth">
+          <number>32</number>
+        </property>
+      </widget>
+    </item>
+  </layout>
+</item>
+   <item>
+    <widget class="qSlicerSimpleMarkupsWidget" name="positivePrompts"/>
+   </item>
+   <item>
+    <widget class="QLabel" name="label">
+     <property name="text">
+      <string>Negative Prompt</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="qSlicerSimpleMarkupsWidget" name="negativePrompts"/>
+   </item>
+  </layout>
+ </widget>
+ <customwidgets>
+  <customwidget>
+   <class>qMRMLNodeComboBox</class>
+   <extends>QWidget</extends>
+   <header>qMRMLNodeComboBox.h</header>
+  </customwidget>
+  <customwidget>
+   <class>qMRMLWidget</class>
+   <extends>QWidget</extends>
+   <header>qMRMLWidget.h</header>
+   <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>qSlicerWidget</class>
+   <extends>QWidget</extends>
+   <header>qSlicerWidget.h</header>
+   <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>qSlicerSimpleMarkupsWidget</class>
+   <extends>qSlicerWidget</extends>
+   <header>qSlicerSimpleMarkupsWidget.h</header>
+  </customwidget>
+  <customwidget>
+   <class>qMRMLSegmentSelectorWidget</class>
+   <extends>qMRMLWidget</extends>
+   <header>qMRMLSegmentSelectorWidget.h</header>
+  </customwidget>
+ </customwidgets>
+ <resources/>
+ <connections>
+  <connection>
+   <sender>SegmentHumanBody</sender>
+   <signal>mrmlSceneChanged(vtkMRMLScene*)</signal>
+   <receiver>positivePrompts</receiver>
+   <slot>setMRMLScene(vtkMRMLScene*)</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>20</x>
+     <y>20</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>20</x>
+     <y>20</y>
+    </hint>
+   </hints>
+  </connection>
+  <connection>
+   <sender>SegmentHumanBody</sender>
+   <signal>mrmlSceneChanged(vtkMRMLScene*)</signal>
+   <receiver>negativePrompts</receiver>
+   <slot>setMRMLScene(vtkMRMLScene*)</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>20</x>
+     <y>20</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>20</x>
+     <y>20</y>
+    </hint>
+   </hints>
+  </connection>
+ </connections>
 </ui>
