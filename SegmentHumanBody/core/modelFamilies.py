@@ -66,7 +66,6 @@ class SPXModelFamily(BaseModelFamily):
 
     def confirm_model(self):
         model_key = self._get_model_key()
-        #print(f"[SPX] Loading model: {model_key}")
         self.model = ModelRegistry.get_model(model_key)
 
     def on_propagate(self, **kwargs):
@@ -82,21 +81,14 @@ class SPXModelFamily(BaseModelFamily):
         pass
 
     def onRender(self, img, pos_points, neg_points, **kwargs):
-        #print("[ModelFamily] onRender called")
-        #print("[ModelFamily] kwargs:", kwargs)
         if not self.model:
             return None
 
-        #print("[ModelFamily] Calling model.forward")
-
-        # --- Run SPX ---
         labels = self.model.forward(img=img, **kwargs)
 
-        #print("[ModelFamily] model.forward returned")
         if not pos_points:
             return None
 
-        # --- Select labels ---
         selected_labels = set()
 
         for x, y in pos_points:

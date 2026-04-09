@@ -1,5 +1,5 @@
 import qt, vtk, slicer
-import logging, json
+import logging, ast
 import numpy as np
 from slicer.ScriptedLoadableModule import (
     ScriptedLoadableModule,
@@ -10,6 +10,8 @@ from slicer.util import VTKObservationMixin
 
 from core.modelFamilies import BaseModelFamily, SAMFamily, SPXModelFamily, AutoModelFamily
 from core.utils import call_if_exists, get_slice_from_volume, write_slice_to_volume
+from core.modelRegistry import ModelRegistry
+
 
 log = logging.getLogger(__name__)
 
@@ -69,6 +71,7 @@ class SegmentationRenderer:
             #print("[Renderer] STOP called")
 
             slicer.util.errorDisplay(f"Rendering stopped:\n{str(e)}")
+            self.widget.setInteractiveState(False)
 
         finally:
             self.widget._isRendering = False
@@ -118,6 +121,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.segmentSelector.setMRMLScene(slicer.mrmlScene)
         self.ui.segmentSelector.segmentationNodeSelectorVisible = False
         self.ui.docLinkLabel.setOpenExternalLinks(True)
+        self.setInteractiveState(False)
 
         self.model_classes = {
             'None': BaseModelFamily,
@@ -355,10 +359,44 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             return {}
 
         try:
-            return json.loads(text)
+            # Convert "a=10, b=None" → "{'a':10, 'b':None}"
+            items = []
+            for part in text.split(","):
+                if not part.strip():
+                    continue
+                key, value = part.split("=", 1)
+                items.append(f"'{key.strip()}': {value.strip()}")
+
+            dict_str = "{" + ", ".join(items) + "}"
+
+            return ast.literal_eval(dict_str)
 
         except Exception as e:
-            raise ValueError(f"Invalid JSON:\n{str(e)}")
+            raise ValueError(f"Invalid parameter format:\n{str(e)}")
+    
+    def updateParamPlaceholder(self):
+        if not self.modelFamily or not self.modelFamily.variant:
+            self.ui.paramTextEdit.setPlaceholderText("Model Table Loading Failed. Please Re-install the Module.")
+            return
+
+        try:
+
+            if hasattr(self.modelFamily, "_get_model_key"):
+                key = self.modelFamily._get_model_key()
+            else:
+                key = self.modelFamily.variant
+
+            model_class = getattr(ModelRegistry, "model_cache", {}).get(key)
+
+            if not model_class:
+                model_class = ModelRegistry.instantiate_model(key)
+
+            placeholder = getattr(model_class, "PARAM_HINT", "Param Hint Not Provided")
+
+        except Exception:
+            placeholder = "Model Does Not Exsits. Please Select Other Models."
+
+        self.ui.paramTextEdit.setPlaceholderText(placeholder)
     
     def updateDocLink(self):
         model = getattr(self.modelFamily, "model", None)
@@ -393,6 +431,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.modelFamily.variant = self.modelFamily.VARIANTS[0]
 
         self.updateUIVisibility()
+        self.updateParamPlaceholder()
 
     def updateModelVariants(self):
         dropdown = self.ui.modelVariantDropdown
@@ -420,6 +459,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         variant = self.ui.modelVariantDropdown.currentText
         self.modelFamily.variant = variant
+        self.updateParamPlaceholder()
 
     def onConfirmClicked(self, *args):
         if not self.modelFamily:
@@ -439,6 +479,10 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         else:
             button.setEnabled(True)
             button.setText("Confirm Model Selection")
+    
+    def setInteractiveState(self, is_running: bool):
+        self.ui.enterInteractiveModeButton.setEnabled(not is_running)
+        self.ui.stopInteractiveModeButton.setEnabled(is_running)
 
     def on_go_to_editor(self, *args):
         slicer.util.selectModule('SegmentEditor')
@@ -739,12 +783,14 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
             widget.renderer = SegmentationRenderer(widget)
 
         widget.renderer.start()
+        widget.setInteractiveState(True)
 
 
     def on_stop_interactive(self, widget):
 
         if widget.renderer:
             widget.renderer.stop()
+            widget.setInteractiveState(False)
 
     def on_assign_2d(self, widget):
         call_if_exists(widget.modelFamily, 'on_assign_2d')
