@@ -1,11 +1,13 @@
 import numpy as np
 
 
-class SPX_Tester:
+class SPX_Tester2D:
+    DOC_URL = None
     def __init__(self):
-        print('SPX_Tester_loaded')
+        #print('SPX_Tester2D_loaded')
+        pass
 
-    def forward(self, *args, **kwargs):
+    def forward(self, **kwargs):
         img = kwargs["img"]
 
         if img.ndim == 3:
@@ -25,7 +27,41 @@ class SPX_Tester:
                 labels[i, j] = y_coords[i] * gw + x_coords[j] + 1
 
         return labels
+    
+class SPX_SLIC2D:
+    DOC_URL = "https://scikit-image.org/docs/stable/api/skimage.segmentation.html#skimage.segmentation.slic"
+    def __init__(self):
+        from skimage.segmentation import slic
+        self.slic = slic
+        #print('SPX_SLIC2D_loaded')
+        
 
+    def forward(self, **kwargs):
+        #print("[Model] forward called")
+        #print("[Model] kwargs:", kwargs)
+        img = kwargs.pop("img")
+        
+        if img is None:
+            raise ValueError("Missing required argument: img")
+        #print("[Model] calling slic")
+        return self.slic(img, **kwargs)
+
+class SPX_Felzenszwalb2D:
+    DOC_URL = "https://scikit-image.org/docs/stable/api/skimage.segmentation.html#skimage.segmentation.felzenszwalb"
+    def __init__(self):
+        from skimage.segmentation import felzenszwalb
+        self.felzenszwalb = felzenszwalb
+        #print('SPX_Felzenszwalb2D_loaded')
+        
+
+
+    def forward(self, **kwargs):
+        img = kwargs.pop("img")
+        if img is None:
+            raise ValueError("Missing required argument: img")
+
+        return self.felzenszwalb(img, **kwargs)
+        
 
 class ModelRegistry:
     model_cache = {}
@@ -42,13 +78,16 @@ class ModelRegistry:
 
     @staticmethod
     def check_dependencies(key):
-        print(f"[Dependencies] Checking for {key}")
+        #print(f"[Dependencies] Checking for {key}")
+        pass
 
     @staticmethod
     def instantiate_model(key):
-        print(f"[Instantiation] Fetching model for {key}")
+        #print(f"[Instantiation] Fetching model for {key}")
+        # #print(key)
 
-        if key == 'SPX_Tester':
-            return SPX_Tester()
-
-        raise ValueError(f"{key} not implemented")
+        try:
+            return globals()[key]()
+        
+        except:
+            raise ValueError(f"{key} not implemented")

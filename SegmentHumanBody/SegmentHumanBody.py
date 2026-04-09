@@ -1,5 +1,5 @@
 import qt, vtk, slicer
-import logging
+import logging, json
 import numpy as np
 from slicer.ScriptedLoadableModule import (
     ScriptedLoadableModule,
@@ -48,13 +48,31 @@ class SegmentationRenderer:
 
     def update(self):
         if self.widget._pauseRender or self.widget._isRendering:
+            #print("[Renderer] Skipping frame")
             return
+
+        #print("[Renderer] START update")
 
         self.widget._isRendering = True
         try:
+            #print("[Renderer] Calling logic.onRender")
             self.widget.logic.onRender(self.widget.modelFamily, self.widget)
+            #print("[Renderer] logic.onRender finished OK")
+
+        except Exception as e:
+            #print("[Renderer] EXCEPTION CAUGHT")
+            #print(e)
+
+            log.error(f"[Renderer Error] {e}")
+
+            self.stop()
+            #print("[Renderer] STOP called")
+
+            slicer.util.errorDisplay(f"Rendering stopped:\n{str(e)}")
+
         finally:
             self.widget._isRendering = False
+            #print("[Renderer] END update")
 #
 # Widget
 #
@@ -74,6 +92,10 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.currentViewName = None  # default
         self._isRendering = False
         self._pauseRender = False
+        self.MODEL_DOCS = {
+            "SLIC": "https://scikit-image.org/docs/stable/api/skimage.segmentation.html#skimage.segmentation.slic",
+            "Felzenszwalb": "https://scikit-image.org/docs/stable/api/skimage.segmentation.html#skimage.segmentation.felzenszwalb",
+        }
 
 
     # -------------------------
@@ -90,12 +112,13 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         self.layout.addWidget(uiWidget)
         self.ui = slicer.util.childWidgetVariables(uiWidget)
+        
         self.ui.sourceVolumeSelector.setMRMLScene(slicer.mrmlScene)
         self.ui.segmentationNodeSelector.setMRMLScene(slicer.mrmlScene)
         self.ui.segmentSelector.setMRMLScene(slicer.mrmlScene)
         self.ui.segmentSelector.segmentationNodeSelectorVisible = False
-        
-        
+        self.ui.docLinkLabel.setOpenExternalLinks(True)
+
         self.model_classes = {
             'None': BaseModelFamily,
             'SAM-Style': SAMFamily,
@@ -324,7 +347,35 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         self._parameterNode.Modified()
         self.updateGUIFromParameterNode()
-        
+    
+    def getUserParameters(self):
+        text = self.ui.paramTextEdit.toPlainText()
+
+        if not text.strip():
+            return {}
+
+        try:
+            return json.loads(text)
+
+        except Exception as e:
+            raise ValueError(f"Invalid JSON:\n{str(e)}")
+    
+    def updateDocLink(self):
+        model = getattr(self.modelFamily, "model", None)
+
+        if not model:
+            self.ui.docLinkLabel.setText("")
+            return
+
+        url = getattr(model, "DOC_URL", None)
+
+        if url:
+            self.ui.docLinkLabel.setText(
+                f'<a href="{url}">View documentation</a>'
+            )
+        else:
+            self.ui.docLinkLabel.setText("")
+
     # -------------------------
     # Model Switching
     # -------------------------
@@ -376,6 +427,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         self.logic.on_confirm_model(self)
         self.setConfirmState(True)
+        self.updateDocLink()
 
 
     def setConfirmState(self, confirmed: bool):
@@ -558,6 +610,7 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
     # Model Interaction
     # -------------------------
     def onRender(self, modelFamily, widget):
+        #print("[Logic] onRender called")
         if not modelFamily or not modelFamily.model:
             return
 
@@ -595,14 +648,25 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         scribbles_ijk = self._ras_to_ijk(volumeNode, scribbles, axis)
 
         # --- Call model family (PURE) ---
-        result = call_if_exists(modelFamily, "onRender", img=img,
+        params = widget.getUserParameters()
+        if params is None:
+            return
+
+        #print("[Logic] Params:", params)
+        #print("[Logic] Calling modelFamily.onRender")
+        result = call_if_exists(
+            modelFamily,
+            "onRender",
+            img=img,
             pos_points=scribbles_ijk["positive"],
             neg_points=scribbles_ijk["negative"],
+            **params
         )
-
+        
         # --- Handle result (back to slicer) ---
         if result is not None:
             self.applyResult(widget, result, axis, sliceIndex)
+        #print("[Logic] modelFamily.onRender returned:", type(result))
     
     def applyResult(self, widget, mask2d, axis, sliceIndex):
         volumeNode = widget.ui.sourceVolumeSelector.currentNode()
@@ -623,6 +687,7 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
 
     def onModelConfirmed(self, modelFamily):
         call_if_exists(modelFamily, 'on_confirm_model_selection')
+        self.ui.docLinkLabel.setText("")
 
     def on_confirm_model(self, widget):
         if not widget.modelFamily:

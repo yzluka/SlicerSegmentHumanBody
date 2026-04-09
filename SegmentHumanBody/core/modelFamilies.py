@@ -7,14 +7,14 @@ class BaseModelFamily:
     def __init__(self, variant=None):
         self.variant = variant
         self.model = None
-        print(f"INIT CALLED: {type(self).__name__}")
+        #print(f"INIT CALLED: {type(self).__name__}")
 
     def confirm_model(self):
         if not self.variant:
-            print("[Confirm] No variant selected")
+            #print("[Confirm] No variant selected")
             return
 
-        print(f"[Confirm] {type(self).__name__} → {self.variant}")
+        #print(f"[Confirm] {type(self).__name__} → {self.variant}")
 
         self.model = ModelRegistry.get_model(self.variant)
 
@@ -45,24 +45,14 @@ class SAMFamily(BaseModelFamily):
 # ------------------------
 
 class SPXModelFamily(BaseModelFamily):
-    VARIANTS = ['SLIC', 'Felzenszwalb','Naive_Grid']
-
+    
+    
     MODEL_MAP = {
-        'SLIC': None,
-        'Felzenszwalb': None,
-        'Naive_Grid': 'SPX_Tester'
+        'SLIC-2D': 'SPX_SLIC2D',
+        'Felzenszwalb-2D': 'SPX_Felzenszwalb2D',
+        'Naive_Grid-2D': 'SPX_Tester2D'
     }
-
-    def confirm_model(self):
-        model_key = self._get_model_key()
-        print(f"[SPX] Loading model: {model_key}")
-        self.model = ModelRegistry.get_model(model_key)
-
-    def on_propagate(self, **kwargs):
-        if not self.model:
-            raise RuntimeError("Model not confirmed")
-
-        return self.model.forward(**kwargs)
+    VARIANTS = sorted(list(MODEL_MAP.keys()))
 
     def _get_model_key(self):
         if not self.variant:
@@ -72,6 +62,18 @@ class SPXModelFamily(BaseModelFamily):
             raise ValueError(f"Unknown variant: {self.variant}")
 
         return self.MODEL_MAP[self.variant]
+
+
+    def confirm_model(self):
+        model_key = self._get_model_key()
+        #print(f"[SPX] Loading model: {model_key}")
+        self.model = ModelRegistry.get_model(model_key)
+
+    def on_propagate(self, **kwargs):
+        if not self.model:
+            raise RuntimeError("Model not confirmed")
+
+        return self.model.forward(**kwargs)
     
     def on_enter_interactive(self, **kwargs):
         pass
@@ -80,12 +82,17 @@ class SPXModelFamily(BaseModelFamily):
         pass
 
     def onRender(self, img, pos_points, neg_points, **kwargs):
+        #print("[ModelFamily] onRender called")
+        #print("[ModelFamily] kwargs:", kwargs)
         if not self.model:
             return None
 
-        # --- Run SPX ---
-        labels = self.model.forward(img=img)
+        #print("[ModelFamily] Calling model.forward")
 
+        # --- Run SPX ---
+        labels = self.model.forward(img=img, **kwargs)
+
+        #print("[ModelFamily] model.forward returned")
         if not pos_points:
             return None
 
@@ -112,10 +119,12 @@ class AutoModelFamily(BaseModelFamily):
     VARIANTS = ['BreastCT', 'PE_SEG']
 
     def on_assign_2d(self, **kwargs):
-        print("[Interactive] assign 2D")
+        #print("[Interactive] assign 2D")
+        pass
 
     def on_assign_3d(self, **kwargs):
-        print("[Interactive] assign 3D")
+        #print("[Interactive] assign 3D")
+        pass
 
     def on_automatic_segmentation(self, **kwargs):
         if not self.model:

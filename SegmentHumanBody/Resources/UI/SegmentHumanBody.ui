@@ -46,8 +46,31 @@
      </item>
     </layout>
    </item>
-   <item>
-    <layout class="QHBoxLayout">
+        <item>
+  <widget class="QLabel" name="paramLabel">
+    <property name="text">
+      <string>Customized Hyper-Parameters (Please follow the sample format):</string>
+    </property>
+  </widget>
+</item>
+
+<item>
+  <widget class="QPlainTextEdit" name="paramTextEdit">
+    <property name="placeholderText">
+      <string>{"param1": value1, "param2": value2}</string>
+    </property>
+  </widget>
+</item>
+<item>
+   <widget class="QLabel" name="docLinkLabel">
+      <property name="text">
+        <string></string>
+      </property>
+   </widget>
+</item>
+
+<item>
+  <layout class="QHBoxLayout">
      <item>
       <widget class="QLabel" name="label">
        <property name="text">
