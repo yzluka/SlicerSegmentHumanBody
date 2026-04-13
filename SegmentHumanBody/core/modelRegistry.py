@@ -1,99 +1,53 @@
-import numpy as np
+from .models.spx import SPX_Tester2D, SPX_SLIC2D, SPX_Felzenszwalb2D
 
+# Maps registry key → model class.
+# Add new models here; do not use globals() lookups.
+_MODEL_FACTORIES: dict = {
+    'SPX_Tester2D':       SPX_Tester2D,
+    'SPX_SLIC2D':         SPX_SLIC2D,
+    'SPX_Felzenszwalb2D': SPX_Felzenszwalb2D,
+}
 
-class SPX_Tester2D:
-    DOC_URL = None
-    PARAM_HINT = 'gh=9,gw=9' 
-    def __init__(self):
-        #print('SPX_Tester2D_loaded')
-        pass
-
-    def forward(self, **kwargs):
-        img = kwargs["img"]
-
-        if img.ndim == 3:
-            H, W = img.shape[:2]
-        else:
-            H, W = img.shape
-
-        gh = kwargs.get('gh',0)
-        gw = kwargs.get('gw',0)
-
-
-        gh, gw = 9, 9
-        
-
-        y_coords = np.linspace(0, gh, H, endpoint=False).astype(int)
-        x_coords = np.linspace(0, gw, W, endpoint=False).astype(int)
-
-        labels = np.zeros((H, W), dtype=np.int32)
-
-        for i in range(H):
-            for j in range(W):
-                labels[i, j] = y_coords[i] * gw + x_coords[j] + 1
-
-        return labels
-    
-class SPX_SLIC2D:
-    DOC_URL = "https://scikit-image.org/docs/stable/api/skimage.segmentation.html#skimage.segmentation.slic"
-    PARAM_HINT = "n_segments=100, compactness=10, sigma=1"
-    def __init__(self):
-        from skimage.segmentation import slic
-        self.slic = slic
-        
-
-    def forward(self, **kwargs):
-        img = kwargs.pop("img")
-        
-        if img is None:
-            raise ValueError("Missing required argument: img")
-        return self.slic(img, **kwargs)
-
-class SPX_Felzenszwalb2D:
-    DOC_URL = "https://scikit-image.org/docs/stable/api/skimage.segmentation.html#skimage.segmentation.felzenszwalb"
-    PARAM_HINT = "scale=100, sigma=0.5, min_size=50"
-    def __init__(self):
-        from skimage.segmentation import felzenszwalb
-        self.felzenszwalb = felzenszwalb
-        
-
-
-    def forward(self, **kwargs):
-        img = kwargs.pop("img")
-
-        if img is None:
-            raise ValueError("Missing required argument: img")
-        img = img.astype(np.float32)
-        img_min, img_max = img.min(), img.max()
-
-        if img_max > img_min:
-            img = (img - img_min) / (img_max - img_min)
-
-        return self.felzenszwalb(img, **kwargs)
-        
 
 class ModelRegistry:
-    model_cache = {}
+    """Lazy-instantiating, session-scoped model cache."""
 
-    @staticmethod
-    def get_model(key):
-        if key not in ModelRegistry.model_cache:
-            ModelRegistry.check_dependencies(key)
-            model = ModelRegistry.instantiate_model(key)
-            ModelRegistry.model_cache[key] = model
-            return model
+    model_cache: dict = {}
 
-        return ModelRegistry.model_cache[key]
+    @classmethod
+    def get_model(cls, key: str):
+        """Return a cached model instance, instantiating it on first access."""
+        if key not in cls.model_cache:
+            cls.model_cache[key] = cls._instantiate(key)
+        return cls.model_cache[key]
 
-    @staticmethod
-    def check_dependencies(key):
-        pass
+    @classmethod
+    def _instantiate(cls, key: str):
+        factory = _MODEL_FACTORIES.get(key)
+        if factory is None:
+            raise ValueError(
+                f"Unknown model key: '{key}'. "
+                f"Available: {sorted(_MODEL_FACTORIES)}"
+            )
+        return factory()
 
-    @staticmethod
-    def instantiate_model(key):
-        
-        try:
-            return globals()[key]()
-        
-        except:
-            raise ValueError(f"{key} not implemented")
+    @classmethod
+    def get_param_hint(cls, key: str) -> str:
+        """Return PARAM_HINT for a model without instantiating it."""
+        factory = _MODEL_FACTORIES.get(key)
+        if factory is None:
+            return "Model not available. Please select a different model."
+        return getattr(factory, 'PARAM_HINT', 'No parameter hint provided.')
+
+    @classmethod
+    def register(cls, key: str, factory):
+        """Register a new model factory at runtime (e.g. for plugins)."""
+        _MODEL_FACTORIES[key] = factory
+
+    # ------------------------------------------------------------------ #
+    # Legacy shim — kept so existing callers are not broken               #
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def instantiate_model(cls, key: str):
+        """Create and return a *new* (uncached) instance."""
+        return cls._instantiate(key)

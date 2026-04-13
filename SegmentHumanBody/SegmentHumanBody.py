@@ -11,6 +11,7 @@ from slicer.util import VTKObservationMixin
 from core.modelFamilies import BaseModelFamily, SAMFamily, SPXModelFamily, AutoModelFamily
 from core.utils import call_if_exists, get_slice_from_volume, write_slice_to_volume
 from core.modelRegistry import ModelRegistry
+from core.undoStack import UndoStack
 
 
 log = logging.getLogger(__name__)
@@ -95,10 +96,10 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.currentViewName = None  # default
         self._isRendering = False
         self._pauseRender = False
-        self.MODEL_DOCS = {
-            "SLIC": "https://scikit-image.org/docs/stable/api/skimage.segmentation.html#skimage.segmentation.slic",
-            "Felzenszwalb": "https://scikit-image.org/docs/stable/api/skimage.segmentation.html#skimage.segmentation.felzenszwalb",
-        }
+
+        # Undo tracking
+        self._interactive_point_stack = []  # (node, controlPointID) — interactive mode
+        self._undo_shortcut = None
 
 
     # -------------------------
@@ -138,6 +139,11 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # Lock selectors
         self.ui.positivePrompts.setNodeSelectorVisible(False)
         self.ui.negativePrompts.setNodeSelectorVisible(False)
+
+        # Ctrl+Z undo shortcut — parented to the module widget so it is
+        # active only while this panel is visible.
+        self._undo_shortcut = qt.QShortcut(qt.QKeySequence("Ctrl+Z"), uiWidget)
+        self._undo_shortcut.connect('activated()', self.onUndo)
 
         qt.QTimer.singleShot(0, self._initializeAfterSetup)
 
@@ -215,6 +221,11 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                     vtk.vtkCommand.ModifiedEvent,
                     self._onMarkupsModified
                 )
+                self.addObserver(
+                    node,
+                    slicer.vtkMRMLMarkupsNode.PointAddedEvent,
+                    self._onPointAdded
+                )
 
     def _onMarkupsModified(self, caller=None, event=None):
         if not self._parameterNode:
@@ -225,7 +236,16 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.ui.positivePrompts.currentNode(),
             self.ui.negativePrompts.currentNode(),
         )
-    
+
+    def _onPointAdded(self, caller=None, event=None):
+        """Record each newly added prompt point so Ctrl+Z can remove it."""
+        if caller is None:
+            return
+        n = caller.GetNumberOfControlPoints()
+        if n > 0:
+            cp_id = caller.GetNthControlPointID(n - 1)
+            self._interactive_point_stack.append((caller, cp_id))
+
     def onSliceViewChanged(self, viewName):
         self.currentViewName = viewName
 
@@ -359,7 +379,6 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             return {}
 
         try:
-            # Convert "a=10, b=None" → "{'a':10, 'b':None}"
             items = []
             for part in text.split(","):
                 if not part.strip():
@@ -376,25 +395,19 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     
     def updateParamPlaceholder(self):
         if not self.modelFamily or not self.modelFamily.variant:
-            self.ui.paramTextEdit.setPlaceholderText("Model Table Loading Failed. Please Re-install the Module.")
+            self.ui.paramTextEdit.setPlaceholderText("Select a model variant.")
             return
 
         try:
-
             if hasattr(self.modelFamily, "_get_model_key"):
                 key = self.modelFamily._get_model_key()
             else:
                 key = self.modelFamily.variant
 
-            model_class = getattr(ModelRegistry, "model_cache", {}).get(key)
-
-            if not model_class:
-                model_class = ModelRegistry.instantiate_model(key)
-
-            placeholder = getattr(model_class, "PARAM_HINT", "Param Hint Not Provided")
+            placeholder = ModelRegistry.get_param_hint(key)
 
         except Exception:
-            placeholder = "Model Does Not Exsits. Please Select Other Models."
+            placeholder = "Model not available. Please select a different model."
 
         self.ui.paramTextEdit.setPlaceholderText(placeholder)
     
@@ -504,6 +517,14 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if not segmentID:
             return
 
+        # The working mask and render key are segment-specific — switching
+        # segments must invalidate both so the next render reads fresh data.
+        self.logic.reset_render_state()
+
+        # Prompt-point history is per-session; clear it on segment switch so
+        # Ctrl+Z cannot remove points that belong to a different segment.
+        self._interactive_point_stack.clear()
+
         self._pauseRender = True
         try:
             self.clearPrompts()
@@ -519,6 +540,29 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         if negNode:
             negNode.RemoveAllControlPoints()
+
+        self._interactive_point_stack.clear()
+
+    def onUndo(self):
+        """Ctrl+Z handler.
+
+        Interactive mode: remove the most recently added prompt point.
+        Non-interactive mode: restore the previous 2-D slice state from the
+        per-segment undo stack.
+        """
+        in_interactive = bool(self.renderer and self.renderer.timer.isActive())
+
+        if in_interactive:
+            # Pop and remove the last added prompt point.
+            while self._interactive_point_stack:
+                node, cp_id = self._interactive_point_stack.pop()
+                idx = node.GetControlPointIndexByID(cp_id)
+                if idx >= 0:
+                    node.RemoveNthControlPoint(idx)
+                    return   # removed one point — done for this undo step
+            # Nothing left to undo
+        else:
+            self.logic.undo(self)
 
     def onAddSegment(self, *args):
         self._pauseRender = True
@@ -590,8 +634,71 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
 class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
 
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # --- Render-skip optimisation ---
+        # Tracks the last (points, axis, slice, params) tuple that produced a
+        # result.  If it matches the current frame we skip applyResult entirely,
+        # avoiding a full 3D labelmap read/write on every idle tick.
+        self._last_render_key = None
+
+        # --- Working-mask optimisation ---
+        # We keep a single pre-allocated numpy array for the current segment's
+        # 3D labelmap.  Only the 2D slice changes each frame, so we update it
+        # in-place and push back to Slicer, eliminating the per-frame
+        # arrayFromSegmentBinaryLabelmap() call and its .copy().
+        self._working_mask = None
+        self._working_mask_segment = None   # (segNodeID, segmentID) sentinel
+
+        # --- Non-interactive undo ---
+        # Stores 2D slice snapshots keyed by (segNodeID, segmentID) so mask
+        # changes from propagate/expand operations can be reversed.
+        self._undo = UndoStack()
+
     def setDefaultParameters(self, parameterNode):
         pass
+
+    def reset_render_state(self):
+        """Clear per-segment caches.  Call whenever the active segment or
+        volume changes so the next render reads fresh data from Slicer."""
+        self._last_render_key = None
+        self._working_mask = None
+        self._working_mask_segment = None
+
+    def undo(self, widget):
+        """Restore the previous 2-D slice state for the active segment.
+
+        Called by the Widget in non-interactive mode when Ctrl+Z is pressed.
+        """
+        segNode, segmentID = self.getCurrentSegment(widget)
+        if not segNode or not segmentID:
+            return
+
+        entry = self._undo.pop(segNode.GetID(), segmentID)
+        if entry is None:
+            return
+
+        axis, sliceIndex, slice_2d = entry
+
+        volumeNode = widget.ui.sourceVolumeSelector.currentNode()
+        if not volumeNode:
+            return
+
+        # Ensure the working mask is loaded for this segment.
+        segment_key = (segNode.GetID(), segmentID)
+        if self._working_mask is None or self._working_mask_segment != segment_key:
+            raw = slicer.util.arrayFromSegmentBinaryLabelmap(segNode, segmentID, volumeNode)
+            self._working_mask = raw.copy()
+            self._working_mask_segment = segment_key
+
+        write_slice_to_volume(self._working_mask, slice_2d, axis, sliceIndex)
+        slicer.util.updateSegmentBinaryLabelmapFromArray(
+            self._working_mask, segNode, segmentID, volumeNode
+        )
+
+        # Invalidate the render key so the next interactive render re-applies
+        # the current prompt points on top of the restored slice.
+        self._last_render_key = None
 
     # -------------------------
     # Prompt Nodes
@@ -654,7 +761,6 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
     # Model Interaction
     # -------------------------
     def onRender(self, modelFamily, widget):
-        #print("[Logic] onRender called")
         if not modelFamily or not modelFamily.model:
             return
 
@@ -680,24 +786,37 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         if not volumeNode:
             return
 
-        volumeArray = slicer.util.arrayFromVolume(volumeNode)
         axis, sliceIndex = self.getAxisAndSlice(widget)
-        img = get_slice_from_volume(volumeArray, axis, sliceIndex)
 
-        # --- Convert coordinates ---
-        scribbles = {
-            "positive": pos_points,
-            "negative": neg_points,
-        }
-        scribbles_ijk = self._ras_to_ijk(volumeNode, scribbles, axis)
-
-        # --- Call model family (PURE) ---
+        # --- Build render key before any expensive work ---
+        # pos/neg points are VTK objects; tuple(p) makes them hashable.
         params = widget.getUserParameters()
         if params is None:
             return
 
-        #print("[Logic] Params:", params)
-        #print("[Logic] Calling modelFamily.onRender")
+        render_key = (
+            tuple(tuple(p) for p in pos_points),
+            tuple(tuple(p) for p in neg_points),
+            axis,
+            sliceIndex,
+            tuple(sorted(params.items())) if params else (),
+        )
+
+        # SPXModelFamily.onRender is already cached (no model.forward call on
+        # cache hit), but applyResult still writes the full 3D labelmap to
+        # Slicer on every tick.  Skip it when nothing has changed.
+        if render_key == self._last_render_key:
+            return
+
+        # --- Compute result ---
+        volumeArray = slicer.util.arrayFromVolume(volumeNode)
+        img = get_slice_from_volume(volumeArray, axis, sliceIndex)
+
+        scribbles_ijk = self._ras_to_ijk(volumeNode, {
+            "positive": pos_points,
+            "negative": neg_points,
+        }, axis)
+
         result = call_if_exists(
             modelFamily,
             "onRender",
@@ -706,32 +825,58 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
             neg_points=scribbles_ijk["negative"],
             **params
         )
-        
-        # --- Handle result (back to slicer) ---
+
+        # --- Apply result and record key ---
         if result is not None:
             self.applyResult(widget, result, axis, sliceIndex)
-        #print("[Logic] modelFamily.onRender returned:", type(result))
+            self._last_render_key = render_key
     
     def applyResult(self, widget, mask2d, axis, sliceIndex):
         volumeNode = widget.ui.sourceVolumeSelector.currentNode()
+        if not volumeNode:
+            return
+
         segNode = widget.ui.segmentSelector.currentNode()
         segmentID = widget.ui.segmentSelector.currentSegmentID()
 
-        if not volumeNode or not segNode or not segmentID:
-            return
+        # Auto-create a segmentation node if the user hasn't selected one yet.
+        if not segNode:
+            segNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode")
+            segNode.CreateDefaultDisplayNodes()
+            segNode.SetReferenceImageGeometryParameterFromVolumeNode(volumeNode)
+            self.setVolumeAndSegmentation(widget._parameterNode, volumeNode, segNode)
+            # Update both selectors without triggering downstream signal chains.
+            widget.ui.segmentationNodeSelector.blockSignals(True)
+            widget.ui.segmentationNodeSelector.setCurrentNode(segNode)
+            widget.ui.segmentationNodeSelector.blockSignals(False)
+            widget.ui.segmentSelector.blockSignals(True)
+            widget.ui.segmentSelector.setCurrentNode(segNode)
+            widget.ui.segmentSelector.blockSignals(False)
 
-        mask3d = slicer.util.arrayFromSegmentBinaryLabelmap(segNode, segmentID, volumeNode)
+        # Auto-create the first segment if the segmentation is empty.
+        if not segmentID:
+            segmentID = segNode.GetSegmentation().AddEmptySegment("Segment_1")
+            # Block signals so onSegmentChanged does not clear the prompt points
+            # that triggered this render.
+            widget.ui.segmentSelector.blockSignals(True)
+            widget.ui.segmentSelector.setCurrentSegmentID(segmentID)
+            widget.ui.segmentSelector.blockSignals(False)
+            widget.ui.addSegmentButton.setEnabled(True)
 
-        fullMask = mask3d.copy()
-        write_slice_to_volume(fullMask, mask2d, axis, sliceIndex)
+        # Maintain a persistent 3D working mask so we only read the full
+        # labelmap from Slicer once per segment, not every frame.
+        # We update just the 2D slice in-place each render.
+        segment_key = (segNode.GetID(), segmentID)
+        if self._working_mask is None or self._working_mask_segment != segment_key:
+            raw = slicer.util.arrayFromSegmentBinaryLabelmap(segNode, segmentID, volumeNode)
+            self._working_mask = raw.copy()
+            self._working_mask_segment = segment_key
+
+        write_slice_to_volume(self._working_mask, mask2d, axis, sliceIndex)
 
         slicer.util.updateSegmentBinaryLabelmapFromArray(
-            fullMask, segNode, segmentID, volumeNode
+            self._working_mask, segNode, segmentID, volumeNode
         )
-
-    def onModelConfirmed(self, modelFamily):
-        call_if_exists(modelFamily, 'on_confirm_model_selection')
-        self.ui.docLinkLabel.setText("")
 
     def on_confirm_model(self, widget):
         if not widget.modelFamily:
@@ -767,30 +912,52 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
             slicer.util.warningDisplay("No segment selected.")
             return
 
-        volumeArray = slicer.util.arrayFromVolume(volumeNode)
+        params = widget.getUserParameters()
 
+        volumeArray = slicer.util.arrayFromVolume(volumeNode)
         axis, sliceIndex = self.getAxisAndSlice(widget)
         img = get_slice_from_volume(volumeArray, axis, sliceIndex)
 
-        labels = modelFamily.model.forward(img=img)
+        # Convert negative prompt points to 2-D IJK for this slice so they can
+        # be used to subtract regions in expandSegWithSPX.
+        _, negNode = self.getPromptNodes(widget._parameterNode)
+        neg_points_ras = [
+            negNode.GetNthControlPointPosition(i)
+            for i in range(negNode.GetNumberOfControlPoints())
+        ] if negNode else []
+        neg_ijk = self._ras_to_ijk(
+            volumeNode, {"positive": [], "negative": neg_points_ras}, axis
+        )["negative"]
 
-        self.expandSegWithSPX(segNode, segmentID, volumeNode, labels, axis, sliceIndex)
+        # Delegate to the family so the correct algorithm and user params are
+        # used, and the SPX label cache is consulted before recomputing.
+        labels = call_if_exists(modelFamily, 'on_propagate', img=img, **params)
+
+        if labels is None:
+            slicer.util.warningDisplay("This model does not support propagation.")
+            return
+
+        self.expandSegWithSPX(segNode, segmentID, volumeNode, labels, axis, sliceIndex,
+                              neg_points=neg_ijk)
     
     
     def on_enter_interactive(self, widget):
-    
         if not widget.renderer:
             widget.renderer = SegmentationRenderer(widget)
+
+        # Force a fresh read from Slicer on the first render: the user may
+        # have edited the segment outside of interactive mode.
+        self.reset_render_state()
 
         widget.renderer.start()
         widget.setInteractiveState(True)
 
-
     def on_stop_interactive(self, widget):
-
         if widget.renderer:
             widget.renderer.stop()
             widget.setInteractiveState(False)
+
+        self.reset_render_state()
 
     def on_assign_2d(self, widget):
         call_if_exists(widget.modelFamily, 'on_assign_2d')
@@ -799,7 +966,7 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         call_if_exists(widget.modelFamily, 'on_assign_3d')
     
     def on_automatic_segmentation(self, widget):
-        call_if_exists(widget.modelFamily, 'run')
+        call_if_exists(widget.modelFamily, 'on_automatic_segmentation')
 
 
     def _ras_to_ijk(self, volumeNode, scrib, axis):
@@ -830,31 +997,6 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
             "positive": convert(scrib["positive"]),
             "negative": convert(scrib["negative"])
         }
-
-    def updateSegmentationFromArray(self, mask, volumeNode, sliceIndex):
-
-        # --- create segmentation node ---
-        segNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode")
-        segNode.CreateDefaultDisplayNodes()
-        segNode.SetReferenceImageGeometryParameterFromVolumeNode(volumeNode)
-
-        # --- create segment ---
-        segmentID = segNode.GetSegmentation().AddEmptySegment("SPX")
-
-        # --- make full 3D mask ---
-        volumeArray = slicer.util.arrayFromVolume(volumeNode)
-        fullMask = np.zeros_like(volumeArray, dtype=np.uint8)
-
-        axis = self.getSliceAccessorDimension(volumeNode)
-
-        write_slice_to_volume(fullMask, mask, axis, sliceIndex)
-
-        # --- push to slicer ---
-        slicer.util.updateSegmentBinaryLabelmapFromArray(
-            fullMask, segNode, segmentID, volumeNode
-        )
-
-
 
     def getAxisAndSlice(self, widget):
         viewName = widget.currentViewName
@@ -887,19 +1029,36 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         return segNode, segmentID
 
 
-    def expandSegWithSPX(self, segNode, segmentID, volumeNode, labels, axis, sliceIndex):
-
+    def expandSegWithSPX(self, segNode, segmentID, volumeNode, labels, axis, sliceIndex,
+                         neg_points=None):
         mask3d = slicer.util.arrayFromSegmentBinaryLabelmap(segNode, segmentID, volumeNode)
 
         sliceMask = get_slice_from_volume(mask3d, axis, sliceIndex)
 
-        selected_labels = np.unique(labels[sliceMask > 0])
-        expanded = np.isin(labels, selected_labels).astype(np.uint8)
+        # Snapshot the current slice before modifying it so Ctrl+Z can restore.
+        self._undo.push(segNode.GetID(), segmentID, axis, sliceIndex, sliceMask)
 
-        fullMask = np.zeros_like(mask3d, dtype=np.uint8)
+        selected_labels = set(np.unique(labels[sliceMask > 0]).tolist())
+
+        # Remove regions touched by negative prompt points.
+        if neg_points:
+            for x, y in neg_points:
+                if 0 <= y < labels.shape[0] and 0 <= x < labels.shape[1]:
+                    selected_labels.discard(int(labels[y, x]))
+
+        expanded = np.isin(labels, list(selected_labels)).astype(np.uint8)
+
+        # Preserve all other annotated slices — only replace the current one.
+        fullMask = mask3d.copy()
         write_slice_to_volume(fullMask, expanded, axis, sliceIndex)
 
         slicer.util.updateSegmentBinaryLabelmapFromArray(
             fullMask, segNode, segmentID, volumeNode
         )
+
+        # Keep the working mask in sync so the next interactive render does
+        # not overwrite the propagation result with stale data.
+        segment_key = (segNode.GetID(), segmentID)
+        if self._working_mask_segment == segment_key:
+            write_slice_to_volume(self._working_mask, expanded, axis, sliceIndex)
     
