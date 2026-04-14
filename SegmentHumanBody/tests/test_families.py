@@ -161,6 +161,75 @@ class TestSPXModelFamily(unittest.TestCase):
         result = fam.onRender(img=img, pos_points=[[3, 5]], neg_points=[[3, 5]])
         self.assertIsNone(result)
 
+    # ---- base_mask (interactive additive / subtractive mode) ----
+
+    def test_onrender_with_base_mask_neg_erases_existing_region(self):
+        """Neg-only (no pos): neg point erases its SPX region from the base mask."""
+        fam = self._make_family_with_fake_model()
+        img = np.zeros((10, 20), dtype=np.uint8)
+        # Base: entire image painted.
+        base = np.ones((10, 20), dtype=np.uint8)
+        # Neg point on right half (label 2) → right half cleared, left kept.
+        result = fam.onRender(img=img, pos_points=[], neg_points=[[15, 5]], base_mask=base)
+        self.assertIsNotNone(result)
+        np.testing.assert_array_equal(result[:, :10], 1)
+        np.testing.assert_array_equal(result[:, 10:], 0)
+
+    def test_onrender_with_base_mask_pos_adds_to_existing(self):
+        """Pos point adds its SPX region on top of the base mask."""
+        fam = self._make_family_with_fake_model()
+        img = np.zeros((10, 20), dtype=np.uint8)
+        # Base: only right half painted.
+        base = np.zeros((10, 20), dtype=np.uint8)
+        base[:, 10:] = 1
+        # Pos on left half → left half added, right half kept from base.
+        result = fam.onRender(img=img, pos_points=[[3, 5]], neg_points=[], base_mask=base)
+        self.assertIsNotNone(result)
+        np.testing.assert_array_equal(result, 1)
+
+    def test_onrender_with_base_mask_neg_wins_over_pos(self):
+        """When pos and neg point to the same SPX region, neg wins (region erased)."""
+        fam = self._make_family_with_fake_model()
+        img = np.zeros((10, 20), dtype=np.uint8)
+        base = np.ones((10, 20), dtype=np.uint8)
+        # Both pos and neg on left half → left erased, right kept from base.
+        result = fam.onRender(img=img, pos_points=[[3, 5]], neg_points=[[3, 5]], base_mask=base)
+        self.assertIsNotNone(result)
+        np.testing.assert_array_equal(result[:, :10], 0)
+        np.testing.assert_array_equal(result[:, 10:], 1)
+
+    def test_onrender_with_base_mask_preserves_base_when_no_matching_prompts(self):
+        """Out-of-bounds prompts → base mask returned unchanged."""
+        fam = self._make_family_with_fake_model()
+        img = np.zeros((10, 20), dtype=np.uint8)
+        base = np.ones((10, 20), dtype=np.uint8)
+        result = fam.onRender(img=img, pos_points=[[999, 999]], neg_points=[], base_mask=base)
+        # 999,999 is out of bounds → pos_only_labels is empty → base unchanged
+        self.assertIsNotNone(result)
+        np.testing.assert_array_equal(result, base)
+
+    def test_onrender_base_mask_not_included_in_spx_cache_key(self):
+        """Different base_mask values must not cause extra model.forward() calls."""
+        call_count = [0]
+        original_forward = _FakeModel.forward
+
+        class _CountingModel(_FakeModel):
+            def forward(self, **kwargs):
+                call_count[0] += 1
+                return original_forward(self, **kwargs)
+
+        fam = SPXModelFamily(variant='Naive_Grid-2D')
+        fam.model = _CountingModel()
+        img = np.zeros((10, 20), dtype=np.uint8)
+        base_a = np.zeros((10, 20), dtype=np.uint8)
+        base_b = np.ones((10, 20), dtype=np.uint8)
+
+        fam.onRender(img=img, pos_points=[[3, 5]], neg_points=[], base_mask=base_a)
+        fam.onRender(img=img, pos_points=[[3, 5]], neg_points=[], base_mask=base_b)
+
+        self.assertEqual(call_count[0], 1,
+                         "Different base_mask values must not bust the SPX label cache")
+
     # ---- SPX label cache ----
 
     def test_cache_hit_skips_forward(self):

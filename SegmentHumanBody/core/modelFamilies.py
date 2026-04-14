@@ -117,6 +117,11 @@ class SPXModelFamily(BaseModelFamily):
         if not self.model:
             return None
 
+        # Pop base_mask before building the SPX label-map cache key.
+        # The label map depends only on img content and algorithm params,
+        # not on the pre-existing painted slice.
+        base_mask = kwargs.pop('base_mask', None)
+
         key = self._make_cache_key(img, kwargs)
         if key != self._cache_key:
             self._cache_labels = self.model.forward(img=img, **kwargs)
@@ -124,23 +129,38 @@ class SPXModelFamily(BaseModelFamily):
 
         labels = self._cache_labels
 
-        if not pos_points:
-            return None
-
-        selected_labels = set()
+        # Collect labels under positive and negative prompts.
+        pos_labels = set()
         for x, y in pos_points:
             if 0 <= y < labels.shape[0] and 0 <= x < labels.shape[1]:
-                selected_labels.add(labels[y, x])
+                pos_labels.add(labels[y, x])
 
-        # Subtract regions under negative prompt points.
+        neg_labels = set()
         for x, y in neg_points:
             if 0 <= y < labels.shape[0] and 0 <= x < labels.shape[1]:
-                selected_labels.discard(labels[y, x])
+                neg_labels.add(labels[y, x])
 
-        if not selected_labels:
+        # Neg has priority: a label under a neg point is never added by pos.
+        pos_only_labels = pos_labels - neg_labels
+
+        if base_mask is not None:
+            # Additive / subtractive mode — used in interactive sessions that
+            # have a pre-existing painted region:
+            #   result = (base_slice | pos_region) & ~neg_region
+            # Neg points erase from whatever is painted, including data that
+            # predates the current session; pos points add to it.
+            pos_region = (np.isin(labels, list(pos_only_labels))
+                          if pos_only_labels else np.zeros(labels.shape, dtype=bool))
+            neg_region = (np.isin(labels, list(neg_labels))
+                          if neg_labels else np.zeros(labels.shape, dtype=bool))
+            return np.where(neg_region, 0,
+                            np.where(pos_region, 1, base_mask)).astype(np.uint8)
+
+        # Classic mode (no base mask): derive result entirely from prompts.
+        if not pos_only_labels:
             return None
 
-        return np.isin(labels, list(selected_labels)).astype(np.uint8)
+        return np.isin(labels, list(pos_only_labels)).astype(np.uint8)
 
 
 # ------------------------

@@ -5,6 +5,7 @@ from slicer.ScriptedLoadableModule import (
     ScriptedLoadableModule,
     ScriptedLoadableModuleWidget,
     ScriptedLoadableModuleLogic,
+    ScriptedLoadableModuleTest,
 )
 from slicer.util import VTKObservationMixin
 
@@ -655,6 +656,13 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         # changes from propagate/expand operations can be reversed.
         self._undo = UndoStack()
 
+        # --- Interactive base mask ---
+        # Full 3D snapshot of the segment taken when entering interactive mode.
+        # Each render computes: result = (base_slice | pos_region) & ~neg_region
+        # so that neg prompts erase existing painted data and removing a pos
+        # prompt reverts its region to the base state rather than to zero.
+        self._interactive_base_mask = None
+
     def setDefaultParameters(self, parameterNode):
         pass
 
@@ -664,6 +672,23 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         self._last_render_key = None
         self._working_mask = None
         self._working_mask_segment = None
+        self._interactive_base_mask = None
+
+    def _ensure_interactive_base_mask(self, widget, volumeNode):
+        """Lazily reload _interactive_base_mask when it was cleared by a segment
+        switch while the renderer was still running.
+
+        onSegmentChanged → reset_render_state() sets _interactive_base_mask to
+        None.  Without this reload the render loop falls back to classic mode
+        (no base mask) and negative prompts stop erasing existing painted data.
+        """
+        if self._interactive_base_mask is not None:
+            return
+        segNode = widget.ui.segmentSelector.currentNode()
+        segmentID = widget.ui.segmentSelector.currentSegmentID()
+        if segNode and segmentID and volumeNode:
+            raw = slicer.util.arrayFromSegmentBinaryLabelmap(segNode, segmentID, volumeNode)
+            self._interactive_base_mask = raw.copy()
 
     def undo(self, widget):
         """Restore the previous 2-D slice state for the active segment.
@@ -786,7 +811,7 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         if not volumeNode:
             return
 
-        axis, sliceIndex = self.getAxisAndSlice(widget)
+        axis, sliceIndex = self.getAxisAndSlice(widget, volumeNode)
 
         # --- Build render key before any expensive work ---
         # pos/neg points are VTK objects; tuple(p) makes them hashable.
@@ -817,12 +842,26 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
             "negative": neg_points,
         }, axis)
 
+        # _interactive_base_mask may be None when the user switched segments while
+        # the renderer was still running — onSegmentChanged → reset_render_state()
+        # clears it.  Reload lazily so neg prompts keep working without requiring
+        # the user to stop and restart interactive mode.
+        self._ensure_interactive_base_mask(widget, volumeNode)
+
+        # Pass the base slice so that the family can erase neg regions from
+        # pre-existing painted data and add pos regions on top.
+        base_slice = (
+            get_slice_from_volume(self._interactive_base_mask, axis, sliceIndex)
+            if self._interactive_base_mask is not None else None
+        )
+
         result = call_if_exists(
             modelFamily,
             "onRender",
             img=img,
             pos_points=scribbles_ijk["positive"],
             neg_points=scribbles_ijk["negative"],
+            base_mask=base_slice,
             **params
         )
 
@@ -915,7 +954,7 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         params = widget.getUserParameters()
 
         volumeArray = slicer.util.arrayFromVolume(volumeNode)
-        axis, sliceIndex = self.getAxisAndSlice(widget)
+        axis, sliceIndex = self.getAxisAndSlice(widget, volumeNode)
         img = get_slice_from_volume(volumeArray, axis, sliceIndex)
 
         # Convert negative prompt points to 2-D IJK for this slice so they can
@@ -948,6 +987,18 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         # Force a fresh read from Slicer on the first render: the user may
         # have edited the segment outside of interactive mode.
         self.reset_render_state()
+
+        # Snapshot the current segment mask as the immutable base for this
+        # interactive session.  Each render computes:
+        #   result = (base_slice | pos_region) & ~neg_region
+        # so neg prompts erase pre-existing painted data and removing a pos
+        # prompt reverts its region to the base state.
+        volumeNode = widget.ui.sourceVolumeSelector.currentNode()
+        segNode = widget.ui.segmentSelector.currentNode()
+        segmentID = widget.ui.segmentSelector.currentSegmentID()
+        if volumeNode and segNode and segmentID:
+            raw = slicer.util.arrayFromSegmentBinaryLabelmap(segNode, segmentID, volumeNode)
+            self._interactive_base_mask = raw.copy()
 
         widget.renderer.start()
         widget.setInteractiveState(True)
@@ -998,22 +1049,36 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
             "negative": convert(scrib["negative"])
         }
 
-    def getAxisAndSlice(self, widget):
+    def getAxisAndSlice(self, widget, volumeNode=None):
         viewName = widget.currentViewName
 
         lm = slicer.app.layoutManager()
         sliceWidget = lm.sliceWidget(viewName)
-        logic = sliceWidget.sliceLogic()
-
-        offset = logic.GetSliceOffset()
-        sliceIndex = logic.GetSliceIndexFromOffset(offset) - 1
 
         if viewName == "Red":
-            axis = 0   
+            axis = 0
         elif viewName == "Green":
-            axis = 1   
+            axis = 1
         else:
-            axis = 2   
+            axis = 2
+
+        if volumeNode is not None:
+            # Convert the slice plane's RAS origin to the volume's IJK space so
+            # that the index is correct regardless of the volume's spacing/origin.
+            sliceNode = sliceWidget.mrmlSliceNode()
+            sliceToRAS = sliceNode.GetSliceToRAS()
+            ras = [sliceToRAS.GetElement(r, 3) for r in range(3)]
+            rasToIjk = vtk.vtkMatrix4x4()
+            volumeNode.GetRASToIJKMatrix(rasToIjk)
+            ijk = rasToIjk.MultiplyPoint(ras + [1])
+            # axis=0 (Red/axial)    → K = ijk[2]
+            # axis=1 (Green/coronal) → J = ijk[1]
+            # axis=2 (Yellow/sagittal) → I = ijk[0]
+            component = {0: 2, 1: 1, 2: 0}[axis]
+            sliceIndex = int(round(ijk[component]))
+        else:
+            logic = sliceWidget.sliceLogic()
+            sliceIndex = logic.GetSliceIndexFromOffset(logic.GetSliceOffset()) - 1
 
         return axis, sliceIndex
     
@@ -1061,4 +1126,38 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         segment_key = (segNode.GetID(), segmentID)
         if self._working_mask_segment == segment_key:
             write_slice_to_volume(self._working_mask, expanded, axis, sliceIndex)
-    
+
+
+#
+# SegmentHumanBodyTest
+#
+
+class SegmentHumanBodyTest(ScriptedLoadableModuleTest):
+    """Entry point for the 3D Slicer "Reload and Test" button.
+
+    The actual test cases live in Testing/Python/SegmentHumanBodyTest.py as a
+    standard unittest.TestCase so they can also be run via
+    slicer_add_python_unittest in CMake.  This class discovers and delegates
+    to them so that "Reload and Test" remains a meaningful action.
+    """
+
+    def runTest(self):
+        import importlib
+        import os
+        import sys
+        import unittest
+
+        test_dir = os.path.join(os.path.dirname(__file__), 'Testing', 'Python')
+        if test_dir not in sys.path:
+            sys.path.insert(0, test_dir)
+
+        import SegmentHumanBodyTest as ext
+        importlib.reload(ext)
+
+        suite = unittest.TestLoader().loadTestsFromTestCase(ext.SegmentHumanBodyLogicTest)
+        result = unittest.TextTestRunner(verbosity=2).run(suite)
+        if not result.wasSuccessful():
+            raise Exception(
+                f'{len(result.failures) + len(result.errors)} test(s) failed — '
+                'see the Python console for details'
+            )

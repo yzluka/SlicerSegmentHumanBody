@@ -4,6 +4,13 @@ set(MODULE_NAME SegmentHumanBody)
 #-----------------------------------------------------------------------------
 set(MODULE_PYTHON_SCRIPTS
   ${MODULE_NAME}.py
+  core/__init__.py
+  core/utils.py
+  core/modelFamilies.py
+  core/modelRegistry.py
+  core/models/__init__.py
+  core/models/spx.py
+  core/undoStack.py
   )
 
 set(MODULE_PYTHON_RESOURCES
