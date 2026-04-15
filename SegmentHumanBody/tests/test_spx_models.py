@@ -58,6 +58,38 @@ class TestSPXTester2D(unittest.TestCase):
         labels = self.model.forward(img=img, gh=3.0, gw=3.0)
         self.assertEqual(labels.shape, img.shape)
 
+    def test_output_dtype_is_int32(self):
+        img = _gray_image()
+        labels = self.model.forward(img=img)
+        self.assertEqual(labels.dtype, np.int32)
+
+    def test_vectorized_grid_cells_are_uniform(self):
+        """Within each grid cell every pixel must share the same label.
+
+        Uses an image size that divides evenly (H=60/gh=3, W=80/gw=4) so each
+        cell is exactly 20×20 pixels — any intra-cell label change would be a
+        vectorisation bug.
+        """
+        H, W, gh, gw = 60, 80, 3, 4
+        cell_h, cell_w = H // gh, W // gw
+        img = _gray_image(H, W)
+        labels = self.model.forward(img=img, gh=gh, gw=gw)
+        for row in range(gh):
+            for col in range(gw):
+                cell = labels[row * cell_h:(row + 1) * cell_h,
+                               col * cell_w:(col + 1) * cell_w]
+                unique = np.unique(cell)
+                self.assertEqual(len(unique), 1,
+                                 f"Cell ({row},{col}) has {len(unique)} labels: {unique} — "
+                                 "vectorized grid contains spurious intra-cell boundaries")
+
+    def test_large_image_no_loop_overhead(self):
+        """Vectorized path must handle a 512×512 image without error or OOM."""
+        img = _gray_image(512, 512)
+        labels = self.model.forward(img=img, gh=16, gw=16)
+        self.assertEqual(labels.shape, (512, 512))
+        self.assertEqual(len(np.unique(labels)), 16 * 16)
+
 
 @unittest.skipUnless(SKIMAGE_AVAILABLE, "scikit-image not installed")
 class TestSPXSLIC2D(unittest.TestCase):

@@ -1,27 +1,35 @@
+"""Concrete superpixel (SPX) algorithm implementations.
+
+Each class exposes:
+  - ``PARAM_HINT``  — example parameter string shown in the UI
+  - ``DOC_URL``     — link to upstream documentation (optional)
+  - ``forward(**kwargs)`` — pops ``img`` from kwargs; returns an integer label map
+"""
+
 import numpy as np
 
 
 class SPX_Tester2D:
-    """Naive uniform grid superpixels — useful for debugging the SPX pipeline."""
+    """Naive uniform-grid superpixels — useful for debugging the SPX pipeline.
+
+    Divides the image into a regular gh × gw grid.  Each cell receives a
+    unique integer label.  Fully vectorised; no Python-level loops.
+    """
 
     DOC_URL = None
     PARAM_HINT = 'gh=9, gw=9'
 
     def forward(self, **kwargs):
         img = kwargs["img"]
-        H, W = img.shape[:2] if img.ndim == 3 else img.shape
+        H, W = img.shape[:2]
         gh = int(kwargs.get('gh', 9))
         gw = int(kwargs.get('gw', 9))
 
-        y_coords = np.linspace(0, gh, H, endpoint=False).astype(int)
-        x_coords = np.linspace(0, gw, W, endpoint=False).astype(int)
+        y_coords = np.linspace(0, gh, H, endpoint=False).astype(np.int32)
+        x_coords = np.linspace(0, gw, W, endpoint=False).astype(np.int32)
 
-        labels = np.zeros((H, W), dtype=np.int32)
-        for i in range(H):
-            for j in range(W):
-                labels[i, j] = y_coords[i] * gw + x_coords[j] + 1
-
-        return labels
+        # Broadcast to (H, W) without any Python loops.
+        return (y_coords[:, np.newaxis] * gw + x_coords[np.newaxis, :] + 1).astype(np.int32)
 
 
 class SPX_SLIC2D:
@@ -38,8 +46,8 @@ class SPX_SLIC2D:
         img = kwargs.pop("img")
         if img is None:
             raise ValueError("Missing required argument: img")
-        # slicer's CT slices are 2D grayscale; slic defaults to channel_axis=-1
-        # (multichannel), which raises on a 2D array unless told otherwise.
+        # CT slices are 2-D grayscale; slic defaults to channel_axis=-1
+        # (multi-channel) which raises on a plain 2-D array.
         if img.ndim == 2:
             kwargs.setdefault('channel_axis', None)
         return self._slic(img, **kwargs)

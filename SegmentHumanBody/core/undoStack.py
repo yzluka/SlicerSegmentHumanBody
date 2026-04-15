@@ -1,3 +1,4 @@
+from collections import deque
 import numpy as np
 
 
@@ -13,7 +14,9 @@ class UndoStack:
 
     def __init__(self, limit: int = DEFAULT_LIMIT):
         self._limit = limit
-        self._stacks: dict = {}   # (segNodeID, segmentID) -> list[(axis, sliceIndex, ndarray)]
+        # deque with maxlen auto-discards the oldest entry (left end) when
+        # full — O(1) vs the O(n) list.pop(0) that a plain list would need.
+        self._stacks: dict = {}   # (segNodeID, segmentID) -> deque[(axis, sliceIndex, ndarray)]
 
     # ------------------------------------------------------------------ #
     # Public API                                                           #
@@ -23,10 +26,9 @@ class UndoStack:
              axis: int, slice_index: int, slice_2d: np.ndarray) -> None:
         """Push a snapshot of *slice_2d* onto the stack for this segment."""
         key = (seg_node_id, segment_id)
-        stack = self._stacks.setdefault(key, [])
-        stack.append((axis, slice_index, slice_2d.copy()))
-        if len(stack) > self._limit:
-            stack.pop(0)
+        if key not in self._stacks:
+            self._stacks[key] = deque(maxlen=self._limit)
+        self._stacks[key].append((axis, slice_index, slice_2d.copy()))
 
     def pop(self, seg_node_id: str, segment_id: str):
         """Pop and return the last snapshot, or ``None`` if the stack is empty."""

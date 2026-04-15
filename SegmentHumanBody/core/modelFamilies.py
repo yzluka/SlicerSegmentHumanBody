@@ -1,5 +1,6 @@
 import numpy as np
 from .modelRegistry import ModelRegistry
+from .utils import labels_at_points
 
 class BaseModelFamily:
     VARIANTS = ['None']
@@ -130,15 +131,9 @@ class SPXModelFamily(BaseModelFamily):
         labels = self._cache_labels
 
         # Collect labels under positive and negative prompts.
-        pos_labels = set()
-        for x, y in pos_points:
-            if 0 <= y < labels.shape[0] and 0 <= x < labels.shape[1]:
-                pos_labels.add(labels[y, x])
-
-        neg_labels = set()
-        for x, y in neg_points:
-            if 0 <= y < labels.shape[0] and 0 <= x < labels.shape[1]:
-                neg_labels.add(labels[y, x])
+        # labels_at_points uses numpy fancy indexing — O(n_points), no loop.
+        pos_labels = labels_at_points(pos_points, labels)
+        neg_labels = labels_at_points(neg_points, labels)
 
         # Neg has priority: a label under a neg point is never added by pos.
         pos_only_labels = pos_labels - neg_labels
