@@ -6,7 +6,106 @@ scikit-image installed (though those environments cannot run the SPX models
 either, since they also require scikit-image).
 """
 
+import ast
 import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Slice view / coordinate constants
+# ---------------------------------------------------------------------------
+
+# Maps 3D Slicer slice view names to axis indices used by get/write_slice.
+VIEW_TO_AXIS = {"Red": 0, "Green": 1, "Yellow": 2}
+
+# axis → (x_col, y_col) indices into an IJK triple (I=0, J=1, K=2).
+# Used when projecting 3-D IJK voxel coordinates onto a 2-D slice plane.
+#   axis=0 Red/axial:       slice = vol[k,:,:]  → 2D pt = (I, J)
+#   axis=1 Green/coronal:   slice = vol[:,j,:]  → 2D pt = (I, K)
+#   axis=2 Yellow/sagittal: slice = vol[:,:,i]  → 2D pt = (J, K)
+AXIS_TO_XY_COLS = {0: (0, 1), 1: (0, 2), 2: (1, 2)}
+
+# axis → which IJK component gives the current slice index.
+#   axis=0 (axial):    K = ijk[2]
+#   axis=1 (coronal):  J = ijk[1]
+#   axis=2 (sagittal): I = ijk[0]
+AXIS_TO_IJK_COMPONENT = {0: 2, 1: 1, 2: 0}
+
+
+# ---------------------------------------------------------------------------
+# RAS → IJK 2-D projection  (pure numpy — no VTK / Slicer dependency)
+# ---------------------------------------------------------------------------
+
+def ras_to_ijk_2d(mat_4x4: np.ndarray, points, axis: int) -> list:
+    """Convert RAS-space 3-D points to 2-D slice coordinates in IJK space.
+
+    Parameters
+    ----------
+    mat_4x4 : (4, 4) numpy array — the volume's RAS-to-IJK affine matrix.
+    points : sequence of (x, y, z) triples in RAS space.
+    axis : int — slice axis (0 axial, 1 coronal, 2 sagittal).
+
+    Returns
+    -------
+    List of [x, y] pairs in 2-D slice space (column-first / OpenCV convention).
+    Empty list when *points* is empty.
+    """
+    if not points:
+        return []
+    xc, yc = AXIS_TO_XY_COLS[axis]
+    pts   = np.array(points, dtype=np.float64)          # (N, 3)
+    pts_h = np.hstack([pts, np.ones((len(pts), 1))])    # (N, 4)
+    ijk   = (mat_4x4 @ pts_h.T).T[:, :3].astype(int)   # (N, 3)
+    return ijk[:, [xc, yc]].tolist()
+
+
+# ---------------------------------------------------------------------------
+# Segment name helper
+# ---------------------------------------------------------------------------
+
+def next_segment_name(existing_names) -> str:
+    """Return the lowest 'Segment_N' name not already in *existing_names*."""
+    index = 1
+    while f"Segment_{index}" in existing_names:
+        index += 1
+    return f"Segment_{index}"
+
+
+# ---------------------------------------------------------------------------
+# Parameter string parsing
+# ---------------------------------------------------------------------------
+
+def parse_user_parameters(text: str) -> dict:
+    """Parse a model hyper-parameter string into a dict.
+
+    Accepts two formats:
+      - Dict literal:  {"n_segments": 100, "sigma": 5.0}
+      - key=value:     n_segments=100, sigma=5.0    (matches PARAM_HINT style)
+
+    Returns an empty dict for empty / whitespace-only input.
+    Raises ValueError with a descriptive message on parse failure.
+    """
+    text = text.strip()
+    if not text:
+        return {}
+    # Try dict-literal first (JSON-compatible)
+    try:
+        result = ast.literal_eval(text)
+        if isinstance(result, dict):
+            return result
+    except (ValueError, SyntaxError):
+        pass
+    # Fall back to key=value pairs
+    try:
+        items = []
+        for part in text.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            key, value = part.split("=", 1)
+            items.append(f"'{key.strip()}': {value.strip()}")
+        return ast.literal_eval("{" + ", ".join(items) + "}")
+    except Exception as e:
+        raise ValueError(f"Invalid parameter format:\n{str(e)}")
 
 
 # ---------------------------------------------------------------------------

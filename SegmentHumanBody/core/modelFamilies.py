@@ -8,15 +8,10 @@ class BaseModelFamily:
     def __init__(self, variant=None):
         self.variant = variant
         self.model = None
-        #print(f"INIT CALLED: {type(self).__name__}")
 
     def confirm_model(self):
         if not self.variant:
-            #print("[Confirm] No variant selected")
             return
-
-        #print(f"[Confirm] {type(self).__name__} → {self.variant}")
-
         self.model = ModelRegistry.get_model(self.variant)
 
 
@@ -166,11 +161,9 @@ class AutoModelFamily(BaseModelFamily):
     VARIANTS = ['BreastCT', 'PE_SEG']
 
     def on_assign_2d(self, **kwargs):
-        #print("[Interactive] assign 2D")
         pass
 
     def on_assign_3d(self, **kwargs):
-        #print("[Interactive] assign 3D")
         pass
 
     def on_automatic_segmentation(self, **kwargs):

@@ -1,5 +1,5 @@
 import qt, vtk, slicer
-import logging, ast
+import logging
 import numpy as np
 from slicer.ScriptedLoadableModule import (
     ScriptedLoadableModule,
@@ -22,6 +22,11 @@ from core.utils import (
     POSITION_UNDEFINED,
     POSITION_PREVIEW,
     POSITION_DEFINED,
+    VIEW_TO_AXIS,
+    AXIS_TO_IJK_COMPONENT,
+    ras_to_ijk_2d,
+    next_segment_name,
+    parse_user_parameters,
 )
 from core.modelRegistry import ModelRegistry
 from core.undoStack import UndoStack
@@ -33,6 +38,30 @@ POS_NODE = 'positivePromptPointsNode'
 NEG_NODE = 'negativePromptPointsNode'
 INPUT_VOLUME = "InputVolume"
 SEGMENTATION = "Segmentation"
+
+# Config shared by ensurePromptNodesExist and recreatePromptNodes.
+# Each entry: ref_name → (RGB color, display label)
+_PROMPT_NODE_CONFIGS = {
+    POS_NODE: ([0, 1, 0], 'positive'),
+    NEG_NODE: ([1, 0, 0], 'negative'),
+}
+
+
+def _node_records(node):
+    """Return [(status, cp_id, position), …] for all control points in *node*.
+
+    Produces the format expected by collect_confirmed_points /
+    collect_preview_points.  Returns an empty list when *node* is None.
+    This avoids duplicating the same comprehension in onRender and on_propagate.
+    """
+    if not node:
+        return []
+    return [
+        (node.GetNthControlPointPositionStatus(i),
+         node.GetNthControlPointID(i),
+         node.GetNthControlPointPosition(i))
+        for i in range(node.GetNumberOfControlPoints())
+    ]
 
 #
 # Module
@@ -273,7 +302,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if not self._parameterNode:
             return
 
-        self.logic.updateParameterNodeFromMarkups(
+        self.logic.setPromptNodes(
             self._parameterNode,
             self.ui.positivePrompts.currentNode(),
             self.ui.negativePrompts.currentNode(),
@@ -378,29 +407,24 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.logic.set_window_level(None, None)
             self._resetWLButton()
 
-    def _onWindowSliderChanged(self, value):
-        self.ui.windowSpinBox.blockSignals(True)
-        self.ui.windowSpinBox.setValue(value)
-        self.ui.windowSpinBox.blockSignals(False)
+    def _sync_wl_widgets(self, peer, value):
+        """Copy *value* to *peer* (blocking signals) then run W/L change logic."""
+        peer.blockSignals(True)
+        peer.setValue(value)
+        peer.blockSignals(False)
         self._onWLControlChanged()
+
+    def _onWindowSliderChanged(self, value):
+        self._sync_wl_widgets(self.ui.windowSpinBox, value)
 
     def _onWindowSpinBoxChanged(self, value):
-        self.ui.windowSlider.blockSignals(True)
-        self.ui.windowSlider.setValue(value)
-        self.ui.windowSlider.blockSignals(False)
-        self._onWLControlChanged()
+        self._sync_wl_widgets(self.ui.windowSlider, value)
 
     def _onLevelSliderChanged(self, value):
-        self.ui.levelSpinBox.blockSignals(True)
-        self.ui.levelSpinBox.setValue(value)
-        self.ui.levelSpinBox.blockSignals(False)
-        self._onWLControlChanged()
+        self._sync_wl_widgets(self.ui.levelSpinBox, value)
 
     def _onLevelSpinBoxChanged(self, value):
-        self.ui.levelSlider.blockSignals(True)
-        self.ui.levelSlider.setValue(value)
-        self.ui.levelSlider.blockSignals(False)
-        self._onWLControlChanged()
+        self._sync_wl_widgets(self.ui.levelSlider, value)
 
     def onApplyWindowLevel(self, _=None):
         """Confirm the current W/L values for model inference and lock the button.
@@ -539,7 +563,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             segNode.CreateDefaultDisplayNodes()
             segNode.SetReferenceImageGeometryParameterFromVolumeNode(volumeNode)
 
-        self.logic.updateParameterNodeFromMarkups(
+        self.logic.setPromptNodes(
             self._parameterNode,
             self.ui.positivePrompts.currentNode(),
             self.ui.negativePrompts.currentNode(),
@@ -551,25 +575,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.updateGUIFromParameterNode()
     
     def getUserParameters(self):
-        text = self.ui.paramTextEdit.toPlainText()
-
-        if not text.strip():
-            return {}
-
-        try:
-            items = []
-            for part in text.split(","):
-                if not part.strip():
-                    continue
-                key, value = part.split("=", 1)
-                items.append(f"'{key.strip()}': {value.strip()}")
-
-            dict_str = "{" + ", ".join(items) + "}"
-
-            return ast.literal_eval(dict_str)
-
-        except Exception as e:
-            raise ValueError(f"Invalid parameter format:\n{str(e)}")
+        return parse_user_parameters(self.ui.paramTextEdit.toPlainText())
     
     def updateParamPlaceholder(self):
         if not self.modelFamily or not self.modelFamily.variant:
@@ -870,14 +876,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 segmentation.GetNthSegment(i).GetName()
                 for i in range(segmentation.GetNumberOfSegments())
             }
-
-            index = 1
-            while f"Segment_{index}" in existing:
-                index += 1
-
-            name = f"Segment_{index}"
-
-            segmentID = segmentation.AddEmptySegment(name)
+            segmentID = segmentation.AddEmptySegment(next_segment_name(existing))
 
             self.ui.segmentSelector.setCurrentSegmentID(segmentID)
 
@@ -1057,58 +1056,35 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
             parameterNode.GetNodeReference(INPUT_VOLUME),
             parameterNode.GetNodeReference(SEGMENTATION),
         )
-    
+
+    def _make_prompt_node(self, parameterNode, ref_name, color, label):
+        """Remove any existing node for *ref_name*, create a fresh one, and
+        register it on *parameterNode*.  Fresh nodes have a label counter of 0
+        so the placement cursor is always labeled 'Positive 1' / 'Negative 1'.
+        """
+        old = parameterNode.GetNodeReference(ref_name)
+        if old:
+            slicer.mrmlScene.RemoveNode(old)
+        node = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLMarkupsFiducialNode', label)
+        node.CreateDefaultDisplayNodes()
+        dn = node.GetDisplayNode()
+        dn.SetSelectedColor(*color)
+        dn.SetColor(*color)
+        dn.SetActiveColor(*color)
+        node.SetHideFromEditors(True)
+        parameterNode.SetNodeReferenceID(ref_name, node.GetID())
+        return node
+
     def ensurePromptNodesExist(self, parameterNode):
-        configs = {
-            POS_NODE: ([0, 1, 0], 'positive'),
-            NEG_NODE: ([1, 0, 0], 'negative'),
-        }
-
-        for ref_name, (color, label) in configs.items():
+        """Create prompt nodes for any reference slot that is currently empty."""
+        for ref_name, (color, label) in _PROMPT_NODE_CONFIGS.items():
             if not parameterNode.GetNodeReference(ref_name):
-                node = slicer.mrmlScene.AddNewNodeByClass(
-                    'vtkMRMLMarkupsFiducialNode', label
-                )
-
-                node.CreateDefaultDisplayNodes()
-                displayNode = node.GetDisplayNode()
-
-                displayNode.SetSelectedColor(*color)
-                displayNode.SetColor(*color)
-                displayNode.SetActiveColor(*color)
-
-                node.SetHideFromEditors(True)
-
-                parameterNode.SetNodeReferenceID(
-                    ref_name, node.GetID()
-                )
+                self._make_prompt_node(parameterNode, ref_name, color, label)
 
     def recreatePromptNodes(self, parameterNode):
-        """Replace any existing prompt markup nodes with brand-new ones.
-
-        Fresh nodes have an internal label counter of 0, so the placement
-        cursor the markups widget auto-creates on an empty node is always
-        labeled 'Positive 1' / 'Negative 1' — regardless of how many points
-        were placed and removed in previous interactive sessions.
-        """
-        configs = {
-            POS_NODE: ([0, 1, 0], 'positive'),
-            NEG_NODE: ([1, 0, 0], 'negative'),
-        }
-        for ref_name, (color, label) in configs.items():
-            old = parameterNode.GetNodeReference(ref_name)
-            if old:
-                slicer.mrmlScene.RemoveNode(old)
-            node = slicer.mrmlScene.AddNewNodeByClass(
-                'vtkMRMLMarkupsFiducialNode', label
-            )
-            node.CreateDefaultDisplayNodes()
-            dn = node.GetDisplayNode()
-            dn.SetSelectedColor(*color)
-            dn.SetColor(*color)
-            dn.SetActiveColor(*color)
-            node.SetHideFromEditors(True)
-            parameterNode.SetNodeReferenceID(ref_name, node.GetID())
+        """Replace both prompt nodes with brand-new ones (counter reset to 0)."""
+        for ref_name, (color, label) in _PROMPT_NODE_CONFIGS.items():
+            self._make_prompt_node(parameterNode, ref_name, color, label)
 
     def setPromptNodes(self, parameterNode, posNode, negNode):
         parameterNode.SetNodeReferenceID(
@@ -1123,9 +1099,6 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
             parameterNode.GetNodeReference(POS_NODE),
             parameterNode.GetNodeReference(NEG_NODE),
         )
-
-    def updateParameterNodeFromMarkups(self, parameterNode, posNode, negNode):
-        self.setPromptNodes(parameterNode, posNode, negNode)
 
     # -------------------------
     # Model Interaction
@@ -1152,16 +1125,6 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         # This dual condition means a point whose ID was removed from _preview_cp_ids
         # (by _onPointConfirmed) is included even if its status stayed at Preview.
         preview_ids = widget._preview_cp_ids
-
-        def _node_records(node):
-            if not node:
-                return []
-            return [
-                (node.GetNthControlPointPositionStatus(i),
-                 node.GetNthControlPointID(i),
-                 node.GetNthControlPointPosition(i))
-                for i in range(node.GetNumberOfControlPoints())
-            ]
 
         pos_points = collect_confirmed_points(_node_records(posNode), preview_ids)
         neg_points = collect_confirmed_points(_node_records(negNode), preview_ids)
@@ -1398,16 +1361,6 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         _, negNode = self.getPromptNodes(widget._parameterNode)
         preview_ids = widget._preview_cp_ids
 
-        def _node_records(node):
-            if not node:
-                return []
-            return [
-                (node.GetNthControlPointPositionStatus(i),
-                 node.GetNthControlPointID(i),
-                 node.GetNthControlPointPosition(i))
-                for i in range(node.GetNumberOfControlPoints())
-            ]
-
         neg_points_ras = collect_confirmed_points(_node_records(negNode), preview_ids)
         neg_ijk = self._ras_to_ijk(
             volumeNode, {"positive": [], "negative": neg_points_ras}, axis
@@ -1479,46 +1432,23 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
 
 
     def _ras_to_ijk(self, volumeNode, scrib, axis):
-        rasToIjk = vtk.vtkMatrix4x4()
-        volumeNode.GetRASToIJKMatrix(rasToIjk)
-
-        # Extract the 4×4 VTK matrix into numpy once, then batch-multiply all
-        # points at once instead of calling MultiplyPoint in a Python loop.
-        mat = np.array([[rasToIjk.GetElement(r, c) for c in range(4)]
-                        for r in range(4)])  # (4, 4)
-
-        # axis → (x_col, y_col) in the IJK triple (I=0, J=1, K=2)
-        # axis=0 Red/axial:      slice is array[k,:,:], 2D pt = [I, J]
-        # axis=1 Green/coronal:  slice is array[:,j,:], 2D pt = [I, K]
-        # axis=2 Yellow/sagittal:slice is array[:,:,i], 2D pt = [J, K]
-        axis_to_xy_cols = {0: (0, 1), 1: (0, 2), 2: (1, 2)}
-        xc, yc = axis_to_xy_cols[axis]
-
-        def convert(points):
-            if not points:
-                return []
-            pts = np.array(points, dtype=np.float64)          # (N, 3)
-            pts_h = np.hstack([pts, np.ones((len(pts), 1))])  # (N, 4)
-            ijk = (mat @ pts_h.T).T[:, :3].astype(int)        # (N, 3)
-            return ijk[:, [xc, yc]].tolist()
-
+        # Extract the 4×4 RAS-to-IJK matrix from VTK into numpy, then delegate
+        # the batch point conversion to the Slicer-agnostic ras_to_ijk_2d helper.
+        vtk_mat = vtk.vtkMatrix4x4()
+        volumeNode.GetRASToIJKMatrix(vtk_mat)
+        mat = np.array([[vtk_mat.GetElement(r, c) for c in range(4)]
+                        for r in range(4)])
         return {
-            "positive": convert(scrib["positive"]),
-            "negative": convert(scrib["negative"])
+            "positive": ras_to_ijk_2d(mat, scrib["positive"], axis),
+            "negative": ras_to_ijk_2d(mat, scrib["negative"], axis),
         }
 
     def getAxisAndSlice(self, widget, volumeNode=None):
         viewName = widget.currentViewName
+        axis = VIEW_TO_AXIS.get(viewName, 0)
 
         lm = slicer.app.layoutManager()
         sliceWidget = lm.sliceWidget(viewName)
-
-        if viewName == "Red":
-            axis = 0
-        elif viewName == "Green":
-            axis = 1
-        else:
-            axis = 2
 
         if volumeNode is not None:
             # Convert the slice plane's RAS origin to the volume's IJK space so
@@ -1529,11 +1459,7 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
             rasToIjk = vtk.vtkMatrix4x4()
             volumeNode.GetRASToIJKMatrix(rasToIjk)
             ijk = rasToIjk.MultiplyPoint(ras + [1])
-            # axis=0 (Red/axial)    → K = ijk[2]
-            # axis=1 (Green/coronal) → J = ijk[1]
-            # axis=2 (Yellow/sagittal) → I = ijk[0]
-            component = {0: 2, 1: 1, 2: 0}[axis]
-            sliceIndex = int(round(ijk[component]))
+            sliceIndex = int(round(ijk[AXIS_TO_IJK_COMPONENT[axis]]))
         else:
             logic = sliceWidget.sliceLogic()
             sliceIndex = logic.GetSliceIndexFromOffset(logic.GetSliceOffset()) - 1
