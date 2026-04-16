@@ -16,7 +16,7 @@ from core.utils import (
     write_slice_to_volume,
     apply_window_level,
     spx_boundary_mask,
-    labels_at_points,
+    select_spx_labels,
     collect_confirmed_points,
     collect_preview_points,
     VIEW_TO_AXIS,
@@ -742,10 +742,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # Segment Editor node setup can reset the slice composite label layer.
         # Re-apply the SPX boundary overlay if it was active.
         if self._spx_boundary_visible and self._spx_boundary_node:
-            lm = slicer.app.layoutManager()
-            sw = lm.sliceWidget(self._spx_boundary_view)
-            if sw:
-                composite = sw.sliceLogic().GetSliceCompositeNode()
+            composite = self._get_composite_node(self._spx_boundary_view)
+            if composite:
                 composite.SetLabelVolumeID(self._spx_boundary_node.GetID())
                 composite.SetLabelOpacity(0.8)
 
@@ -1036,9 +1034,6 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         else:
             self.bind('on_stop_interactive')()
 
-    def on_go_to_editor(self, *args):
-        slicer.util.selectModule('SegmentEditor')
-
     def on_go_to_markups(self, *args):
         slicer.util.selectModule('Markups')
     
@@ -1171,6 +1166,11 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     # SPX Boundary Overlay  (Q)
     # -------------------------
     def _restoreSegmentation(self, snapshot):
+        """Restore a 2-D slice from *snapshot* and sync the Logic working mask.
+
+        The working mask is updated through _get_working_mask so the cache is
+        always the single source of truth — no parallel sync paths.
+        """
         if snapshot is None:
             return
 
@@ -1182,28 +1182,22 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if not segNode or not volumeNode:
             return
 
-        mask3d = slicer.util.arrayFromSegmentBinaryLabelmap(
-            segNode, segmentID, volumeNode
-        )
+        working = self.logic._get_working_mask(segNode, segmentID, volumeNode)
+        write_slice_to_volume(working, slice_2d, axis, sliceIndex)
+        slicer.util.updateSegmentBinaryLabelmapFromArray(working, segNode, segmentID, volumeNode)
+    def _get_composite_node(self, view_name):
+        """Return the slice composite node for *view_name*, or None if unavailable."""
+        sw = slicer.app.layoutManager().sliceWidget(view_name)
+        return sw.sliceLogic().GetSliceCompositeNode() if sw else None
 
-        write_slice_to_volume(mask3d, slice_2d, axis, sliceIndex)
-
-        slicer.util.updateSegmentBinaryLabelmapFromArray(
-            mask3d, segNode, segmentID, volumeNode
-        )
-
-        # sync working mask
-        self.logic._working_mask = mask3d.copy()
-        self.logic._working_mask_segment = (segNodeID, segmentID)
     def _hideSPXBoundary(self):
         """Remove the SPX boundary label from the slice view it was shown on."""
         if not self._spx_boundary_visible:
             return
         if self._spx_boundary_view:
-            lm = slicer.app.layoutManager()
-            sw = lm.sliceWidget(self._spx_boundary_view)
-            if sw:
-                sw.sliceLogic().GetSliceCompositeNode().SetLabelVolumeID("")
+            composite = self._get_composite_node(self._spx_boundary_view)
+            if composite:
+                composite.SetLabelVolumeID("")
         self._spx_boundary_visible = False
         self._spx_boundary_view    = None
         self.ui.showSPXBoundaryCheckBox.blockSignals(True)
@@ -1271,8 +1265,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         # Set as the label layer in the current slice view.
         viewName = self.currentViewName
-        lm = slicer.app.layoutManager()
-        composite = lm.sliceWidget(viewName).sliceLogic().GetSliceCompositeNode()
+        composite = self._get_composite_node(viewName)
         composite.SetLabelVolumeID(self._spx_boundary_node.GetID())
         composite.SetLabelOpacity(0.8)
 
@@ -1416,8 +1409,22 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         self._working_mask = None
         self._working_mask_segment = None
         self._prompt_base_mask = None
+        self._preview_mask = None
         # W/L is intentionally NOT reset here — it is a user preference that
         # should persist across segment/volume changes until explicitly changed.
+
+    def _get_working_mask(self, segNode, segmentID, volumeNode):
+        """Return the cached 3-D working mask, reading from Slicer on a miss.
+
+        The mask is keyed by (segNodeID, segmentID).  On a cache hit the same
+        numpy array is returned so callers can update it in-place.
+        """
+        segment_key = (segNode.GetID(), segmentID)
+        if self._working_mask is None or self._working_mask_segment != segment_key:
+            raw = slicer.util.arrayFromSegmentBinaryLabelmap(segNode, segmentID, volumeNode)
+            self._working_mask = raw.copy()
+            self._working_mask_segment = segment_key
+        return self._working_mask
 
     def reset_prompt_base_mask(self):
         """Invalidate the prompt base mask and render key.
@@ -1605,7 +1612,7 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
             if has_base else None
         )
 
-        self._restoreSegmentation(widget)
+        self._restore_working_mask(widget)
 
         result = call_if_exists(
             modelFamily,
@@ -1623,7 +1630,13 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         if result is not None:
             self.previewResult(widget, result, axis, sliceIndex)
 
-    def _restoreSegmentation(self, widget):
+    def _restore_working_mask(self, widget):
+        """Push the cached working mask back to Slicer, undoing any preview write.
+
+        Called at the start of each render cycle to undo the previous preview
+        overlay before re-computing it.  Uses _get_working_mask so a cache miss
+        (e.g. first render after a segment switch) performs one full Slicer read.
+        """
         volumeNode = widget.ui.sourceVolumeSelector.currentNode()
         segNode = widget.ui.segmentSelector.currentNode()
         segmentID = widget.ui.segmentSelector.currentSegmentID()
@@ -1631,19 +1644,16 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         if not volumeNode or not segNode or not segmentID:
             return
 
-        # 🔴 use working mask as ground truth
-        segment_key = (segNode.GetID(), segmentID)
-
-        if self._working_mask is None or self._working_mask_segment != segment_key:
-            raw = slicer.util.arrayFromSegmentBinaryLabelmap(segNode, segmentID, volumeNode)
-            self._working_mask = raw.copy()
-            self._working_mask_segment = segment_key
-
-        slicer.util.updateSegmentBinaryLabelmapFromArray(
-            self._working_mask, segNode, segmentID, volumeNode
-        )
+        working = self._get_working_mask(segNode, segmentID, volumeNode)
+        slicer.util.updateSegmentBinaryLabelmapFromArray(working, segNode, segmentID, volumeNode)
 
     def previewResult(self, widget, mask2d, axis, sliceIndex):
+        """Write a preview overlay to Slicer without touching the working mask.
+
+        The preview is intentionally written on top of the Slicer labelmap so
+        the user sees the model's suggestion in the slice view.  _restore_working_mask
+        undoes it before the next render cycle so the working mask stays clean.
+        """
         volumeNode = widget.ui.sourceVolumeSelector.currentNode()
         segNode = widget.ui.segmentSelector.currentNode()
         segmentID = widget.ui.segmentSelector.currentSegmentID()
@@ -1651,32 +1661,12 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         if not volumeNode or not segNode or not segmentID:
             return
 
-        # --- store preview only (DO NOT write to segmentation) ---
         self._preview_mask = (mask2d, axis, sliceIndex)
 
-        # --- trigger display refresh ---
-        self._showPreview(widget)
-        
-    def _showPreview(self, widget):
-        if self._preview_mask is None:
-            return
-
-        mask2d, axis, sliceIndex = self._preview_mask
-
-        volumeNode = widget.ui.sourceVolumeSelector.currentNode()
-        segNode = widget.ui.segmentSelector.currentNode()
-        segmentID = widget.ui.segmentSelector.currentSegmentID()
-
-        base = slicer.util.arrayFromSegmentBinaryLabelmap(
-            segNode, segmentID, volumeNode
-        )
-
+        base = slicer.util.arrayFromSegmentBinaryLabelmap(segNode, segmentID, volumeNode)
         preview = base.copy()
         write_slice_to_volume(preview, mask2d, axis, sliceIndex)
-
-        slicer.util.updateSegmentBinaryLabelmapFromArray(
-            preview, segNode, segmentID, volumeNode
-        )
+        slicer.util.updateSegmentBinaryLabelmapFromArray(preview, segNode, segmentID, volumeNode)
     def _ensure_seg_and_segment(self, widget, volumeNode):
         """Guarantee a segmentation node and at least one segment exist.
 
@@ -1729,20 +1719,9 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
             # which would re-trigger updateGUIFromParameterNode mid-render.
             return
 
-        # Maintain a persistent 3D working mask so we only read the full
-        # labelmap from Slicer once per segment, not every frame.
-        # We update just the 2D slice in-place each render.
-        segment_key = (segNode.GetID(), segmentID)
-        if self._working_mask is None or self._working_mask_segment != segment_key:
-            raw = slicer.util.arrayFromSegmentBinaryLabelmap(segNode, segmentID, volumeNode)
-            self._working_mask = raw.copy()
-            self._working_mask_segment = segment_key
-
-        write_slice_to_volume(self._working_mask, mask2d, axis, sliceIndex)
-
-        slicer.util.updateSegmentBinaryLabelmapFromArray(
-            self._working_mask, segNode, segmentID, volumeNode
-        )
+        working = self._get_working_mask(segNode, segmentID, volumeNode)
+        write_slice_to_volume(working, mask2d, axis, sliceIndex)
+        slicer.util.updateSegmentBinaryLabelmapFromArray(working, segNode, segmentID, volumeNode)
 
     def compute_spx_boundary(self, widget):
         """Compute SPX superpixel boundary pixels for the current slice.
@@ -1915,51 +1894,29 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
 
         return axis, sliceIndex
     
-    def getCurrentSegment(self, widget):
-        segNode = widget.ui.segmentSelector.currentNode()
-        segmentID = widget.ui.segmentSelector.currentSegmentID()
-
-        if not segmentID and segNode:
-            segmentation = segNode.GetSegmentation()
-            if segmentation.GetNumberOfSegments() > 0:
-                segmentID = segmentation.GetNthSegmentID(0)
-
-        return segNode, segmentID
 
 
     def expandSegWithSPX(self, widget, segNode, segmentID, volumeNode, labels, axis, sliceIndex, neg_points=None):
-        mask3d = slicer.util.arrayFromSegmentBinaryLabelmap(segNode, segmentID, volumeNode)
-
-        sliceMask = get_slice_from_volume(mask3d, axis, sliceIndex)
-
-        # Snapshot the current slice before modifying it so Ctrl+Z can restore.
+        # Snapshot before any modification so Ctrl+Z can restore.
         snapshot = widget._captureSegmentationState()
         if snapshot:
             widget._undo_stack.append(('expand', snapshot))
 
-        selected_labels = set(np.unique(labels[sliceMask > 0]).tolist())
-
-        # Remove regions touched by negative prompt points.
-        if neg_points:
-            selected_labels -= labels_at_points(neg_points, labels)
-
-        expanded = np.isin(labels, list(selected_labels)).astype(np.uint8)
-
-        # Preserve all other annotated slices — only replace the current one.
-        fullMask = mask3d.copy()
-        write_slice_to_volume(fullMask, expanded, axis, sliceIndex)
-
-        slicer.util.updateSegmentBinaryLabelmapFromArray(
-            fullMask, segNode, segmentID, volumeNode
+        expanded = select_spx_labels(
+            labels,
+            get_slice_from_volume(
+                slicer.util.arrayFromSegmentBinaryLabelmap(segNode, segmentID, volumeNode),
+                axis, sliceIndex,
+            ),
+            neg_points=neg_points,
         )
-        self._working_mask = fullMask.copy()
-        self._working_mask_segment = (segNode.GetID(), segmentID)
 
-        # Keep the working mask in sync so the next interactive render does
-        # not overwrite the propagation result with stale data.
-        segment_key = (segNode.GetID(), segmentID)
-        if self._working_mask_segment == segment_key:
-            write_slice_to_volume(self._working_mask, expanded, axis, sliceIndex)
+        # Write the new slice into the working mask and push to Slicer.
+        # _get_working_mask initialises the cache if needed; writing into the
+        # returned array keeps it as the single source of truth.
+        working = self._get_working_mask(segNode, segmentID, volumeNode)
+        write_slice_to_volume(working, expanded, axis, sliceIndex)
+        slicer.util.updateSegmentBinaryLabelmapFromArray(working, segNode, segmentID, volumeNode)
 
 
 #

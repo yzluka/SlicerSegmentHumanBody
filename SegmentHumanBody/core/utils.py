@@ -221,6 +221,29 @@ def collect_preview_points(point_records, preview_ids):
     ]
 
 
+def select_spx_labels(labels: np.ndarray, mask2d: np.ndarray,
+                      neg_points=None) -> np.ndarray:
+    """Select superpixel regions touched by a positive annotation mask.
+
+    Every superpixel that overlaps ``mask2d > 0`` is included; superpixels
+    touched by ``neg_points`` (if given) are then removed.
+
+    Parameters
+    ----------
+    labels     : 2-D integer label map produced by an SPX model.
+    mask2d     : 2-D binary mask (positive where annotated, zero elsewhere).
+    neg_points : optional list of (x, y) pixel coords that veto their labels.
+
+    Returns
+    -------
+    uint8 ndarray, same shape as *labels*: 1 = selected region, 0 = excluded.
+    """
+    selected = set(np.unique(labels[mask2d > 0]).tolist())
+    if neg_points:
+        selected -= labels_at_points(neg_points, labels)
+    return np.isin(labels, list(selected)).astype(np.uint8)
+
+
 def labels_at_points(points, labels: np.ndarray) -> set:
     """Return the set of unique label values under the given (x, y) points.
 
