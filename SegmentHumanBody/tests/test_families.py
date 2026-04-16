@@ -339,28 +339,28 @@ class TestSPXModelFamily(unittest.TestCase):
         key = fam._make_cache_key(img, {'weights': [1, 2, 3]})
         self.assertIsNotNone(key)
 
-    # ---- on_propagate ----
+    # ---- on_expand ----
 
-    def test_on_propagate_raises_without_model(self):
+    def test_on_expand_raises_without_model(self):
         fam = SPXModelFamily(variant='Naive_Grid-2D')
         with self.assertRaises(RuntimeError):
-            fam.on_propagate(img=np.zeros((10, 10)))
+            fam.on_expand(img=np.zeros((10, 10)))
 
-    def test_on_propagate_raises_without_img(self):
+    def test_on_expand_raises_without_img(self):
         fam = SPXModelFamily(variant='Naive_Grid-2D')
         fam.model = _FakeModel()
         with self.assertRaises(ValueError):
-            fam.on_propagate()
+            fam.on_expand()
 
-    def test_on_propagate_returns_label_map(self):
+    def test_on_expand_returns_label_map(self):
         fam = SPXModelFamily(variant='Naive_Grid-2D')
         fam.model = _FakeModel()
         img = np.zeros((10, 20), dtype=np.uint8)
-        result = fam.on_propagate(img=img)
+        result = fam.on_expand(img=img)
         self.assertIsNotNone(result)
         self.assertEqual(result.shape, (10, 20))
 
-    def test_on_propagate_passes_user_params_to_model(self):
+    def test_on_expand_passes_user_params_to_model(self):
         """User params must reach model.forward, not be silently dropped."""
         received = {}
 
@@ -372,14 +372,14 @@ class TestSPXModelFamily(unittest.TestCase):
         fam = SPXModelFamily(variant='Naive_Grid-2D')
         fam.model = _ParamCapture()
         img = np.zeros((10, 20), dtype=np.uint8)
-        fam.on_propagate(img=img, n_segments=42, compactness=5)
+        fam.on_expand(img=img, n_segments=42, compactness=5)
 
         self.assertEqual(received.get('n_segments'), 42)
         self.assertEqual(received.get('compactness'), 5)
         # img is passed to model.forward as a kwarg (each model pops it internally)
         self.assertIn('img', received)
 
-    def test_on_propagate_uses_label_cache(self):
+    def test_on_expand_uses_label_cache(self):
         """If the label cache is warm for this slice, forward() must not be called again."""
         call_count = [0]
         original_forward = _FakeModel.forward
@@ -398,8 +398,8 @@ class TestSPXModelFamily(unittest.TestCase):
         self.assertEqual(call_count[0], 1)
 
         # Propagate on the same slice — must reuse the cached labels
-        fam.on_propagate(img=img)
-        self.assertEqual(call_count[0], 1, "on_propagate should reuse the cache, not call forward() again")
+        fam.on_expand(img=img)
+        self.assertEqual(call_count[0], 1, "on_expand should reuse the cache, not call forward() again")
 
     # ---- interactive stubs ----
 

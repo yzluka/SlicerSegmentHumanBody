@@ -83,13 +83,13 @@ class SPXModelFamily(BaseModelFamily):
             params = str(sorted(kwargs.items()))
         return (img.ctypes.data, img.shape, img.dtype.str, params)
 
-    def on_propagate(self, **kwargs):
+    def on_expand(self, **kwargs):
         if not self.model:
             raise RuntimeError("Model not confirmed")
 
         img = kwargs.get('img')
         if img is None:
-            raise ValueError("on_propagate requires 'img' keyword argument")
+            raise ValueError("on_expand requires 'img' keyword argument")
 
         # Strip 'img' so only algorithm params reach model.forward and the cache key.
         model_kwargs = {k: v for k, v in kwargs.items() if k != 'img'}
