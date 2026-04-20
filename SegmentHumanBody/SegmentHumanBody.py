@@ -17,7 +17,8 @@ from core.utils import (
 )
 from core.modelRegistry import ModelRegistry
 from core._logic import SegmentHumanBodyLogic
-from core._state import WidgetState, _SliceViewMouseFilter
+from core._state import WidgetState
+from core._input import BrushHandler, EraseHandler
 
 log = logging.getLogger(__name__)
 
@@ -56,7 +57,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.currentViewName = None  # default
 
         # Single unified action history for Ctrl+Z.  Each entry is a list:
-        #   ['brush',  change]                  — Paint/Erase stroke
+        #   ['brush',  change]                  — Paint stroke
+        #   ['erase',  change]                  — Erase stroke
         #   ['expand', change]                  — expand operation
         #   ['point',  change, node, cp_id]     — confirmed prompt control point
         # ``change`` is a MaskChange (or None when the action produced no net
@@ -67,9 +69,9 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._history = []
         self._undo_shortcut = None
 
-        # Before-state captured at brush-stroke start (no pre_stroke wrapper).
-        # Holds (axis, idx, slice_copy) while a stroke is in progress; None otherwise.
-        self._stroke_before = None
+        # Active stroke handler (BrushHandler or EraseHandler), or None when
+        # neither tool is active.  Owns the mouse filter and stroke-before state.
+        self._stroke_handler = None
 
         # SPX boundary overlay
         self._spx_boundary_node    = None   # vtkMRMLLabelMapVolumeNode
@@ -78,21 +80,14 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._spx_boundary_shortcut = None
         self._expand_shortcut    = None
 
-        self._toolValidatorTimer = qt.QTimer()
-        self._toolValidatorTimer.timeout.connect(self._enforceToolConsistency)
-        self._brushMouseFilter = None  # _SliceViewMouseFilter installed on slicer.app
-
     # -------------------------
     # Setup / Cleanup
     # -------------------------
     def cleanup(self):
-        """Called by Slicer when the module is unloaded.  Remove the app-level
-        Qt event filter so it does not reference a dead widget."""
-        if self._brushMouseFilter:
-            slicer.app.removeEventFilter(self._brushMouseFilter)
-            self._brushMouseFilter = None
-        if self._toolValidatorTimer.isActive():
-            self._toolValidatorTimer.stop()
+        """Called by Slicer when the module is unloaded."""
+        if self._stroke_handler:
+            self._stroke_handler.detach(self)
+            self._stroke_handler = None
         super().cleanup()
 
     def setup(self):
@@ -139,69 +134,33 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._expand_shortcut.connect('activated()', self._onExpandShortcut)
 
         qt.QTimer.singleShot(0, self._initializeAfterSetup)
-        self._toolValidatorTimer.start(100)
-
-        # Install a Qt application-level event filter to detect brush stroke
-        # boundaries.  Qt events fire before VTK processes them, so this works
-        # even when the Segment Editor Paint/Erase effect absorbs VTK events.
-        self._brushMouseFilter = _SliceViewMouseFilter(self)
-        slicer.app.installEventFilter(self._brushMouseFilter)
 
         log.debug('[Setup complete]')
 
-    def _onBrushStrokeStart(self):
-        if not (self.ui.brushToolButton.isChecked() or self.ui.eraseToolButton.isChecked()):
-            return
+    def _set_stroke_handler(self, handler):
+        """Switch the active stroke handler, detaching the old one first."""
+        if self._stroke_handler:
+            self._stroke_handler.detach(self)
+        self._stroke_handler = handler
+        if handler:
+            handler.attach(self)
 
-        if not self.ctrl.brush_in_progress:
-            # If a prior stroke's commit timer is still pending (extremely rare
-            # race between rapid clicks), flush it now so history stays ordered.
-            if self._stroke_before is not None:
-                self._commitPendingStroke()
+    def _add_history(self, entry):
+        """Append *entry* to the undo history (called by input handlers)."""
+        self._history.append(entry)
 
-            source = 'erase' if self.ui.eraseToolButton.isChecked() else 'brush'
-            axis, idx, before = self.logic.capture_current_slice(self)
-            if before is not None:
-                self._stroke_before = (axis, idx, before, source)
-            self.ctrl.brush_in_progress = True
-            log.debug('[Widget] %s stroke start — history depth %d', source, len(self._history))
-            self.logic.reset_render_state()
+    def _resolveActiveView(self):
+        """Update currentViewName to whichever slice view the cursor is over.
 
-    def _onBrushStrokeEnd(self):
-        if not self.ctrl.brush_in_progress:
-            return
-        self.ctrl.brush_in_progress = False
-
-        # Our Qt event filter fires BEFORE Qt delivers the event to the VTK
-        # render window, so the Paint effect has not called apply() yet.
-        # A 0-ms timer fires AFTER the current event is fully dispatched
-        # (including VTK's synchronous processing of the mouse release, which
-        # triggers the Paint effect's natural apply()), so the labelmap is
-        # committed by the time _commitPendingStroke reads it.
-        if self._stroke_before is not None:
-            qt.QTimer.singleShot(0, self._commitPendingStroke)
-
-    def _commitPendingStroke(self):
-        """Read the post-stroke Slicer state, compute the delta, record in history.
-
-        Called from a 0-ms QTimer (scheduled in _onBrushStrokeEnd) so that
-        VTK's Paint-effect apply() has already committed the stroke before we
-        read the labelmap.  Also called synchronously when the E shortcut or
-        Ctrl+Z needs an immediate commit.
+        Called lazily at the moments that need an accurate view (expand, point
+        confirmed) rather than on every mouse-move event.
         """
-        if self._stroke_before is None:
-            return
-        axis, idx, before, source = self._stroke_before
-        self._stroke_before = None
-        change = self.logic.commit_stroke(self, axis, idx, before, source)
-        if change is not None:
-            # Skip erase strokes that covered no positive pixels — nothing
-            # meaningful was removed so there is nothing to undo.
-            if source == 'erase' and not np.any(change.delta < 0):
+        lm = slicer.app.layoutManager()
+        for viewName in ("Red", "Green", "Yellow"):
+            sw = lm.sliceWidget(viewName)
+            if sw and sw.sliceView().underMouse():
+                self.currentViewName = viewName
                 return
-            self._history.append([source, change])
-        log.debug('[Widget] %s committed — change=%s  history=%d',
-                  source, change is not None, len(self._history))
 
     def _onExpand(self):
         """Run expand and record the result in history.
@@ -209,133 +168,21 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         Shared by the E shortcut and the Expand button.  Returns immediately
         when pre-conditions fail (handled inside ``on_expand``).
         """
+        self._resolveActiveView()
         change = self.logic.on_expand(self)
         if change is not None:
             self._history.append(['expand', change])
 
     def _onExpandShortcut(self):
-        """Handle the E hotkey: exit brush → expand → re-enter brush.
-
-        Three cases are handled:
-
-        1. Mouse still held (brush_in_progress): VTK will never receive a
-           mouse-release, so we call apply() manually to flush the buffered
-           stroke, then commit synchronously.
-
-        2. Pending 0-ms timer commit (mouse just released before the timer
-           fired): flush _commitPendingStroke synchronously so the stroke
-           is in history and in the tracker before expand reads the mask.
-
-        3. No pending stroke: brush is active but idle — expand runs directly.
-        """
-        brush_active = self.ui.brushToolButton.isChecked()
-        erase_active = self.ui.eraseToolButton.isChecked()
-
-        if brush_active or erase_active:
-            prior_tool = "brush" if brush_active else "erase"
-
-            if self.ctrl.brush_in_progress:
-                # Case 1: VTK will never get the mouse release — flush manually.
-                editor = self._segEditor()
-                if editor:
-                    effect = editor.activeEffect()
-                    if effect:
-                        try:
-                            effect.self().apply()
-                        except Exception as exc:
-                            log.warning('[Widget] Paint apply() failed: %s', exc)
-                self.ctrl.brush_in_progress = False
-
-            # Cases 1 + 2: commit any pending before-state synchronously.
-            if self._stroke_before is not None:
-                self._commitPendingStroke()
-
-            self._setTool(None)
-            self._onExpand()
-            self._setTool(prior_tool)
-        else:
-            self._onExpand()
-
-    def _enforceToolConsistency(self):
-        editor = self._segEditor()
-        if not editor:
-            return
-
-        interactionNode = slicer.app.applicationLogic().GetInteractionNode()
-        selectionNode = slicer.app.applicationLogic().GetSelectionNode()
-
-        posNode, negNode = self.logic.getPromptNodes(self._parameterNode)
-
-        activeEffect = editor.activeEffect().name if editor.activeEffect() else None
-        activePlaceNodeID = selectionNode.GetActivePlaceNodeID()
-        mode = interactionNode.GetCurrentInteractionMode()
-
-        # --- If placing points → brush must be OFF ---
-        if mode == interactionNode.Place and activePlaceNodeID in (
-            posNode.GetID() if posNode else None,
-            negNode.GetID() if negNode else None,
-        ):
-            if self.ui.brushToolButton.isChecked() or self.ui.eraseToolButton.isChecked():
-                self._forceDeactivateBrush()
-
-        # --- If brush is active → UI must match ---
-        elif activeEffect in ("Paint", "Erase"):
-            self._syncBrushUI(activeEffect)
-
-        # --- If no tool active → UI must be OFF ---
-        elif activeEffect is None:
-            if self.ui.brushToolButton.isChecked() or self.ui.eraseToolButton.isChecked():
-                self._forceDeactivateBrush()
-    
-    def _forceDeactivateBrush(self):
-        self._setTool(None)
-
-    def _syncBrushUI(self, effectName):
-        self.ui.brushToolButton.blockSignals(True)
-        self.ui.eraseToolButton.blockSignals(True)
-
-        self.ui.brushToolButton.setChecked(effectName == "Paint")
-        self.ui.eraseToolButton.setChecked(effectName == "Erase")
-
-        self.ui.brushToolButton.blockSignals(False)
-        self.ui.eraseToolButton.blockSignals(False)
-
-    def _setTool(self, tool: str):
-        editor = self._segEditor()
-
-        # --- turn everything OFF (NO SIGNALS) ---
-        self.ui.brushToolButton.blockSignals(True)
-        self.ui.eraseToolButton.blockSignals(True)
-
-        self.ui.brushToolButton.setChecked(False)
-        self.ui.eraseToolButton.setChecked(False)
-
-        self.ui.brushToolButton.blockSignals(False)
-        self.ui.eraseToolButton.blockSignals(False)
-
-        if editor:
-            editor.setActiveEffectByName("")
-
-        # --- apply selected tool ---
-        if tool == "brush":
-            self.ui.brushToolButton.blockSignals(True)
-            self.ui.brushToolButton.setChecked(True)
-            self.ui.brushToolButton.blockSignals(False)
-
-            self._pausePromptPlacement()
-
-            if editor:
-                self._activateBrushEffect("Paint", self.ui.brushToolButton)
-
-        elif tool == "erase":
-            self.ui.eraseToolButton.blockSignals(True)
-            self.ui.eraseToolButton.setChecked(True)
-            self.ui.eraseToolButton.blockSignals(False)
-
-            self._pausePromptPlacement()
-
-            if editor:
-                self._activateBrushEffect("Erase", self.ui.eraseToolButton)
+        """Handle the E hotkey: flush any active stroke → expand → restore tool."""
+        prior_class = type(self._stroke_handler) if self._stroke_handler else None
+        if self._stroke_handler:
+            # detach() flushes (apply + commit) then deactivates the editor effect.
+            self._stroke_handler.detach(self)
+            self._stroke_handler = None
+        self._onExpand()
+        if prior_class:
+            self._set_stroke_handler(prior_class())
 
 
     def _initializeAfterSetup(self):
@@ -358,16 +205,14 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # a visible module switch later.  Both selectModule calls happen before the
         # event loop repaints, so the user sees no flash.
         qt.QTimer.singleShot(0, self._preloadSegmentEditor)
-        # Observe slice node changes so that scrolling re-draws the prompt result.
-        self._connectSliceObservers()
+        # Slice observers are wired by _observeMarkupsNodes (called above via
+        # setParameterNode).  No direct call needed here.
 
     def _connectSliceObservers(self):
-        """Add VTK observers on all three slice nodes.
+        """Add VTK observers for slice scrolling, cursor tracking, and interaction mode.
 
-        When the active slice view scrolls to a new slice the prompt result
-        must be redrawn.  Observing ``ModifiedEvent`` on every slice node and
-        checking whether the *active* view actually changed slice triggers the
-        right render without polling.
+        All three are registered here so they survive the removeObservers() call
+        inside _observeMarkupsNodes.
         """
         lm = slicer.app.layoutManager()
         for viewName in ("Red", "Green", "Yellow"):
@@ -376,6 +221,13 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 self.addObserver(sw.mrmlSliceNode(),
                                  vtk.vtkCommand.ModifiedEvent,
                                  self._onSliceNodeModified)
+
+        # Deactivate the brush when the user switches to point-placement mode.
+        interactionNode = slicer.app.applicationLogic().GetInteractionNode()
+        if interactionNode:
+            self.addObserver(interactionNode,
+                             vtk.vtkCommand.ModifiedEvent,
+                             self._onInteractionModeChanged)
 
     def _onSliceNodeModified(self, caller=None, event=None):
         """Re-render when the active slice view scrolls to a new slice.
@@ -418,37 +270,32 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             return
         self._triggerRender()
 
+    def _onInteractionModeChanged(self, caller=None, event=None):
+        """Deactivate the brush when the user enters point-placement mode."""
+        if not self._stroke_handler:
+            return
+        interactionNode = caller
+        if interactionNode.GetCurrentInteractionMode() != interactionNode.Place:
+            return
+        selectionNode = slicer.app.applicationLogic().GetSelectionNode()
+        posNode, negNode = self.logic.getPromptNodes(self._parameterNode)
+        activePlaceID = selectionNode.GetActivePlaceNodeID()
+        if activePlaceID in (
+            posNode.GetID() if posNode else None,
+            negNode.GetID() if negNode else None,
+        ):
+            self._set_stroke_handler(None)
+
     def _preloadSegmentEditor(self):
         """Silently initialize the Segment Editor module widget if not done yet.
 
-        The widget is only created the first time the module is shown.  We trigger
-        that creation by switching to it and immediately back — both happen in the
-        same call stack before the event loop repaints, so the user sees no flash.
-        Also hooks activeEffectChanged so a right-click exit of the paint/erase
-        effect is reflected in our Brush / Erase toggle buttons.
+        Triggers creation by switching to it and immediately back — both happen
+        in the same call stack so the user sees no flash.  activeEffectChanged
+        is wired per-handler in StrokeHandler.attach; no global connection here.
         """
         if slicer.modules.segmenteditor.widgetRepresentation() is None:
             slicer.util.selectModule('SegmentEditor')
             slicer.util.selectModule(self.moduleName)
-
-        editor = self._segEditor()
-        if editor:
-            editor.connect('activeEffectChanged()', self._onEditorEffectChanged)
-
-    def _onEditorEffectChanged(self):
-        if self.ctrl.activating_brush:
-            return
-
-        editor = self._segEditor()
-        if not editor:
-            return
-
-        effect = editor.activeEffect()
-        active_name = effect.name if effect else None
-
-        # --- Sync UI state ---
-        if active_name not in ("Paint", "Erase"):
-            self._setTool(None)
 
 
     # -------------------------
@@ -484,7 +331,6 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         ui.modelFamilyDropdown.connect('currentIndexChanged(int)', self.onModelFamilyChanged)
         ui.modelVariantDropdown.connect('currentIndexChanged(int)', self.onVariantChanged)
-        ui.sliceViewDropdown.connect('currentTextChanged(QString)', self.onSliceViewChanged)
         ui.sourceVolumeSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.updateParameterNodeFromGUI)
         ui.segmentationNodeSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.updateParameterNodeFromGUI)
         ui.segmentSelector.connect("currentSegmentChanged(QString)", self.onSegmentChanged)
@@ -549,6 +395,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if caller is None:
             return
 
+        self._resolveActiveView()
         n = caller.GetNumberOfControlPoints()
         if n > 0:
             cp_id = caller.GetNthControlPointID(n - 1)
@@ -592,13 +439,10 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         """Request a single immediate render via the controller.
 
         Used when confirmed point placements, point removals, undos, and slice
-        scrolls need the display updated without waiting for the 100ms timer.
+        scrolls need the display updated immediately.
         Re-entrancy and pending-render bookkeeping are handled by ctrl.request_render.
         """
         self.ctrl.request_render()
-
-    def onSliceViewChanged(self, viewName):
-        self.currentViewName = viewName
 
     # -------------------------
     # Window / Level
@@ -705,71 +549,11 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             effect.setParameter("BrushSphere",
                                 "1" if self.ui.brushSphereCheckBox.isChecked() else "0")
 
-    def _pausePromptPlacement(self):
-        """Switch the interaction node to view-transform mode.
-
-        Called when brush or erase is activated so that left-clicks in slice
-        views go to the paint effect rather than placing markup points.
-        """
-        slicer.app.applicationLogic().GetInteractionNode().SwitchToViewTransformMode()
-
-
-    def _activateBrushEffect(self, effect_name: str, button):
-        """Shared setup for Paint / Erase: guard nodes, sync Segment Editor, activate."""
-        editor = self._segEditor()
-        if editor is None:
-            button.blockSignals(True)
-            button.setChecked(False)
-            button.blockSignals(False)
-            return
-
-        volNode, segNode = self.logic.getVolumeAndSegmentation(self._parameterNode)
-
-        if effect_name == "Paint" and segNode and \
-                segNode.GetSegmentation().GetNumberOfSegments() == 0:
-            self.onAddSegment()
-
-        if not volNode or not segNode:
-            button.blockSignals(True)
-            button.setChecked(False)
-            button.blockSignals(False)
-            return
-
-        self.ctrl.activating_brush = True
-        try:
-            editor.setSegmentationNode(segNode)
-            self.ctrl.brush_in_progress = False
-            editor.setSourceVolumeNode(volNode)
-            editor.setUndoEnabled(True)
-            editor.setMaximumNumberOfUndoStates(50)
-            segID = self.ui.segmentSelector.currentSegmentID()
-            if segID:
-                editor.setCurrentSegmentID(segID)
-            editor.setActiveEffectByName(effect_name)
-            self._applyBrushParams()
-        finally:
-            self.ctrl.activating_brush = False
-
-        # Segment Editor node setup can reset the slice composite label layer.
-        # Re-apply the SPX boundary overlay if it was active.
-        if self._spx_boundary_visible and self._spx_boundary_node:
-            composite = self._get_composite_node(self._spx_boundary_view)
-            if composite:
-                composite.SetLabelVolumeID(self._spx_boundary_node.GetID())
-                composite.SetLabelOpacity(0.8)
-
-
     def onBrushToggled(self, checked: bool):
-        if checked:
-            self._setTool("brush")
-        else:
-            self._setTool(None)
+        self._set_stroke_handler(BrushHandler() if checked else None)
 
     def onEraseToggled(self, checked: bool):
-        if checked:
-            self._setTool("erase")
-        else:
-            self._setTool(None)
+        self._set_stroke_handler(EraseHandler() if checked else None)
 
     def _onBrushDiameterSliderChanged(self, value):
         self.ui.brushDiameterSpinBox.blockSignals(True)
@@ -826,9 +610,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         self.ui.samMaskDropdown.clear()
         self.ui.samMaskDropdown.addItems(['Mask-1', 'Mask-2', 'Mask-3'])
-        self.ui.sliceViewDropdown.clear()
-        self.ui.sliceViewDropdown.addItems(["Red", "Green", "Yellow"])
-        self.ui.sliceViewDropdown.setCurrentText("Red")
+        # View is now auto-detected from mouse position; hide the manual dropdown.
+        self.ui.sliceViewDropdown.setVisible(False)
 
         for name in dropdowns:
             if hasattr(self.ui, name):
@@ -1060,11 +843,13 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         segNode = self.ui.segmentSelector.currentNode()
         if segNode and segmentID:
             self._history.clear()
-            self._stroke_before = None
+            if self._stroke_handler:
+                self._stroke_handler.reset(self)
 
     def clearPrompts(self):
         self._history.clear()
-        self._stroke_before = None
+        if self._stroke_handler:
+            self._stroke_handler.reset(self)
 
         # Recreate fresh markup nodes (counter=0).  This is the structural
         # fix for "starts at Positive 2": fresh nodes have never had a point
@@ -1103,10 +888,9 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def onUndo(self):
         log.debug('[Widget] Undo pressed — history depth %d', len(self._history))
 
-        # If a 0-ms commit timer is pending (mouse just released, timer hasn't
-        # fired) flush it now so the stroke lands in history before we pop.
-        if self._stroke_before is not None:
-            self._commitPendingStroke()
+        # Flush any in-flight stroke so it lands in history before we pop.
+        if self._stroke_handler:
+            self._stroke_handler.flush(self)
 
         if not self._history:
             return
@@ -1260,7 +1044,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.ctrl.resume()
 
         self._history.clear()
-        self._stroke_before = None
+        if self._stroke_handler:
+            self._stroke_handler.reset(self)
 
     def onRemoveSegment(self, *args):
         self.ctrl.pause()
@@ -1279,7 +1064,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         
         if segNode and segmentID:
             self._history.clear()
-            self._stroke_before = None
+            if self._stroke_handler:
+                self._stroke_handler.reset(self)
 
     def getOrCreateSegmentationNode(self):
         volumeNode = self.ui.sourceVolumeSelector.currentNode()

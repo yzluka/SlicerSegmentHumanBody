@@ -156,10 +156,11 @@ class SPXModelFamily(BaseModelFamily):
         if not self.model:
             return None
 
-        # Pop base_mask before building the SPX label-map cache key.
+        # Pop base_mask and erase_mask before building the SPX label-map cache key.
         # The label map depends only on img content and algorithm params,
-        # not on the pre-existing painted slice.
-        base_mask = kwargs.pop('base_mask', None)
+        # not on the pre-existing painted state.
+        base_mask  = kwargs.pop('base_mask',  None)
+        erase_mask = kwargs.pop('erase_mask', None)
 
         key = self._make_cache_key(img, kwargs)
         if key != self._cache_key:
@@ -183,6 +184,13 @@ class SPXModelFamily(BaseModelFamily):
                           if pos_only_labels else np.zeros(labels.shape, dtype=bool))
             neg_region = (np.isin(labels, list(neg_labels))
                           if neg_labels else np.zeros(labels.shape, dtype=bool))
+
+            # Pixels manually excluded by the erase brush take priority over
+            # SPX-label expansion.  The exclusion mask is committed through the
+            # single write path (commit_stroke) so it is always current.
+            if erase_mask is not None:
+                pos_region = pos_region & ~erase_mask
+
             return np.where(neg_region, 0,
                             np.where(pos_region, 1, base_mask)).astype(np.uint8)
 

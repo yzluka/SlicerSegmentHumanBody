@@ -1,36 +1,12 @@
 """Widget state for the SegmentHumanBody Slicer module.
 
-WidgetState           — render-loop gating and tool-mode flags.
-_SliceViewMouseFilter — Qt app-level event filter for brush stroke detection.
+WidgetState — render-loop gating and tool-mode flags.
 """
 
 import logging
 import qt
 
 log = logging.getLogger(__name__)
-
-
-class _SliceViewMouseFilter(qt.QObject):
-    """Qt application-level event filter for detecting brush stroke boundaries.
-
-    Installed on slicer.app so it fires for every Qt mouse event before any
-    VTK interactor observer.  Returns False so events are never consumed.
-    """
-
-    def __init__(self, widget):
-        super().__init__()
-        self._widget = widget
-
-    def eventFilter(self, obj, event):
-        t = event.type()
-        try:
-            if t == qt.QEvent.MouseButtonPress and event.button() == qt.Qt.LeftButton:
-                self._widget._onBrushStrokeStart()
-            elif t == qt.QEvent.MouseButtonRelease and event.button() == qt.Qt.LeftButton:
-                self._widget._onBrushStrokeEnd()
-        except Exception as exc:
-            log.error('[MouseFilter] brush event handler raised: %s', exc)
-        return False
 
 
 class WidgetState:
@@ -55,7 +31,7 @@ class WidgetState:
         self._pause_depth = 0   # nestable: each pause() must be paired with resume()
 
         # Tool-mode flags (read and written directly by the widget)
-        self.activating_brush  = False   # True while _activateBrushEffect is running
+        self.activating_brush  = False   # True while StrokeHandler._activate_effect is running
         self.brush_in_progress = False   # True between stroke-start and stroke-end
         self.creating_segment  = False   # suppresses onSegmentChanged during add
 

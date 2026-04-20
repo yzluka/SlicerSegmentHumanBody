@@ -86,6 +86,13 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         # from scratch, so removing any point always reverts correctly.
         self._session_base: np.ndarray | None = None
 
+        # Pixels manually excluded by the erase brush.
+        # {(axis, slice_idx): bool 2-D array}  — True = excluded from pos-region expansion.
+        # Populated by commit_stroke (the single write path) on erase strokes.
+        # Un-populated when an erase stroke is undone.  Cleared by reset_render_state /
+        # end_session (segment switch, clearPrompts, etc.).
+        self._erase_acc: dict = {}
+
         # Confirmed W/L values (set via "Apply Window/Level").  When set, each
         # slice is normalized to [0, 255] before reaching the model.  Volume
         # data is never modified.
@@ -112,6 +119,7 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         """
         self._last_render_key = None
         self._session_base = None
+        self._erase_acc = {}
 
     def _get_tracker(self, segNode, segmentID, volumeNode) -> SegmentTracker:
         """Return the active ``SegmentTracker``, creating one when necessary.
@@ -191,7 +199,28 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         write_slice_to_volume(tracker._mask, before_slice, axis, idx)
 
         # Single write path: delta = after − before, updates _mask, pushes.
-        return tracker.write_slice(axis, idx, after_slice, source=source)
+        change = tracker.write_slice(axis, idx, after_slice, source=source)
+
+        # Keep _session_base in sync with manual brush/erase changes.
+        # Without this, any render that fires after the stroke would recompute
+        # result = (stale_base | pos_selections) and overwrite the brush work.
+        if self._session_base is not None:
+            write_slice_to_volume(self._session_base, after_slice, axis, idx)
+
+        # Record pixels removed by erase strokes so SPX renders don't re-expand
+        # into them.  Updated here (the single write path) so the state is always
+        # current before any subsequent render reads it.
+        if source == 'erase':
+            removed = (before_slice.astype(np.int16) - after_slice.astype(np.int16)) > 0
+            if np.any(removed):
+                key = (axis, idx)
+                acc = self._erase_acc.get(key)
+                if acc is None:
+                    self._erase_acc[key] = removed.copy()
+                else:
+                    acc |= removed
+
+        return change
 
     def reverse_change(self, widget, change) -> None:
         """Apply the inverse of *change* to the tracker and push to Slicer."""
@@ -200,7 +229,25 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         vol, seg, seg_id = self._get_context(widget)
         if not vol or not seg or not seg_id:
             return
-        self._get_tracker(seg, seg_id, vol).reverse_delta(change)
+        tracker = self._get_tracker(seg, seg_id, vol)
+        tracker.reverse_delta(change)
+
+        # Keep _session_base in sync so subsequent renders start from the
+        # reverted state.
+        if self._session_base is not None:
+            reverted = tracker.get_slice(change.axis, change.slice_idx)
+            write_slice_to_volume(self._session_base, reverted, change.axis, change.slice_idx)
+
+        # Un-accumulate erased pixels when an erase stroke is undone.
+        if change.source == 'erase':
+            key = (change.axis, change.slice_idx)
+            if key in self._erase_acc:
+                r_end = change.r_min + change.delta.shape[0]
+                c_end = change.c_min + change.delta.shape[1]
+                restored = change.delta < 0  # delta < 0 = was erased; reversing restores them
+                self._erase_acc[key][change.r_min:r_end, change.c_min:c_end] &= ~restored
+                if not np.any(self._erase_acc[key]):
+                    del self._erase_acc[key]
 
     def end_session(self):
         """End the current annotation session.
@@ -213,6 +260,7 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         """
         self._session_base = None
         self._last_render_key = None
+        self._erase_acc = {}
 
     # -------------------------
     # Window / Level
@@ -423,12 +471,14 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
 
         base_slice = get_slice_from_volume(self._session_base, axis, sliceIndex)
 
+        erase_slice = self._erase_acc.get((axis, sliceIndex))
         result = call_if_exists(
             modelFamily, "onRender",
             img=img,
             pos_points=scribbles_ijk["positive"],
             neg_points=scribbles_ijk["negative"],
             base_mask=base_slice.copy(),
+            erase_mask=erase_slice.copy() if erase_slice is not None else None,
             **params
         )
 
@@ -586,6 +636,9 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
             return None
 
         params = widget.getUserParameters()
+        if params is None:
+            slicer.util.warningDisplay("Invalid model parameters.")
+            return None
 
         volumeArray = slicer.util.arrayFromVolume(volumeNode)
         if volumeArray is None:

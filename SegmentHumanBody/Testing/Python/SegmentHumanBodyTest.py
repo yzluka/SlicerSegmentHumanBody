@@ -7,7 +7,7 @@ These tests require a live Slicer process and exercise:
   - MRML scene operations (arrayFromSegmentBinaryLabelmap, etc.)
   - Delta-based undo: write_slice / reverse_delta round-trips.
   - Unified history: expand returns MaskChange; reverse_change restores state.
-  - Qt event filter (_SliceViewMouseFilter): return value and callback routing.
+  - Qt event filter (_SliceViewMouseFilter): return value and on_press/on_release routing.
 """
 
 import unittest
@@ -576,43 +576,42 @@ class MouseFilterTest(unittest.TestCase):
 
     def _make_filter(self):
         import qt
-        from core._state import _SliceViewMouseFilter
-        widget = MagicMock()
-        widget._onBrushStrokeStart = MagicMock()
-        widget._onBrushStrokeEnd   = MagicMock()
-        return _SliceViewMouseFilter(widget), widget
+        from core._input import _SliceViewMouseFilter
+        on_press   = MagicMock()
+        on_release = MagicMock()
+        return _SliceViewMouseFilter(on_press, on_release), on_press, on_release
 
     def test_event_filter_always_returns_false(self):
         import qt
-        filt, _ = self._make_filter()
+        filt, _, _ = self._make_filter()
         event = MagicMock()
         event.type.return_value = qt.QEvent.MouseMove
         result = filt.eventFilter(None, event)
         self.assertFalse(result, "eventFilter must never consume events")
 
-    def test_mouse_press_calls_stroke_start(self):
+    def test_mouse_press_calls_on_press(self):
         import qt
-        filt, widget = self._make_filter()
+        filt, on_press, _ = self._make_filter()
         event = MagicMock()
         event.type.return_value   = qt.QEvent.MouseButtonPress
         event.button.return_value = qt.Qt.LeftButton
         filt.eventFilter(None, event)
-        widget._onBrushStrokeStart.assert_called_once()
+        on_press.assert_called_once()
 
-    def test_mouse_release_calls_stroke_end(self):
+    def test_mouse_release_calls_on_release(self):
         import qt
-        filt, widget = self._make_filter()
+        filt, _, on_release = self._make_filter()
         event = MagicMock()
         event.type.return_value   = qt.QEvent.MouseButtonRelease
         event.button.return_value = qt.Qt.LeftButton
         filt.eventFilter(None, event)
-        widget._onBrushStrokeEnd.assert_called_once()
+        on_release.assert_called_once()
 
     def test_callback_exception_does_not_propagate(self):
         """Exceptions in the callback must be swallowed to protect the Qt event loop."""
         import qt
-        filt, widget = self._make_filter()
-        widget._onBrushStrokeStart.side_effect = RuntimeError("test error")
+        filt, on_press, _ = self._make_filter()
+        on_press.side_effect = RuntimeError("test error")
         event = MagicMock()
         event.type.return_value   = qt.QEvent.MouseButtonPress
         event.button.return_value = qt.Qt.LeftButton
