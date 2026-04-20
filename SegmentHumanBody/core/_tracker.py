@@ -144,7 +144,7 @@ class SegmentTracker:
         return get_slice_from_volume(self.get_mask(), axis, idx)
 
     def snapshot(self) -> np.ndarray:
-        """Deep copy of the full 3-D mask — used by PromptSession as base."""
+        """Deep copy of the full 3-D mask — used as the session base."""
         return self.get_mask().copy()
 
     # ------------------------------------------------------------------

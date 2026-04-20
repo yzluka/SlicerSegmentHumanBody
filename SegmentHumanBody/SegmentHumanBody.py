@@ -8,7 +8,7 @@ from slicer.ScriptedLoadableModule import (
 )
 from slicer.util import VTKObservationMixin
 
-from core.modelFamilies import BaseModelFamily, SAMFamily, SPXModelFamily, AutoModelFamily, FAMILY_REGISTRY
+from core.modelFamilies import BaseModelFamily, SPXModelFamily, FAMILY_REGISTRY
 from core.utils import (
     call_if_exists,
     write_slice_to_volume,
@@ -16,9 +16,8 @@ from core.utils import (
     parse_user_parameters,
 )
 from core.modelRegistry import ModelRegistry
-from core._renderer import _SliceViewMouseFilter
 from core._logic import SegmentHumanBodyLogic
-from core._controller import RenderController
+from core._state import WidgetState, _SliceViewMouseFilter
 
 log = logging.getLogger(__name__)
 
@@ -51,7 +50,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         VTKObservationMixin.__init__(self)
 
         self.logic = SegmentHumanBodyLogic()
-        self.ctrl = RenderController(self)   # central state machine for all render flags
+        self.ctrl = WidgetState(self)
         self._parameterNode = None
         self.modelFamily = None
         self.currentViewName = None  # default
@@ -160,11 +159,12 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             if self._stroke_before is not None:
                 self._commitPendingStroke()
 
+            source = 'erase' if self.ui.eraseToolButton.isChecked() else 'brush'
             axis, idx, before = self.logic.capture_current_slice(self)
             if before is not None:
-                self._stroke_before = (axis, idx, before)
+                self._stroke_before = (axis, idx, before, source)
             self.ctrl.brush_in_progress = True
-            log.debug('[Widget] brush stroke start — history depth %d', len(self._history))
+            log.debug('[Widget] %s stroke start — history depth %d', source, len(self._history))
             self.logic.reset_render_state()
 
     def _onBrushStrokeEnd(self):
@@ -191,13 +191,17 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         """
         if self._stroke_before is None:
             return
-        axis, idx, before = self._stroke_before
+        axis, idx, before, source = self._stroke_before
         self._stroke_before = None
-        change = self.logic.commit_stroke(self, axis, idx, before)
+        change = self.logic.commit_stroke(self, axis, idx, before, source)
         if change is not None:
-            self._history.append(['brush', change])
-        log.debug('[Widget] stroke committed — change=%s  history=%d',
-                  change is not None, len(self._history))
+            # Skip erase strokes that covered no positive pixels — nothing
+            # meaningful was removed so there is nothing to undo.
+            if source == 'erase' and not np.any(change.delta < 0):
+                return
+            self._history.append([source, change])
+        log.debug('[Widget] %s committed — change=%s  history=%d',
+                  source, change is not None, len(self._history))
 
     def _onExpand(self):
         """Run expand and record the result in history.
@@ -238,8 +242,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                     if effect:
                         try:
                             effect.self().apply()
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            log.warning('[Widget] Paint apply() failed: %s', exc)
                 self.ctrl.brush_in_progress = False
 
             # Cases 1 + 2: commit any pending before-state synchronously.
@@ -527,6 +531,9 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                     slicer.vtkMRMLMarkupsNode.PointRemovedEvent,
                     self._onPointRemoved
                 )
+
+        # Re-add slice-node observers that removeObservers() wiped.
+        self._connectSliceObservers()
 
     def _onPointConfirmed(self, caller=None, event=None):
         """PointPositionDefinedEvent — a placement was just confirmed by the user.
@@ -1107,8 +1114,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         entry = self._history.pop()
         action_type = entry[0]
 
-        # --- Brush / Expand → reverse the stored delta ---
-        if action_type in ('brush', 'expand'):
+        # --- Brush / Erase / Expand → reverse the stored delta ---
+        if action_type in ('brush', 'erase', 'expand'):
             change = entry[1]
             self.logic.reverse_change(self, change)
 
@@ -1189,6 +1196,9 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self._spx_boundary_node.CreateDefaultDisplayNodes()
             # Allocate image data with the same geometry as the source volume.
             sourceArray = slicer.util.arrayFromVolume(volumeNode)
+            if sourceArray is None:
+                slicer.util.warningDisplay("Cannot read volume data — SPX boundary not shown.")
+                return
             zeroArray = np.zeros(sourceArray.shape, dtype=np.uint8)
             slicer.util.updateVolumeFromArray(self._spx_boundary_node, zeroArray)
             ijkToRAS = vtk.vtkMatrix4x4()

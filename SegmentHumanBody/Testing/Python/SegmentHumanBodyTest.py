@@ -576,7 +576,7 @@ class MouseFilterTest(unittest.TestCase):
 
     def _make_filter(self):
         import qt
-        from core._renderer import _SliceViewMouseFilter
+        from core._state import _SliceViewMouseFilter
         widget = MagicMock()
         widget._onBrushStrokeStart = MagicMock()
         widget._onBrushStrokeEnd   = MagicMock()

@@ -231,7 +231,7 @@ class AutoModelFamily(BaseModelFamily):
 # Add a new family by adding one entry here — no widget edits required.
 FAMILY_REGISTRY: dict = {
     'None':                      BaseModelFamily,
-    'SAM-Style':                 SAMFamily,
+    # 'SAM-Style':                 SAMFamily,
     'SPX-Assisted Annotation':   SPXModelFamily,
-    'Auto':                      AutoModelFamily,
+    # 'Auto':                      AutoModelFamily,
 }

@@ -43,11 +43,3 @@ class ModelRegistry:
     def register(cls, key: str, factory):
         """Register a new model factory at runtime (e.g. for plugins)."""
         _MODEL_FACTORIES[key] = factory
-
-    # ------------------------------------------------------------------ #
-    # Legacy shim — kept so existing callers are not broken               #
-    # ------------------------------------------------------------------ #
-    @classmethod
-    def instantiate_model(cls, key: str):
-        """Create and return a *new* (uncached) instance."""
-        return cls._instantiate(key)

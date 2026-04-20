@@ -47,17 +47,6 @@ class TestModelRegistry(unittest.TestCase):
             ModelRegistry.get_model('DoesNotExist')
         self.assertIn('DoesNotExist', str(ctx.exception))
 
-    # --- _instantiate ---
-
-    def test_instantiate_model_unknown_key_raises_value_error(self):
-        with self.assertRaises(ValueError):
-            ModelRegistry.instantiate_model('Bogus')
-
-    def test_instantiate_model_returns_new_instance_each_call(self):
-        a = ModelRegistry.instantiate_model('SPX_Tester2D')
-        b = ModelRegistry.instantiate_model('SPX_Tester2D')
-        self.assertIsNot(a, b)
-
     # --- get_param_hint ---
 
     def test_get_param_hint_returns_correct_hint(self):

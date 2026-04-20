@@ -11,7 +11,6 @@ import numpy as np
 from slicer.ScriptedLoadableModule import ScriptedLoadableModuleLogic
 
 from core.modelFamilies import SPXModelFamily
-from core.session import PromptSession
 from core.utils import (
     call_if_exists,
     get_slice_from_volume,
@@ -73,40 +72,28 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        # --- Render-skip optimisation ---
-        # Tracks the last (points, axis, slice, params) tuple that produced a
-        # result.  If it matches the current frame we skip applyResult entirely,
-        # avoiding a full 3D labelmap read/write on every idle tick.
+        # Render-skip: skip the write path when nothing has changed since the
+        # last frame (same prompts, axis, slice, params).
         self._last_render_key = None
 
-        # --- Segment tracker ---
-        # Owns the numpy cache for the current segment and routes all reads and
-        # writes through a single object so Slicer never gets out of sync.
-        # Dropped by reset_render_state(); lazily recreated by _get_tracker().
+        # Numpy cache for the active segment; routes all reads/writes through
+        # a single object so Slicer stays in sync.  Replaced lazily by
+        # _get_tracker() when the segment identity changes.
         self._tracker: SegmentTracker | None = None
 
-        # --- Annotation session ---
-        # Created on the first confirmed prompt and cleared by reset_render_state
-        # (segment switch, brush stroke, model change, undo).
-        # Holds the segment snapshot taken at session start so that removing
-        # any combination of points can always recompute the correct result
-        # from base_mask + remaining points — no per-point snapshot needed.
-        self._session: PromptSession | None = None
+        # Frozen 3-D snapshot of the segment taken on the first confirmed prompt.
+        # Lets every render recompute result = base + pos_labels − neg_labels
+        # from scratch, so removing any point always reverts correctly.
+        self._session_base: np.ndarray | None = None
 
-        # --- Window / Level ---
-        # Set by set_window_level() when the user clicks "Apply Window/Level".
-        # None = raw values are passed to models (no normalization).
-        # When set, each 2D slice is clipped to [level-window/2, level+window/2]
-        # and scaled to [0, 255] before being passed to any model.
-        # The underlying vtkMRMLScalarVolumeNode data is never written to.
+        # Confirmed W/L values (set via "Apply Window/Level").  When set, each
+        # slice is normalized to [0, 255] before reaching the model.  Volume
+        # data is never modified.
         self._wl_window = None
         self._wl_level  = None
 
-        # --- Last write_slice result ---
-        # Stores the most recent MaskChange returned by write_slice so that
-        # the async point-confirm flow (trigger render → capture change) can
-        # pick it up without polling.  Cleared before each render that the
-        # point-confirm path schedules.
+        # Most recent MaskChange from write_slice; picked up by the async
+        # point-confirm flow (render fires → _capturePointChange reads this).
         self._last_change = None
 
     def setDefaultParameters(self, parameterNode):
@@ -117,20 +104,14 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
     # -------------------------
 
     def reset_render_state(self):
-        """Invalidate the render-loop session and key caches.
+        """Clear the session snapshot and render key so the next render starts fresh.
 
-        Clears the annotation session and the last render key so the next
-        render starts fresh.  The ``SegmentTracker`` is intentionally
-        preserved: its delta stack holds the undo history for the current
-        segment and must survive session resets (e.g. brush-stroke start).
-        A new tracker is created automatically by ``_get_tracker()`` whenever
-        the segment or volume identity changes.
-
-        W/L values are intentionally preserved — they are a user preference
-        that should survive segment/volume changes until explicitly cleared.
+        The tracker and W/L values are intentionally preserved — the tracker
+        holds the active mask cache and W/L is a user preference that should
+        survive segment changes.
         """
         self._last_render_key = None
-        self._session = None
+        self._session_base = None
 
     def _get_tracker(self, segNode, segmentID, volumeNode) -> SegmentTracker:
         """Return the active ``SegmentTracker``, creating one when necessary.
@@ -180,7 +161,7 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         before_slice = tracker.get_slice(axis, idx).copy()
         return axis, idx, before_slice
 
-    def commit_stroke(self, widget, axis, idx, before_slice) -> 'MaskChange | None':
+    def commit_stroke(self, widget, axis, idx, before_slice, source='brush') -> 'MaskChange | None':
         """Record a brush stroke as a tracked delta via the single write path.
 
         Reads the after-state directly from Slicer (bypassing the cached
@@ -199,6 +180,9 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
 
         # Read the committed after-state from Slicer without touching _mask.
         raw = slicer.util.arrayFromSegmentBinaryLabelmap(seg, seg_id, vol)
+        if raw is None:
+            log.warning('[Logic] commit_stroke: labelmap read returned None — stroke lost')
+            return None
         after_slice = get_slice_from_volume(raw, axis, idx).copy()
 
         # Restore before-state in _mask so write_slice sees the right baseline.
@@ -207,7 +191,7 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         write_slice_to_volume(tracker._mask, before_slice, axis, idx)
 
         # Single write path: delta = after − before, updates _mask, pushes.
-        return tracker.write_slice(axis, idx, after_slice, source='brush')
+        return tracker.write_slice(axis, idx, after_slice, source=source)
 
     def reverse_change(self, widget, change) -> None:
         """Apply the inverse of *change* to the tracker and push to Slicer."""
@@ -227,7 +211,7 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         Slicer is NOT written to here because in the new design every render
         already commits directly — there is never a stale preview to flush.
         """
-        self._session = None
+        self._session_base = None
         self._last_render_key = None
 
     # -------------------------
@@ -343,7 +327,7 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         Design principle: **always commit**.  Every call writes the result
         through the ``SegmentTracker`` (cache + Slicer together).  There is no
         separate "preview" state — what Slicer shows is always the committed state.
-        The ``PromptSession.base_mask`` snapshot (taken on the first prompt)
+        The ``_session_base`` snapshot (taken on the first prompt)
         lets us recompute any slice from scratch so that removing a point
         correctly reverts to base without any per-point snapshot.
         """
@@ -387,20 +371,20 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         # No active prompts
         # -----------------------------------------------------------------
         if not pos_points and not neg_points:
-            if self._session is not None:
+            if self._session_base is not None:
                 # Restore this slice to the session base (removes any
                 # prompt-driven region that was committed while prompts existed).
                 _, segNode, segmentID = self._get_context(widget)
                 if segNode and segmentID:
                     self._get_tracker(segNode, segmentID, volumeNode).write_slice(
                         axis, sliceIndex,
-                        self._session.base_slice(axis, sliceIndex),
+                        get_slice_from_volume(self._session_base, axis, sliceIndex),
                         source='prompt',
                     )
                 # End session once all markup nodes are empty.
                 total = sum(n.GetNumberOfControlPoints() for n in (posNode, negNode) if n)
                 if total == 0:
-                    self._session = None
+                    self._session_base = None
             self._last_render_key = render_key
             return
 
@@ -419,10 +403,8 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         # -----------------------------------------------------------------
         # Start session on first prompt (snapshot committed state as base)
         # -----------------------------------------------------------------
-        if self._session is None:
-            self._session = PromptSession(
-                self._get_tracker(segNode, segmentID, volumeNode).snapshot()
-            )
+        if self._session_base is None:
+            self._session_base = self._get_tracker(segNode, segmentID, volumeNode).snapshot()
 
         # -----------------------------------------------------------------
         # Compute
@@ -439,7 +421,7 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         img = get_slice_from_volume(volumeArray, axis, sliceIndex)
         img = self._apply_wl_to_slice(img)
 
-        base_slice = self._session.base_slice(axis, sliceIndex)
+        base_slice = get_slice_from_volume(self._session_base, axis, sliceIndex)
 
         result = call_if_exists(
             modelFamily, "onRender",
@@ -453,6 +435,8 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         # -----------------------------------------------------------------
         # Commit — write result (or base) directly into tracker cache + Slicer
         # -----------------------------------------------------------------
+        if result is None:
+            log.warning('[Logic] onRender: model returned None — writing base slice')
         self._last_render_key = render_key
         self._last_change = self._get_tracker(segNode, segmentID, volumeNode).write_slice(
             axis, sliceIndex,

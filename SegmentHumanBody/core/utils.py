@@ -303,10 +303,10 @@ def spx_boundary_mask(labels: np.ndarray) -> np.ndarray:
         return find_boundaries(labels, connectivity=1, mode='thick').astype(np.uint8)
     except ImportError:
         b = np.zeros(labels.shape, dtype=np.uint8)
-        b[1:]    |= (labels[1:]    != labels[:-1]   ).view(np.uint8)
-        b[:-1]   |= (labels[:-1]   != labels[1:]    ).view(np.uint8)
-        b[:, 1:] |= (labels[:, 1:] != labels[:, :-1]).view(np.uint8)
-        b[:, :-1]|= (labels[:, :-1]!= labels[:, 1:] ).view(np.uint8)
+        b[1:]    |= (labels[1:]    != labels[:-1]   ).astype(np.uint8)
+        b[:-1]   |= (labels[:-1]   != labels[1:]    ).astype(np.uint8)
+        b[:, 1:] |= (labels[:, 1:] != labels[:, :-1]).astype(np.uint8)
+        b[:, :-1]|= (labels[:, :-1]!= labels[:, 1:] ).astype(np.uint8)
         return b
 
 
@@ -318,6 +318,8 @@ def extract_connected_component(mask: np.ndarray, point_xy) -> np.ndarray:
     ``scipy.ndimage.binary_propagation`` otherwise.
     """
     x, y = point_xy
+    if y < 0 or y >= mask.shape[0] or x < 0 or x >= mask.shape[1]:
+        return np.zeros_like(mask, dtype=bool)
     if not mask[y, x]:
         return np.zeros_like(mask, dtype=bool)
     try:
