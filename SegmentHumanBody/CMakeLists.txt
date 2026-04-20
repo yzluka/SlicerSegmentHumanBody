@@ -10,7 +10,10 @@ set(MODULE_PYTHON_SCRIPTS
   core/modelRegistry.py
   core/models/__init__.py
   core/models/spx.py
-  core/undoStack.py
+  core/_state.py
+  core/_input.py
+  core/_logic.py
+  core/_tracker.py
   )
 
 set(MODULE_PYTHON_RESOURCES

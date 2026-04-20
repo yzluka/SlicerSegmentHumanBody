@@ -111,21 +111,31 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
     # -------------------------
 
     def reset_render_state(self):
-        """Clear the session snapshot and render key so the next render starts fresh.
+        """Clear session render state: render key, session snapshot, erase tracking.
 
-        The tracker and W/L values are intentionally preserved — the tracker
-        holds the active mask cache and W/L is a user preference that should
-        survive segment changes.
+        The tracker (mask cache) and W/L values are intentionally preserved —
+        the tracker holds the authoritative 3D mask and W/L is a user preference
+        that should survive segment changes.
         """
         self._last_render_key = None
         self._session_base = None
         self._erase_acc = {}
 
+    def invalidate_render_key(self):
+        """Invalidate the render cache key without disturbing session state.
+
+        Called at brush-stroke start so a pending prompt render is forced to
+        re-execute after the stroke, while ``_session_base`` is preserved for
+        ``commit_stroke`` to sync with the brush/erase changes.
+        """
+        self._last_render_key = None
+
     def _get_tracker(self, segNode, segmentID, volumeNode) -> SegmentTracker:
         """Return the active ``SegmentTracker``, creating one when necessary.
 
-        A new tracker is created whenever ``reset_render_state()`` has been
-        called (sets ``_tracker = None``) or when the segment identity changes.
+        A new tracker is created when the segment identity changes (node ID or
+        segment ID).  The tracker is intentionally preserved across
+        ``reset_render_state()`` calls since it holds the authoritative 3D mask.
         The tracker lazily loads the numpy mask from Slicer on first access.
 
         Also ensures the closed surface representation exists so that writes
@@ -194,9 +204,7 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         after_slice = get_slice_from_volume(raw, axis, idx).copy()
 
         # Restore before-state in _mask so write_slice sees the right baseline.
-        if tracker._mask is None:
-            tracker._load()
-        write_slice_to_volume(tracker._mask, before_slice, axis, idx)
+        write_slice_to_volume(tracker.get_mask(), before_slice, axis, idx)
 
         # Single write path: delta = after − before, updates _mask, pushes.
         change = tracker.write_slice(axis, idx, after_slice, source=source)
@@ -208,15 +216,18 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
             write_slice_to_volume(self._session_base, after_slice, axis, idx)
 
         # Record pixels removed by erase strokes so SPX renders don't re-expand
-        # into them.  Updated here (the single write path) so the state is always
-        # current before any subsequent render reads it.
-        if source == 'erase':
-            removed = (before_slice.astype(np.int16) - after_slice.astype(np.int16)) > 0
+        # into them.  Derive from change.delta (already cropped to the bbox of
+        # changed pixels) to avoid a redundant full-slice subtraction.
+        if source == 'erase' and change is not None:
+            r_end = change.r_min + change.delta.shape[0]
+            c_end = change.c_min + change.delta.shape[1]
+            removed = np.zeros(after_slice.shape, dtype=bool)
+            removed[change.r_min:r_end, change.c_min:c_end] = change.delta < 0
             if np.any(removed):
                 key = (axis, idx)
                 acc = self._erase_acc.get(key)
                 if acc is None:
-                    self._erase_acc[key] = removed.copy()
+                    self._erase_acc[key] = removed
                 else:
                     acc |= removed
 
@@ -252,15 +263,11 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
     def end_session(self):
         """End the current annotation session.
 
-        Clears the session and render key so the next render starts a fresh
-        session with the current committed state as the new base.
-
-        Slicer is NOT written to here because in the new design every render
-        already commits directly — there is never a stale preview to flush.
+        Clears session state so the next render starts fresh from the current
+        committed base.  Slicer is not written here — every render already
+        commits directly, so there is never a stale preview to flush.
         """
-        self._session_base = None
-        self._last_render_key = None
-        self._erase_acc = {}
+        self.reset_render_state()
 
     # -------------------------
     # Window / Level
@@ -347,6 +354,17 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         """Replace both prompt nodes with brand-new ones (counter reset to 0)."""
         for ref_name, (color, label) in _PROMPT_NODE_CONFIGS.items():
             self._make_prompt_node(parameterNode, ref_name, color, label)
+
+    def recreate_prompt_node(self, parameterNode, is_negative: bool):
+        """Replace one prompt node with a fresh one (counter reset to 0).
+
+        Called after undo empties a node so the next placement cursor shows
+        the correct label ('Positive 1' / 'Negative 1') rather than N+1.
+        Returns the newly created node.
+        """
+        ref_name = NEG_NODE if is_negative else POS_NODE
+        color, label = _PROMPT_NODE_CONFIGS[ref_name]
+        return self._make_prompt_node(parameterNode, ref_name, color, label)
 
     def setPromptNodes(self, parameterNode, posNode, negNode):
         parameterNode.SetNodeReferenceID(
@@ -478,7 +496,7 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
             pos_points=scribbles_ijk["positive"],
             neg_points=scribbles_ijk["negative"],
             base_mask=base_slice.copy(),
-            erase_mask=erase_slice.copy() if erase_slice is not None else None,
+            erase_mask=erase_slice,
             **params
         )
 

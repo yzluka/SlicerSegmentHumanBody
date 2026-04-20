@@ -155,7 +155,7 @@ class StrokeHandler(InputHandler):
         if before is not None:
             self._stroke_before = (axis, idx, before)
         widget.ctrl.brush_in_progress = True
-        widget.logic._last_render_key = None   # invalidate render key; _session_base preserved for commit_stroke
+        widget.logic.invalidate_render_key()   # preserves _session_base for commit_stroke
         log.debug('[%s] stroke start — history %d', self.SOURCE, len(widget._history))
 
     def _on_stroke_end(self, widget):

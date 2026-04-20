@@ -51,7 +51,7 @@ r_min     : int — top row of the bounding box in the slice.
 c_min     : int — left column of the bounding box in the slice.
 axis      : int — slice axis (0 axial / 1 coronal / 2 sagittal).
 slice_idx : int — slice index along the axis.
-source    : str — what produced this change ('brush' | 'prompt' | 'expand').
+source    : str — what produced this change ('brush' | 'erase' | 'prompt' | 'expand').
 """
 
 
@@ -109,16 +109,6 @@ class SegmentTracker:
     # ------------------------------------------------------------------
     # Cache management
     # ------------------------------------------------------------------
-
-    def invalidate(self):
-        """Drop cached mask on next access.
-
-        Call when an external tool has modified the segment outside our write
-        path.  History (owned by the widget) is unaffected; callers that need
-        to clear it should do so separately.
-        """
-        self._mask = None
-        log.debug('[Tracker] invalidated key=%s', self._key)
 
     def sync(self):
         """Drop the cached mask so the next access reloads from Slicer.

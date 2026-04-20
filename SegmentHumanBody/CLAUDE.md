@@ -36,7 +36,7 @@ cd SegmentHumanBody
 
 Test files:
 - `test_families.py` — model family logic (SPX cache, base-mask additive/subtractive mode, neg/pos point handling, propagate)
-- `test_undo_stack.py` — per-segment LIFO undo stack
+- `test_undo_widget.py` — unified undo stack entry format, LIFO ordering, clear semantics, snapshot integrity
 - `test_registry.py` — model registry caching and factory lookup
 - `test_spx_models.py` — individual SPX model algorithms
 - `test_utils.py` — slice read/write helpers
@@ -69,13 +69,16 @@ This is a **3D Slicer scripted module**. The entry point (`SegmentHumanBody.py`)
 ### Key Layers
 
 ```
-SegmentHumanBody.py          ← Slicer module: Widget + Logic
+SegmentHumanBody.py          ← Slicer module entry point: SegmentHumanBodyWidget + Test runner
 core/
-  modelFamilies.py           ← BaseModelFamily, SAMFamily, SPXModelFamily, AutoModelFamily
+  _logic.py                  ← SegmentHumanBodyLogic: render loop, SPX expansion, prompt nodes, W/L
+  _state.py                  ← WidgetState: render-loop gating, pause/resume, tool-mode flags
+  _input.py                  ← InputHandler hierarchy: StrokeHandler, BrushHandler, EraseHandler
+  _tracker.py                ← SegmentTracker: write_slice, reverse_change, MaskChange
+  modelFamilies.py           ← BaseModelFamily, SPXModelFamily, FAMILY_REGISTRY
   modelRegistry.py           ← Lazy-instantiating session cache (ModelRegistry)
   models/spx.py              ← Concrete SPX algorithms (SPX_Tester2D, SPX_SLIC2D, SPX_Felzenszwalb2D)
-  undoStack.py               ← Per-segment LIFO history of 2D slice snapshots
-  utils.py                   ← get_slice_from_volume, write_slice_to_volume, call_if_exists
+  utils.py                   ← get_slice_from_volume, write_slice_to_volume, select_spx_labels, call_if_exists
 ```
 
 ### Model Family Pattern
@@ -92,8 +95,8 @@ Adding a button means: add it to the mapping list AND add the method to the appr
 ### SPX Interactive Loop
 
 ```
-SegmentationRenderer (QTimer 100ms)
-  → Logic.onRender()
+Event-driven render (slice scroll / point confirmed / undo)
+  → ctrl.request_render() → Logic.onRender()
       → render_key check (skip if points/slice/params unchanged)
       → get_slice_from_volume (numpy view, no copy)
       → SPXModelFamily.onRender()
@@ -107,7 +110,7 @@ SegmentationRenderer (QTimer 100ms)
 
 **`_interactive_base_mask`**: Snapshot of the segment's 3D labelmap taken when entering interactive mode. Each render computes `result = (base_slice | pos_selections) & ~neg_selections`. Removing a pos point reverts that region to base state.
 
-**`_working_mask`**: Persistent 3D numpy array kept in sync with Slicer to avoid a full `arrayFromSegmentBinaryLabelmap` call every 100ms. Keyed by `(segNodeID, segmentID)`.
+**`_working_mask`**: Persistent 3D numpy array kept in sync with Slicer to avoid a full `arrayFromSegmentBinaryLabelmap` call on every render. Keyed by `(segNodeID, segmentID)`.
 
 ### SPX Label Cache
 

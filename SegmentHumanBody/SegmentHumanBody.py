@@ -29,7 +29,7 @@ log = logging.getLogger(__name__)
 class SegmentHumanBody(ScriptedLoadableModule):
     def __init__(self, parent):
         super().__init__(parent)
-        self.parent.title = 'SegmentHumanBody (Optimized)'
+        self.parent.title = 'SegmentHumanBodyV2'
         self.parent.categories = ['Segmentation']
         self.parent.contributors = [
             'Yixin Zhang (Duke University)',
@@ -907,19 +907,43 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         elif action_type == 'point':
             _, change, node, cp_id = entry
 
+            _, negNode = self.logic.getPromptNodes(self._parameterNode)
+            is_negative = (node is negNode)
+
             # Pause so _onPointRemoved does not fire a render mid-undo.
             self.ctrl.pause()
             try:
                 idx = node.GetControlPointIndexByID(cp_id)
                 if idx >= 0:
                     node.RemoveNthControlPoint(idx)
+
+                # If the node is now empty, recreate it to reset the ID
+                # counter — otherwise the next placement cursor shows "N+1"
+                # instead of "1".
+                remaining = node.GetNumberOfControlPoints()
+                if remaining == 0:
+                    new_node = self.logic.recreate_prompt_node(
+                        self._parameterNode, is_negative
+                    )
+                    self._observeMarkupsNodes()
+                    interactionNode = slicer.app.applicationLogic().GetInteractionNode()
+                    interactionNode.SwitchToViewTransformMode()
+                    if is_negative:
+                        self.ui.negativePrompts.setCurrentNode(new_node)
+                    else:
+                        self.ui.positivePrompts.setCurrentNode(new_node)
+                        selectionNode = slicer.app.applicationLogic().GetSelectionNode()
+                        selectionNode.SetActivePlaceNodeID(new_node.GetID())
+                        selectionNode.SetActivePlaceNodeClassName(new_node.GetClassName())
+                        interactionNode.SwitchToPersistentPlaceMode()
             finally:
                 self.ctrl.resume()
 
             self.logic.reverse_change(self, change)
 
-        # --- Reset session / render key so the next render starts fresh ---
-        self.logic.reset_render_state()
+        # Invalidate the render cache key so the next render recomputes,
+        # but preserve _session_base and _erase_acc.
+        self.logic.invalidate_render_key()
 
         qt.QTimer.singleShot(0, self._triggerRender)
     # -------------------------
