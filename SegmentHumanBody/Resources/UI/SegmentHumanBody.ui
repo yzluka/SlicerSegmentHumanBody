@@ -109,13 +109,6 @@
     </widget>
    </item>
    <item>
-    <widget class="QCheckBox" name="interactiveModeCheckBox">
-     <property name="text">
-      <string>Interactive (hover preview)</string>
-     </property>
-    </widget>
-   </item>
-   <item>
     <layout class="QHBoxLayout">
      <item>
       <widget class="QPushButton" name="expandSelectedLabelButton">

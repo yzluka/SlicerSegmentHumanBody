@@ -28,10 +28,10 @@ class TestBaseModelFamily(unittest.TestCase):
     def tearDown(self):
         ModelRegistry.model_cache.clear()
 
-    def test_confirm_model_no_variant_is_noop(self):
+    def test_confirm_model_no_variant_raises(self):
         fam = BaseModelFamily(variant=None)
-        fam.confirm_model()          # must not raise
-        self.assertIsNone(fam.model)
+        with self.assertRaises(ValueError):
+            fam.confirm_model()
 
     def test_confirm_model_sets_model_from_registry(self):
         fam = BaseModelFamily(variant='SPX_Tester2D')
@@ -45,14 +45,6 @@ class TestSAMFamily(unittest.TestCase):
 
     def setUp(self):
         self.fam = SAMFamily(variant='SAM-VIT-H')
-
-    def test_on_enter_interactive_does_not_raise(self):
-        self.fam.on_enter_interactive()
-        self.fam.on_enter_interactive(extra='ignored')
-
-    def test_on_stop_interactive_does_not_raise(self):
-        self.fam.on_stop_interactive()
-        self.fam.on_stop_interactive(extra='ignored')
 
     def test_get_requested_mask_does_not_raise(self):
         self.fam.get_requested_mask()
@@ -401,15 +393,6 @@ class TestSPXModelFamily(unittest.TestCase):
         fam.on_expand(img=img)
         self.assertEqual(call_count[0], 1, "on_expand should reuse the cache, not call forward() again")
 
-    # ---- interactive stubs ----
-
-    def test_on_enter_interactive_does_not_raise(self):
-        fam = SPXModelFamily(variant='Naive_Grid-2D')
-        fam.on_enter_interactive()
-
-    def test_on_stop_interactive_does_not_raise(self):
-        fam = SPXModelFamily(variant='Naive_Grid-2D')
-        fam.on_stop_interactive()
 
 
 class TestAutoModelFamily(unittest.TestCase):

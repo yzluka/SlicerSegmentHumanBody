@@ -35,7 +35,8 @@ AXIS_TO_IJK_COMPONENT = {0: 2, 1: 1, 2: 0}
 # RAS → IJK 2-D projection  (pure numpy — no VTK / Slicer dependency)
 # ---------------------------------------------------------------------------
 
-def ras_to_ijk_2d(mat_4x4: np.ndarray, points, axis: int) -> list:
+def ras_to_ijk_2d(mat_4x4: np.ndarray, points, axis: int,
+                  slice_index: int = None) -> list:
     """Convert RAS-space 3-D points to 2-D slice coordinates in IJK space.
 
     Parameters
@@ -43,11 +44,15 @@ def ras_to_ijk_2d(mat_4x4: np.ndarray, points, axis: int) -> list:
     mat_4x4 : (4, 4) numpy array — the volume's RAS-to-IJK affine matrix.
     points : sequence of (x, y, z) triples in RAS space.
     axis : int — slice axis (0 axial, 1 coronal, 2 sagittal).
+    slice_index : int or None — when given, only points whose IJK slice
+        component equals *slice_index* are returned.  Points placed on a
+        different slice are silently dropped so they cannot influence the
+        current slice's model result.
 
     Returns
     -------
     List of [x, y] pairs in 2-D slice space (column-first / OpenCV convention).
-    Empty list when *points* is empty.
+    Empty list when *points* is empty or all are filtered out.
     """
     if not points:
         return []
@@ -55,6 +60,11 @@ def ras_to_ijk_2d(mat_4x4: np.ndarray, points, axis: int) -> list:
     pts   = np.array(points, dtype=np.float64)          # (N, 3)
     pts_h = np.hstack([pts, np.ones((len(pts), 1))])    # (N, 4)
     ijk   = (mat_4x4 @ pts_h.T).T[:, :3].astype(int)   # (N, 3)
+    if slice_index is not None:
+        zc = AXIS_TO_IJK_COMPONENT[axis]
+        ijk = ijk[ijk[:, zc] == slice_index]
+    if len(ijk) == 0:
+        return []
     return ijk[:, [xc, yc]].tolist()
 
 
@@ -158,6 +168,8 @@ def apply_window_level(img: np.ndarray, window, level) -> np.ndarray:
         return img
     lo = float(level) - float(window) / 2.0
     hi = float(level) + float(window) / 2.0
+    if hi == lo:
+        return np.zeros(img.shape, dtype=np.uint8)
     clipped = np.clip(img.astype(np.float32), lo, hi)
     return ((clipped - lo) / (hi - lo) * 255.0).astype(np.uint8)
 
@@ -173,8 +185,8 @@ POSITION_PREVIEW   = 1
 POSITION_DEFINED   = 2
 
 
-def collect_confirmed_points(point_records, preview_ids):
-    """Return positions of control points that represent confirmed placements.
+def partition_prompt_points(point_records, preview_ids):
+    """Split control points into confirmed and unconfirmed (preview) lists.
 
     Parameters
     ----------
@@ -186,39 +198,55 @@ def collect_confirmed_points(point_records, preview_ids):
         IDs of control points that are currently tracked as unconfirmed
         placement cursors (populated by _onPointAdded in the widget).
 
-    A point is *excluded* when:
-    * status == POSITION_UNDEFINED  (no position at all)
-    * status == POSITION_PREVIEW **and** the ID is in preview_ids
-      (this is the active placement cursor before the user clicks)
+    Returns
+    -------
+    (confirmed, preview) — two lists of positions.
 
-    A point is *included* when:
+    *confirmed* includes:
     * status == POSITION_DEFINED  (normal confirmed state), or
     * status == POSITION_PREVIEW **and** the ID is NOT in preview_ids
       (some Slicer builds leave confirmed points at PositionPreview;
       a point whose ID was removed from preview_ids by _onPointConfirmed
       is treated as confirmed even if its status stayed at Preview)
+
+    *preview* includes:
+    * status == POSITION_PREVIEW **and** the ID IS in preview_ids
+      (the active placement cursor before the user clicks a slice)
+
+    POSITION_UNDEFINED points are dropped from both lists.
     """
-    result = []
+    confirmed = []
+    preview   = []
     for status, cp_id, position in point_records:
         if status == POSITION_UNDEFINED:
             continue
         if status == POSITION_PREVIEW and cp_id in preview_ids:
-            continue
-        result.append(position)
-    return result
+            preview.append(position)
+        else:
+            confirmed.append(position)
+    return confirmed, preview
+
+
+def collect_confirmed_points(point_records, preview_ids):
+    """Return positions of confirmed control points.
+
+    Thin wrapper around :func:`partition_prompt_points` for backwards
+    compatibility.  Prefer ``partition_prompt_points`` when both confirmed
+    and preview points are needed in the same call.
+    """
+    confirmed, _ = partition_prompt_points(point_records, preview_ids)
+    return confirmed
 
 
 def collect_preview_points(point_records, preview_ids):
     """Return positions of unconfirmed placement cursors.
 
-    These are PositionPreview points whose ID is still in *preview_ids*,
-    i.e. the user clicked '+' but has not yet clicked on a slice.
-    Used by the hover-preview render path.
+    Thin wrapper around :func:`partition_prompt_points` for backwards
+    compatibility.  Prefer ``partition_prompt_points`` when both confirmed
+    and preview points are needed in the same call.
     """
-    return [
-        position for status, cp_id, position in point_records
-        if status == POSITION_PREVIEW and cp_id in preview_ids
-    ]
+    _, preview = partition_prompt_points(point_records, preview_ids)
+    return preview
 
 
 def select_spx_labels(labels: np.ndarray, mask2d: np.ndarray,

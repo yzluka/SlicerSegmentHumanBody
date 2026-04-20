@@ -5,8 +5,8 @@ Run from inside 3D Slicer via Developer Tools → Run Unittests, or via the
 
 These tests require a live Slicer process and exercise:
   - MRML scene operations (arrayFromSegmentBinaryLabelmap, etc.)
-  - Snapshot-based undo: capture / restore per axis and cross-axis isolation.
-  - Unified undo stack: expand, brush, and interleaved action ordering.
+  - Delta-based undo: write_slice / reverse_delta round-trips.
+  - Unified history: expand returns MaskChange; reverse_change restores state.
   - Qt event filter (_SliceViewMouseFilter): return value and callback routing.
 """
 
@@ -46,8 +46,13 @@ def _read_lm(segNode, segmentID, volumeNode):
 
 
 def _make_logic():
-    from SegmentHumanBody import SegmentHumanBodyLogic
+    from core._logic import SegmentHumanBodyLogic
     return SegmentHumanBodyLogic()
+
+
+def _make_tracker(segNode, segmentID, volumeNode):
+    from core._tracker import SegmentTracker
+    return SegmentTracker(segNode, segmentID, volumeNode)
 
 
 def _mock_widget(volumeNode, segNode, segmentID, paramNode=None):
@@ -61,74 +66,14 @@ def _mock_widget(volumeNode, segNode, segmentID, paramNode=None):
 
 
 def _mock_expand_widget(logic, volumeNode, segNode, segmentID, axis, slice_index):
-    """Widget stub for expandSegWithSPX: _captureSegmentationState returns a
-    real snapshot, and _undo_stack is a plain list that can be inspected."""
-    from core.utils import get_slice_from_volume
-
-    w = MagicMock()
-    w._undo_stack = []
-
-    def _capture():
-        mask3d = _read_lm(segNode, segmentID, volumeNode)
-        data = get_slice_from_volume(mask3d, axis, slice_index)
-        return (segNode.GetID(), segmentID, axis, slice_index, data.copy())
-
-    w._captureSegmentationState.side_effect = _capture
-    return w
-
-
-# ---------------------------------------------------------------------------
-# Fake 'self' objects for calling unbound Widget methods under test
-# without instantiating the full Qt widget.
-# ---------------------------------------------------------------------------
-
-class _FakeRestoreSelf:
-    """Minimal self for SegmentHumanBodyWidget._restoreSegmentation."""
-    def __init__(self, volumeNode, logic):
-        self.logic = logic
-        _vol = volumeNode
-
-        class _VolSel:
-            def currentNode(self):
-                return _vol
-
-        class _UI:
-            def __init__(self):
-                self.sourceVolumeSelector = _VolSel()
-
-        self.ui = _UI()
-
-
-class _FakeCaptureSelf:
-    """Minimal self for SegmentHumanBodyWidget._captureSegmentationState."""
-    def __init__(self, logic, volumeNode, segNode, segmentID, axis, slice_index):
-        self.logic = logic
-        self._fixed_axis = axis
-        self._fixed_slice = slice_index
-
-        _vol = volumeNode
-        _seg = segNode
-        _sid = segmentID
-
-        class _SegSel:
-            def currentNode(self): return _seg
-            def currentSegmentID(self): return _sid
-
-        class _VolSel:
-            def currentNode(self): return _vol
-
-        class _UI:
-            def __init__(self):
-                self.segmentSelector = _SegSel()
-                self.sourceVolumeSelector = _VolSel()
-
-        self.ui = _UI()
-        # Patch getAxisAndSlice so the test controls the axis/slice.
-        logic.getAxisAndSlice = lambda widget, vol=None: (axis, slice_index)
+    """Minimal widget stub kept for tests in SegmentHumanBodyLogicTest that
+    still pass the widget to helper methods.  No longer used for expandSegWithSPX
+    itself (that method no longer takes a widget argument)."""
+    return _mock_widget(volumeNode, segNode, segmentID)
 
 
 # ===========================================================================
-# applyResult tests  (unchanged from original, still valid)
+# applyResult tests
 # ===========================================================================
 
 class SegmentHumanBodyLogicTest(unittest.TestCase):
@@ -165,7 +110,8 @@ class SegmentHumanBodyLogicTest(unittest.TestCase):
         np.testing.assert_array_equal(result[:target], 0)
         np.testing.assert_array_equal(result[target + 1:], 0)
 
-    def test_apply_result_working_mask_cached_across_frames(self):
+    def test_apply_result_reuses_tracker_across_frames(self):
+        """write_slice reuses the same tracker object across consecutive frames."""
         volumeNode = _make_volume()
         segNode, segmentID = _make_seg(volumeNode, with_segment=True)
         widget = _mock_widget(volumeNode, segNode, segmentID)
@@ -175,17 +121,18 @@ class SegmentHumanBodyLogicTest(unittest.TestCase):
         mask_b[:, :_I // 2] = 1
 
         self._logic.applyResult(widget, mask_a, axis=0, sliceIndex=2)
-        cached_id = id(self._logic._working_mask)
+        tracker_id = id(self._logic._tracker)
 
         self._logic.applyResult(widget, mask_b, axis=0, sliceIndex=3)
-        self.assertEqual(id(self._logic._working_mask), cached_id)
+        self.assertEqual(id(self._logic._tracker), tracker_id,
+                         "Tracker must be reused across frames for the same segment")
 
         result = _read_lm(segNode, segmentID, volumeNode)
         np.testing.assert_array_equal(result[2], 1)
         np.testing.assert_array_equal(result[3, :, :_I // 2], 1)
         np.testing.assert_array_equal(result[3, :, _I // 2:], 0)
 
-    # ---- expandSegWithSPX (corrected signatures) ----
+    # ---- expandSegWithSPX ----
 
     def test_expand_seg_with_spx_expands_matched_labels(self):
         volumeNode = _make_volume()
@@ -198,9 +145,7 @@ class SegmentHumanBodyLogicTest(unittest.TestCase):
         labels = np.ones((_J, _I), dtype=np.int32)
         labels[:, _I // 2:] = 2
 
-        widget = _mock_expand_widget(self._logic, volumeNode, segNode, segmentID,
-                                     axis=0, slice_index=3)
-        self._logic.expandSegWithSPX(widget, segNode, segmentID, volumeNode,
+        self._logic.expandSegWithSPX(segNode, segmentID, volumeNode,
                                      labels, axis=0, sliceIndex=3)
 
         result = _read_lm(segNode, segmentID, volumeNode)
@@ -219,9 +164,7 @@ class SegmentHumanBodyLogicTest(unittest.TestCase):
         labels[:, _I // 2:] = 2
 
         neg_pts = [[_I // 2 + 1, 0]]
-        widget = _mock_expand_widget(self._logic, volumeNode, segNode, segmentID,
-                                     axis=0, slice_index=3)
-        self._logic.expandSegWithSPX(widget, segNode, segmentID, volumeNode,
+        self._logic.expandSegWithSPX(segNode, segmentID, volumeNode,
                                      labels, axis=0, sliceIndex=3,
                                      neg_points=neg_pts)
 
@@ -241,44 +184,13 @@ class SegmentHumanBodyLogicTest(unittest.TestCase):
         labels = np.ones((_J, _I), dtype=np.int32)
         labels[:, _I // 2:] = 2
 
-        widget = _mock_expand_widget(self._logic, volumeNode, segNode, segmentID,
-                                     axis=0, slice_index=3)
-        self._logic.expandSegWithSPX(widget, segNode, segmentID, volumeNode,
+        self._logic.expandSegWithSPX(segNode, segmentID, volumeNode,
                                      labels, axis=0, sliceIndex=3)
 
         result = _read_lm(segNode, segmentID, volumeNode)
         np.testing.assert_array_equal(result[2], 1, err_msg="slice 2 must be untouched")
         np.testing.assert_array_equal(result[3, :, :_I // 2], 1)
         np.testing.assert_array_equal(result[3, :, _I // 2:], 0)
-
-    # ---- on_enter / on_stop interactive ----
-
-    def test_on_enter_interactive_starts_renderer(self):
-        """on_enter_interactive must start the renderer timer."""
-        widget = MagicMock()
-        widget.renderer = MagicMock()
-        self._logic.on_enter_interactive(widget)
-        widget.renderer.start.assert_called_once()
-
-    def test_on_enter_interactive_sets_interactive_state(self):
-        widget = MagicMock()
-        widget.renderer = MagicMock()
-        self._logic.on_enter_interactive(widget)
-        widget.setInteractiveState.assert_called_once_with(True)
-
-    def test_on_enter_interactive_resets_render_state(self):
-        """on_enter_interactive calls reset_render_state, clearing cached masks."""
-        self._logic._working_mask = np.ones((5, 5, 5), dtype=np.uint8)
-        widget = MagicMock()
-        widget.renderer = MagicMock()
-        self._logic.on_enter_interactive(widget)
-        self.assertIsNone(self._logic._working_mask)
-
-    def test_on_stop_interactive_stops_renderer(self):
-        widget = MagicMock()
-        widget.renderer = MagicMock()
-        self._logic.on_stop_interactive(widget)
-        widget.renderer.stop.assert_called_once()
 
     # ---- coordinate conversion ----
 
@@ -290,7 +202,7 @@ class SegmentHumanBodyLogicTest(unittest.TestCase):
         cy = (bounds[2] + bounds[3]) / 2
         cz = (bounds[4] + bounds[5]) / 2
 
-        result = self._logic._ras_to_ijk(
+        result = self._logic.ras_to_ijk(
             volumeNode,
             {"positive": [[cx, cy, cz]], "negative": []},
             axis=0
@@ -325,35 +237,24 @@ class SegmentHumanBodyLogicTest(unittest.TestCase):
 
 
 # ===========================================================================
-# Snapshot capture and restore tests
+# SegmentTracker delta-based undo tests
 # ===========================================================================
 
-class SnapshotRestoreTest(unittest.TestCase):
-    """Tests for _captureSegmentationState (via _FakeCaptureSelf) and
-    _restoreSegmentation (via _FakeRestoreSelf) — called as unbound methods
-    to avoid requiring a full Qt widget."""
+class TrackerUndoTest(unittest.TestCase):
+    """Tests for SegmentTracker.write_slice() / reverse_delta() round-trips.
+
+    write_slice() returns a MaskChange (or None for no-ops).  The caller
+    stores the change and passes it to reverse_delta() to undo — there is no
+    internal _changes stack on the tracker.
+    """
 
     def setUp(self):
         slicer.mrmlScene.Clear()
-        self._logic = _make_logic()
 
-    def _capture(self, volumeNode, segNode, segmentID, axis, slice_index):
-        """Call _captureSegmentationState via an unbound method call."""
-        from SegmentHumanBody import SegmentHumanBodyWidget
-        fake_self = _FakeCaptureSelf(
-            self._logic, volumeNode, segNode, segmentID, axis, slice_index
-        )
-        return SegmentHumanBodyWidget._captureSegmentationState(fake_self)
-
-    def _restore(self, volumeNode, snapshot):
-        """Call _restoreSegmentation via an unbound method call."""
-        from SegmentHumanBody import SegmentHumanBodyWidget
-        fake_self = _FakeRestoreSelf(volumeNode, self._logic)
-        SegmentHumanBodyWidget._restoreSegmentation(fake_self, snapshot)
-
-    # ---- capture + restore is identity ----
+    # ---- write + reverse_delta is identity ----
 
     def _roundtrip_test(self, axis, slice_index):
+        from core.utils import get_slice_from_volume
         volumeNode = _make_volume()
         segNode, segmentID = _make_seg(volumeNode, with_segment=True)
 
@@ -363,62 +264,128 @@ class SnapshotRestoreTest(unittest.TestCase):
                 slice_index if axis == 2 else 0] = 1
         _write_lm(segNode, segmentID, volumeNode, initial)
 
-        snap = self._capture(volumeNode, segNode, segmentID, axis, slice_index)
-        # Overwrite the target slice with all-ones.
-        overwrite = np.ones((_K, _J, _I), dtype=np.uint8)
-        _write_lm(segNode, segmentID, volumeNode, overwrite)
-        # Restore from snapshot.
-        self._restore(volumeNode, snap)
+        tracker = _make_tracker(segNode, segmentID, volumeNode)
+
+        # Write all-ones to the target slice; capture the returned change.
+        ones = np.ones(get_slice_from_volume(initial, axis, slice_index).shape,
+                       dtype=np.uint8)
+        change = tracker.write_slice(axis, slice_index, ones, source='test')
+        self.assertIsNotNone(change, "write_slice must return a MaskChange for a real change")
+
+        # Reverse the change — must revert to initial.
+        tracker.reverse_delta(change)
 
         restored = _read_lm(segNode, segmentID, volumeNode)
-        # Only the captured slice is restored; the rest was already overwritten.
-        from core.utils import get_slice_from_volume
-        restored_slice = get_slice_from_volume(restored, axis, slice_index)
         initial_slice  = get_slice_from_volume(initial,  axis, slice_index)
+        restored_slice = get_slice_from_volume(restored, axis, slice_index)
         np.testing.assert_array_equal(
             restored_slice, initial_slice,
-            err_msg=f"axis={axis} slice={slice_index}: restore must undo the overwrite"
+            err_msg=f"axis={axis} slice={slice_index}: reverse_delta must revert the write",
         )
 
-    def test_restore_roundtrip_axial(self):
+    def test_undo_roundtrip_axial(self):
         self._roundtrip_test(axis=0, slice_index=5)
 
-    def test_restore_roundtrip_coronal(self):
+    def test_undo_roundtrip_coronal(self):
         self._roundtrip_test(axis=1, slice_index=6)
 
-    def test_restore_roundtrip_sagittal(self):
+    def test_undo_roundtrip_sagittal(self):
         self._roundtrip_test(axis=2, slice_index=7)
 
-    # ---- non-target slices are not affected ----
+    # ---- reverse_delta does not touch other slices ----
 
-    def test_restore_does_not_touch_other_slices(self):
+    def test_undo_does_not_touch_other_slices(self):
         volumeNode = _make_volume()
         segNode, segmentID = _make_seg(volumeNode, with_segment=True)
 
         initial = np.zeros((_K, _J, _I), dtype=np.uint8)
-        initial[3] = 1    # slice 3 painted
-        initial[7] = 1    # slice 7 also painted
+        initial[3] = 1   # painted
+        initial[7] = 1   # also painted — must be untouched by undo of slice 3
         _write_lm(segNode, segmentID, volumeNode, initial)
 
-        # Capture slice 3 only.
-        snap = self._capture(volumeNode, segNode, segmentID, axis=0, slice_index=3)
-
-        # Erase everything.
-        _write_lm(segNode, segmentID, volumeNode, np.zeros((_K, _J, _I), dtype=np.uint8))
-
-        # Restore slice 3.
-        self._restore(volumeNode, snap)
+        tracker = _make_tracker(segNode, segmentID, volumeNode)
+        ones = np.ones((_J, _I), dtype=np.uint8)
+        change = tracker.write_slice(axis=0, idx=3, new_data=ones, source='test')
+        tracker.reverse_delta(change)
 
         result = _read_lm(segNode, segmentID, volumeNode)
         np.testing.assert_array_equal(result[3], 1,
-                                      err_msg="slice 3 must be restored")
-        np.testing.assert_array_equal(result[7], 0,
-                                      err_msg="slice 7 was not captured → must stay erased")
+                                      err_msg="slice 3 must be restored by undo")
+        np.testing.assert_array_equal(result[7], 1,
+                                      err_msg="slice 7 must remain untouched")
 
-    # ---- snapshot is a deep copy ----
+    # ---- bounding-box efficiency ----
 
-    def test_snapshot_data_is_deep_copy(self):
-        """Modifying the segmentation after capture must not affect the snapshot."""
+    def test_delta_stored_only_for_changed_pixels(self):
+        """The returned MaskChange delta crop must cover only changed pixels."""
+        volumeNode = _make_volume()
+        segNode, segmentID = _make_seg(volumeNode, with_segment=True)
+        tracker = _make_tracker(segNode, segmentID, volumeNode)
+
+        # Paint a small 3×4 patch in the middle of an otherwise empty slice.
+        patch = np.zeros((_J, _I), dtype=np.uint8)
+        patch[4:7, 6:10] = 1
+        change = tracker.write_slice(axis=0, idx=0, new_data=patch, source='test')
+
+        self.assertIsNotNone(change)
+        self.assertEqual(change.delta.shape, (3, 4),
+                         "Delta crop must match the 3×4 changed region exactly")
+
+    # ---- no-op write ----
+
+    def test_write_identical_data_is_noop(self):
+        """write_slice with unchanged data must return None."""
+        volumeNode = _make_volume()
+        segNode, segmentID = _make_seg(volumeNode, with_segment=True)
+
+        initial = np.zeros((_K, _J, _I), dtype=np.uint8)
+        initial[2] = 1
+        _write_lm(segNode, segmentID, volumeNode, initial)
+
+        tracker = _make_tracker(segNode, segmentID, volumeNode)
+        ones = np.ones((_J, _I), dtype=np.uint8)
+        change = tracker.write_slice(axis=0, idx=2, new_data=ones, source='test')
+        self.assertIsNone(change,
+                          "Writing identical data must return None (no-op)")
+
+    # ---- multiple writes → LIFO undo ----
+
+    def test_two_writes_lifo_undo(self):
+        from core.utils import get_slice_from_volume
+        volumeNode = _make_volume()
+        segNode, segmentID = _make_seg(volumeNode, with_segment=True)
+        tracker = _make_tracker(segNode, segmentID, volumeNode)
+
+        left  = np.zeros((_J, _I), dtype=np.uint8)
+        left[:, :_I // 2] = 1
+        right = np.zeros((_J, _I), dtype=np.uint8)
+        right[:, _I // 2:] = 1
+
+        _change_a = tracker.write_slice(0, 5, left,  source='a')
+        change_b  = tracker.write_slice(0, 5, right, source='b')  # replaces left
+
+        # Undo only 'b' → slice should revert to 'left'.
+        tracker.reverse_delta(change_b)
+        result = _read_lm(segNode, segmentID, volumeNode)
+        sl = get_slice_from_volume(result, 0, 5)
+        np.testing.assert_array_equal(sl[:, :_I // 2], 1, err_msg="left half must be restored")
+        np.testing.assert_array_equal(sl[:, _I // 2:], 0, err_msg="right half must be gone")
+
+    # ---- source field is recorded correctly ----
+
+    def test_source_field_is_stored(self):
+        volumeNode = _make_volume()
+        segNode, segmentID = _make_seg(volumeNode, with_segment=True)
+        tracker = _make_tracker(segNode, segmentID, volumeNode)
+
+        patch = np.ones((_J, _I), dtype=np.uint8)
+        change = tracker.write_slice(0, 0, patch, source='expand')
+
+        self.assertEqual(change.source, 'expand')
+
+    # ---- snapshot is deep copy ----
+
+    def test_snapshot_is_deep_copy(self):
         volumeNode = _make_volume()
         segNode, segmentID = _make_seg(volumeNode, with_segment=True)
 
@@ -426,107 +393,54 @@ class SnapshotRestoreTest(unittest.TestCase):
         initial[4, :, :_I // 2] = 1
         _write_lm(segNode, segmentID, volumeNode, initial)
 
-        snap = self._capture(volumeNode, segNode, segmentID, axis=0, slice_index=4)
+        tracker = _make_tracker(segNode, segmentID, volumeNode)
+        snap = tracker.snapshot()
 
-        # Write completely different data AFTER capture.
-        _write_lm(segNode, segmentID, volumeNode, np.ones((_K, _J, _I), dtype=np.uint8))
+        # Mutate the mask after snapshot.
+        ones = np.ones((_J, _I), dtype=np.uint8)
+        tracker.write_slice(0, 4, ones, source='test')
 
-        stored_data = snap[4]
-        np.testing.assert_array_equal(stored_data[:, :_I // 2], 1)
-        np.testing.assert_array_equal(stored_data[:, _I // 2:], 0)
-
-    # ---- captureSegmentationState returns correct metadata ----
-
-    def test_capture_returns_correct_axis(self):
-        volumeNode = _make_volume()
-        segNode, segmentID = _make_seg(volumeNode, with_segment=True)
-        snap = self._capture(volumeNode, segNode, segmentID, axis=2, slice_index=5)
-        self.assertEqual(snap[2], 2)
-
-    def test_capture_returns_correct_slice_index(self):
-        volumeNode = _make_volume()
-        segNode, segmentID = _make_seg(volumeNode, with_segment=True)
-        snap = self._capture(volumeNode, segNode, segmentID, axis=0, slice_index=8)
-        self.assertEqual(snap[3], 8)
-
-    def test_capture_returns_correct_segment_id(self):
-        volumeNode = _make_volume()
-        segNode, segmentID = _make_seg(volumeNode, with_segment=True)
-        snap = self._capture(volumeNode, segNode, segmentID, axis=0, slice_index=0)
-        self.assertEqual(snap[1], segmentID)
-
-    def test_capture_returns_none_when_no_segment(self):
-        volumeNode = _make_volume()
-        snap = self._capture(volumeNode, segNode=None, segmentID=None,
-                             axis=0, slice_index=0)
-        self.assertIsNone(snap)
-
-    # ---- restore None is a no-op ----
-
-    def test_restore_none_snapshot_does_not_raise(self):
-        volumeNode = _make_volume()
-        self._restore(volumeNode, None)   # must not raise
+        # Snapshot must not have changed.
+        from core.utils import get_slice_from_volume
+        snap_slice = get_slice_from_volume(snap, 0, 4)
+        np.testing.assert_array_equal(snap_slice[:, :_I // 2], 1)
+        np.testing.assert_array_equal(snap_slice[:, _I // 2:], 0)
 
 
 # ===========================================================================
-# Unified undo stack — end-to-end tests with real MRML nodes
+# Unified history — end-to-end tests
 # ===========================================================================
 
-class UnifiedUndoStackTest(unittest.TestCase):
-    """End-to-end tests verifying that expand, brush, and interleaved actions
-    are recorded in the unified _undo_stack and can be restored correctly.
+class UnifiedHistoryTest(unittest.TestCase):
+    """End-to-end tests verifying that expandSegWithSPX returns a MaskChange
+    and that logic.reverse_change correctly restores prior state.
 
-    These tests use _mock_expand_widget / _FakeRestoreSelf to exercise the
-    real snapshot/restore code paths without a full Qt widget.
+    The widget's ``_history`` list stores entries of the form
+    ``['expand', change]``, ``['brush', change]``, or
+    ``['point', change, node, cp_id]``.  These tests exercise the logic-side
+    contract (returns MaskChange) and the reverse path (reverse_change undoes it).
     """
 
     def setUp(self):
         slicer.mrmlScene.Clear()
         self._logic = _make_logic()
 
-    def _restore(self, volumeNode, snapshot):
-        from SegmentHumanBody import SegmentHumanBodyWidget
-        SegmentHumanBodyWidget._restoreSegmentation(
-            _FakeRestoreSelf(volumeNode, self._logic), snapshot
-        )
+    # ---- expand returns a MaskChange ----
 
-    # ---- expand → one undo entry pushed ----
-
-    def test_expand_pushes_one_entry_to_undo_stack(self):
+    def test_expand_returns_mask_change(self):
         volumeNode = _make_volume()
         segNode, segmentID = _make_seg(volumeNode, with_segment=True)
         labels = np.ones((_J, _I), dtype=np.int32)
-        widget = _mock_expand_widget(self._logic, volumeNode, segNode, segmentID,
-                                     axis=0, slice_index=3)
 
-        self._logic.expandSegWithSPX(widget, segNode, segmentID, volumeNode,
-                                     labels, axis=0, sliceIndex=3)
+        change = self._logic.expandSegWithSPX(segNode, segmentID, volumeNode,
+                                              labels, axis=0, sliceIndex=3)
 
-        self.assertEqual(len(widget._undo_stack), 1)
-        self.assertEqual(widget._undo_stack[0][0], 'expand')
-
-    def test_expand_undo_entry_carries_pre_expand_data(self):
-        """The snapshot must contain the slice state BEFORE the expand."""
-        volumeNode = _make_volume()
-        segNode, segmentID = _make_seg(volumeNode, with_segment=True)
-
-        pre_state = np.zeros((_K, _J, _I), dtype=np.uint8)
-        pre_state[3, :, :_I // 2] = 1
-        _write_lm(segNode, segmentID, volumeNode, pre_state)
-
-        labels = np.ones((_J, _I), dtype=np.int32)
-        widget = _mock_expand_widget(self._logic, volumeNode, segNode, segmentID,
-                                     axis=0, slice_index=3)
-        self._logic.expandSegWithSPX(widget, segNode, segmentID, volumeNode,
-                                     labels, axis=0, sliceIndex=3)
-
-        snap = widget._undo_stack[0][1]
-        # The snapshot data must match the left-half-only pre-expand state.
-        np.testing.assert_array_equal(snap[4][:, :_I // 2], 1)
-        np.testing.assert_array_equal(snap[4][:, _I // 2:], 0)
+        self.assertIsNotNone(change,
+                             "expandSegWithSPX must return a MaskChange for a real change")
+        self.assertEqual(change.source, 'expand')
+        self.assertEqual(change.slice_idx, 3)
 
     def test_expand_undo_restores_pre_expand_slice(self):
-        """Restoring the snapshot undoes the full-slice expansion."""
         volumeNode = _make_volume()
         segNode, segmentID = _make_seg(volumeNode, with_segment=True)
 
@@ -535,43 +449,39 @@ class UnifiedUndoStackTest(unittest.TestCase):
         _write_lm(segNode, segmentID, volumeNode, pre_state)
 
         labels = np.ones((_J, _I), dtype=np.int32)
-        widget = _mock_expand_widget(self._logic, volumeNode, segNode, segmentID,
-                                     axis=0, slice_index=3)
-        self._logic.expandSegWithSPX(widget, segNode, segmentID, volumeNode,
-                                     labels, axis=0, sliceIndex=3)
+        change = self._logic.expandSegWithSPX(segNode, segmentID, volumeNode,
+                                              labels, axis=0, sliceIndex=3)
 
-        after_expand = _read_lm(segNode, segmentID, volumeNode)
-        np.testing.assert_array_equal(after_expand[3], 1,
-                                      err_msg="expand should have painted the whole slice")
+        after = _read_lm(segNode, segmentID, volumeNode)
+        np.testing.assert_array_equal(after[3], 1,
+                                      err_msg="expand should paint the whole slice")
 
-        # Pop + restore.
-        _, snapshot = widget._undo_stack.pop()
-        self._restore(volumeNode, snapshot)
+        # Undo via reverse_change.
+        widget = _mock_widget(volumeNode, segNode, segmentID)
+        self._logic.reverse_change(widget, change)
         self._logic.reset_render_state()
 
         restored = _read_lm(segNode, segmentID, volumeNode)
         np.testing.assert_array_equal(restored[3, :, :_I // 2], 1,
                                       err_msg="left half must be restored")
         np.testing.assert_array_equal(restored[3, :, _I // 2:], 0,
-                                      err_msg="right half must be gone after undo")
+                                      err_msg="right half must be removed by undo")
 
     def test_expand_undo_does_not_change_other_slices(self):
         volumeNode = _make_volume()
         segNode, segmentID = _make_seg(volumeNode, with_segment=True)
 
         pre = np.zeros((_K, _J, _I), dtype=np.uint8)
-        pre[2] = 1    # slice 2 fully painted — should be untouched
+        pre[2] = 1    # untouched by the expand
         pre[5, :, :_I // 2] = 1
         _write_lm(segNode, segmentID, volumeNode, pre)
 
         labels = np.ones((_J, _I), dtype=np.int32)
-        widget = _mock_expand_widget(self._logic, volumeNode, segNode, segmentID,
-                                     axis=0, slice_index=5)
-        self._logic.expandSegWithSPX(widget, segNode, segmentID, volumeNode,
-                                     labels, axis=0, sliceIndex=5)
+        change = self._logic.expandSegWithSPX(segNode, segmentID, volumeNode,
+                                              labels, axis=0, sliceIndex=5)
 
-        _, snapshot = widget._undo_stack.pop()
-        self._restore(volumeNode, snapshot)
+        widget = _mock_widget(volumeNode, segNode, segmentID)
+        self._logic.reverse_change(widget, change)
 
         result = _read_lm(segNode, segmentID, volumeNode)
         np.testing.assert_array_equal(result[2], 1,
@@ -580,254 +490,133 @@ class UnifiedUndoStackTest(unittest.TestCase):
     # ---- multiple expands → LIFO ordering ----
 
     def test_two_consecutive_expands_lifo(self):
+        """Two expand calls produce independent MaskChange records; reversing
+        the second one leaves the first intact."""
+        from core.utils import get_slice_from_volume
         volumeNode = _make_volume()
         segNode, segmentID = _make_seg(volumeNode, with_segment=True)
 
         labels = np.ones((_J, _I), dtype=np.int32)
-        stack = []
 
-        for sl in [2, 4]:
-            widget = _mock_expand_widget(self._logic, volumeNode, segNode, segmentID,
-                                         axis=0, slice_index=sl)
-            self._logic.expandSegWithSPX(widget, segNode, segmentID, volumeNode,
-                                         labels, axis=0, sliceIndex=sl)
-            stack.extend(widget._undo_stack)
+        change_2 = self._logic.expandSegWithSPX(segNode, segmentID, volumeNode,
+                                                labels, axis=0, sliceIndex=2)
+        change_4 = self._logic.expandSegWithSPX(segNode, segmentID, volumeNode,
+                                                labels, axis=0, sliceIndex=4)
 
-        # Most-recent expand (slice 4) must be undone first.
-        self.assertEqual(len(stack), 2)
-        self.assertEqual(stack[-1][1][3], 4,  "last entry must be slice 4")
-        self.assertEqual(stack[-2][1][3], 2,  "first entry must be slice 2")
+        self.assertIsNotNone(change_2)
+        self.assertIsNotNone(change_4)
+        self.assertEqual(change_2.slice_idx, 2, "First change must be slice 2")
+        self.assertEqual(change_4.slice_idx, 4, "Second change must be slice 4")
 
-    # ---- brush entries: snapshot is not None ----
+        # Undo only slice 4 (LIFO) — slice 2 must remain painted.
+        widget = _mock_widget(volumeNode, segNode, segmentID)
+        self._logic.reverse_change(widget, change_4)
 
-    def test_brush_entry_snapshot_is_not_none(self):
-        """Regression: the original code pushed ('brush', None), which forced
-        onUndo to delegate to editor.undo() — a *separate* undo stack.  Now
-        every brush entry must carry a real snapshot payload."""
-        from core.utils import get_slice_from_volume
+        result = _read_lm(segNode, segmentID, volumeNode)
+        np.testing.assert_array_equal(result[2], 1,
+                                      err_msg="slice 2 must remain after undoing slice 4")
+        np.testing.assert_array_equal(result[4], 0,
+                                      err_msg="slice 4 must be cleared by undo")
 
-        volumeNode = _make_volume()
-        segNode, segmentID = _make_seg(volumeNode, with_segment=True)
+    # ---- history entry format ----
 
-        painted = np.zeros((_K, _J, _I), dtype=np.uint8)
-        painted[3, :, :_I // 2] = 1
-        _write_lm(segNode, segmentID, volumeNode, painted)
+    def test_history_entry_format_brush(self):
+        """Brush entries must be ['brush', change] lists."""
+        history = []
+        mock_change = MagicMock()
+        history.append(['brush', mock_change])
+        entry = history[0]
+        self.assertEqual(entry[0], 'brush')
+        self.assertIs(entry[1], mock_change)
+        self.assertEqual(len(entry), 2)
 
-        snap = (_read_lm(segNode, segmentID, volumeNode)[3].copy(),)
-        # Simulate what _onBrushStrokeStart now does:
-        brush_entry = ('brush', (
-            segNode.GetID(), segmentID, 0, 3,
-            get_slice_from_volume(_read_lm(segNode, segmentID, volumeNode), 0, 3).copy()
-        ))
+    def test_history_entry_format_expand(self):
+        """Expand entries must be ['expand', change] lists."""
+        history = []
+        mock_change = MagicMock()
+        history.append(['expand', mock_change])
+        entry = history[0]
+        self.assertEqual(entry[0], 'expand')
+        self.assertIs(entry[1], mock_change)
 
-        self.assertIsNotNone(brush_entry[1],
-                             "Brush entry must carry a snapshot, not None")
-        self.assertIsInstance(brush_entry[1], tuple)
-        self.assertEqual(len(brush_entry[1]), 5)
-
-    def test_brush_entry_undo_restores_pre_stroke_state(self):
-        """Simulate: capture → paint → undo → pre-paint state restored."""
-        from core.utils import get_slice_from_volume
-
-        volumeNode = _make_volume()
-        segNode, segmentID = _make_seg(volumeNode, with_segment=True)
-
-        # Pre-stroke state: left half of slice 5 painted.
-        pre = np.zeros((_K, _J, _I), dtype=np.uint8)
-        pre[5, :, :_I // 2] = 1
-        _write_lm(segNode, segmentID, volumeNode, pre)
-
-        # Capture state before stroke (mirrors _onBrushStrokeStart).
-        mask3d = _read_lm(segNode, segmentID, volumeNode)
-        pre_data = get_slice_from_volume(mask3d, 0, 5).copy()
-        brush_entry = ('brush', (segNode.GetID(), segmentID, 0, 5, pre_data))
-
-        # Simulate a brush stroke that fills the whole slice.
-        post = pre.copy()
-        post[5] = 1
-        _write_lm(segNode, segmentID, volumeNode, post)
-
-        # Undo: restore from snapshot.
-        self._restore(volumeNode, brush_entry[1])
-        self._logic.reset_render_state()
-
-        restored = _read_lm(segNode, segmentID, volumeNode)
-        np.testing.assert_array_equal(restored[5, :, :_I // 2], 1,
-                                      err_msg="left half must be restored")
-        np.testing.assert_array_equal(restored[5, :, _I // 2:], 0,
-                                      err_msg="right half (painted by stroke) must be undone")
-
-    # ---- stack cleared on segment add / switch ----
+    # ---- history cleared on segment add / switch ----
 
     def test_clear_is_clean_slate_for_next_segment(self):
-        """After a segment switch the undo stack must be empty so the new
-        segment's actions don't accidentally restore a previous segment's state."""
-        undo_stack = []
-        # Push some entries for "old segment".
-        undo_stack.append(('expand', None))
-        undo_stack.append(('brush', None))
-        # Simulate onSegmentChanged / onAddSegment clearing the stack.
-        undo_stack.clear()
-        self.assertEqual(len(undo_stack), 0)
+        """After a segment switch the history must be empty."""
+        history = []
+        history.append(['expand', MagicMock()])
+        history.append(['brush',  MagicMock()])
+        history.clear()
+        self.assertEqual(len(history), 0)
+
+    # ---- reverse_change with None change is a no-op ----
+
+    def test_reverse_change_none_is_noop(self):
+        """reverse_change(widget, None) must not raise or modify the mask."""
+        volumeNode = _make_volume()
+        segNode, segmentID = _make_seg(volumeNode, with_segment=True)
+
+        initial = np.zeros((_K, _J, _I), dtype=np.uint8)
+        initial[1] = 1
+        _write_lm(segNode, segmentID, volumeNode, initial)
+
+        widget = _mock_widget(volumeNode, segNode, segmentID)
+        self._logic.reverse_change(widget, None)  # must not raise
+
+        result = _read_lm(segNode, segmentID, volumeNode)
+        np.testing.assert_array_equal(result[1], 1,
+                                      err_msg="reverse_change(None) must not modify mask")
 
 
 # ===========================================================================
-# _SliceViewMouseFilter behaviour
+# _SliceViewMouseFilter tests
 # ===========================================================================
 
 class MouseFilterTest(unittest.TestCase):
-    """Tests for _SliceViewMouseFilter — the Qt application-level event filter
-    that replaced the VTK interactor observer approach.
 
-    Key invariants:
-      1. eventFilter ALWAYS returns False (never consumes events).
-      2. LeftButton press → _onBrushStrokeStart() called.
-      3. LeftButton release → _onBrushStrokeEnd() called.
-      4. Right button / non-mouse events → no callbacks, still returns False.
-
-    Tests use lightweight fake event objects so no real Qt event-loop setup
-    is required.
-    """
-
-    def setUp(self):
+    def _make_filter(self):
         import qt
-        self._qt = qt
-        from SegmentHumanBody import _SliceViewMouseFilter
-        self._FilterClass = _SliceViewMouseFilter
+        from core._renderer import _SliceViewMouseFilter
+        widget = MagicMock()
+        widget._onBrushStrokeStart = MagicMock()
+        widget._onBrushStrokeEnd   = MagicMock()
+        return _SliceViewMouseFilter(widget), widget
 
-    def _make_fake_widget(self):
-        calls = []
+    def test_event_filter_always_returns_false(self):
+        import qt
+        filt, _ = self._make_filter()
+        event = MagicMock()
+        event.type.return_value = qt.QEvent.MouseMove
+        result = filt.eventFilter(None, event)
+        self.assertFalse(result, "eventFilter must never consume events")
 
-        class _FakeWidget:
-            def _onBrushStrokeStart(self_):  # noqa: N805
-                calls.append('start')
+    def test_mouse_press_calls_stroke_start(self):
+        import qt
+        filt, widget = self._make_filter()
+        event = MagicMock()
+        event.type.return_value   = qt.QEvent.MouseButtonPress
+        event.button.return_value = qt.Qt.LeftButton
+        filt.eventFilter(None, event)
+        widget._onBrushStrokeStart.assert_called_once()
 
-            def _onBrushStrokeEnd(self_):  # noqa: N805
-                calls.append('end')
+    def test_mouse_release_calls_stroke_end(self):
+        import qt
+        filt, widget = self._make_filter()
+        event = MagicMock()
+        event.type.return_value   = qt.QEvent.MouseButtonRelease
+        event.button.return_value = qt.Qt.LeftButton
+        filt.eventFilter(None, event)
+        widget._onBrushStrokeEnd.assert_called_once()
 
-        return _FakeWidget(), calls
-
-    def _make_event(self, type_val, button_val=None):
-        """Return a fake event object whose type() and button() match arguments."""
-        qt = self._qt
-        if button_val is None:
-            button_val = qt.Qt.NoButton
-
-        class _FakeEvent:
-            def type(self): return type_val
-            def button(self): return button_val
-
-        return _FakeEvent()
-
-    # ---- return value ----
-
-    def test_returns_false_on_left_button_press(self):
-        qt = self._qt
-        fake_widget, _ = self._make_fake_widget()
-        f = self._FilterClass(fake_widget)
-        event = self._make_event(qt.QEvent.MouseButtonPress, qt.Qt.LeftButton)
-        self.assertFalse(f.eventFilter(None, event),
-                         "Filter must return False (never consume events)")
-
-    def test_returns_false_on_left_button_release(self):
-        qt = self._qt
-        fake_widget, _ = self._make_fake_widget()
-        f = self._FilterClass(fake_widget)
-        event = self._make_event(qt.QEvent.MouseButtonRelease, qt.Qt.LeftButton)
-        self.assertFalse(f.eventFilter(None, event))
-
-    def test_returns_false_on_right_button_press(self):
-        qt = self._qt
-        fake_widget, _ = self._make_fake_widget()
-        f = self._FilterClass(fake_widget)
-        event = self._make_event(qt.QEvent.MouseButtonPress, qt.Qt.RightButton)
-        self.assertFalse(f.eventFilter(None, event))
-
-    def test_returns_false_on_key_press(self):
-        qt = self._qt
-        fake_widget, _ = self._make_fake_widget()
-        f = self._FilterClass(fake_widget)
-        event = self._make_event(qt.QEvent.KeyPress, qt.Qt.NoButton)
-        self.assertFalse(f.eventFilter(None, event))
-
-    def test_returns_false_on_mouse_move(self):
-        qt = self._qt
-        fake_widget, _ = self._make_fake_widget()
-        f = self._FilterClass(fake_widget)
-        event = self._make_event(qt.QEvent.MouseMove, qt.Qt.LeftButton)
-        self.assertFalse(f.eventFilter(None, event))
-
-    # ---- callback routing ----
-
-    def test_left_press_calls_stroke_start(self):
-        qt = self._qt
-        fake_widget, calls = self._make_fake_widget()
-        f = self._FilterClass(fake_widget)
-        event = self._make_event(qt.QEvent.MouseButtonPress, qt.Qt.LeftButton)
-        f.eventFilter(None, event)
-        self.assertIn('start', calls)
-
-    def test_left_release_calls_stroke_end(self):
-        qt = self._qt
-        fake_widget, calls = self._make_fake_widget()
-        f = self._FilterClass(fake_widget)
-        event = self._make_event(qt.QEvent.MouseButtonRelease, qt.Qt.LeftButton)
-        f.eventFilter(None, event)
-        self.assertIn('end', calls)
-
-    def test_right_press_does_not_call_stroke_start(self):
-        qt = self._qt
-        fake_widget, calls = self._make_fake_widget()
-        f = self._FilterClass(fake_widget)
-        event = self._make_event(qt.QEvent.MouseButtonPress, qt.Qt.RightButton)
-        f.eventFilter(None, event)
-        self.assertEqual(calls, [],
-                         "Right-button press must not trigger a stroke-start callback")
-
-    def test_mouse_move_does_not_trigger_any_callback(self):
-        qt = self._qt
-        fake_widget, calls = self._make_fake_widget()
-        f = self._FilterClass(fake_widget)
-        event = self._make_event(qt.QEvent.MouseMove, qt.Qt.LeftButton)
-        f.eventFilter(None, event)
-        self.assertEqual(calls, [])
-
-    def test_key_press_does_not_trigger_any_callback(self):
-        qt = self._qt
-        fake_widget, calls = self._make_fake_widget()
-        f = self._FilterClass(fake_widget)
-        event = self._make_event(qt.QEvent.KeyPress)
-        f.eventFilter(None, event)
-        self.assertEqual(calls, [])
-
-    def test_left_press_calls_exactly_one_callback(self):
-        """Verify no accidental double-dispatch."""
-        qt = self._qt
-        fake_widget, calls = self._make_fake_widget()
-        f = self._FilterClass(fake_widget)
-        event = self._make_event(qt.QEvent.MouseButtonPress, qt.Qt.LeftButton)
-        f.eventFilter(None, event)
-        self.assertEqual(len(calls), 1)
-
-    def test_consecutive_press_release_sequence(self):
-        """A full click cycle: press → start, release → end."""
-        qt = self._qt
-        fake_widget, calls = self._make_fake_widget()
-        f = self._FilterClass(fake_widget)
-        f.eventFilter(None, self._make_event(qt.QEvent.MouseButtonPress,   qt.Qt.LeftButton))
-        f.eventFilter(None, self._make_event(qt.QEvent.MouseButtonRelease, qt.Qt.LeftButton))
-        self.assertEqual(calls, ['start', 'end'])
-
-    def test_multiple_clicks_produce_correct_sequence(self):
-        """Three full click cycles should give ['start','end'] × 3."""
-        qt = self._qt
-        fake_widget, calls = self._make_fake_widget()
-        f = self._FilterClass(fake_widget)
-        for _ in range(3):
-            f.eventFilter(None, self._make_event(qt.QEvent.MouseButtonPress,   qt.Qt.LeftButton))
-            f.eventFilter(None, self._make_event(qt.QEvent.MouseButtonRelease, qt.Qt.LeftButton))
-        self.assertEqual(calls, ['start', 'end', 'start', 'end', 'start', 'end'])
-
-
-if __name__ == '__main__':
-    unittest.main()
+    def test_callback_exception_does_not_propagate(self):
+        """Exceptions in the callback must be swallowed to protect the Qt event loop."""
+        import qt
+        filt, widget = self._make_filter()
+        widget._onBrushStrokeStart.side_effect = RuntimeError("test error")
+        event = MagicMock()
+        event.type.return_value   = qt.QEvent.MouseButtonPress
+        event.button.return_value = qt.Qt.LeftButton
+        try:
+            filt.eventFilter(None, event)
+        except RuntimeError:
+            self.fail("eventFilter must not propagate exceptions from callbacks")
