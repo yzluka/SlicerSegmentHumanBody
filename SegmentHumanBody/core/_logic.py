@@ -72,26 +72,10 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        # Render-skip: skip the write path when nothing has changed since the
-        # last frame (same prompts, axis, slice, params).
-        self._last_render_key = None
-
         # Numpy cache for the active segment; routes all reads/writes through
         # a single object so Slicer stays in sync.  Replaced lazily by
         # _get_tracker() when the segment identity changes.
         self._tracker: SegmentTracker | None = None
-
-        # Frozen 3-D snapshot of the segment taken on the first confirmed prompt.
-        # Lets every render recompute result = base + pos_labels − neg_labels
-        # from scratch, so removing any point always reverts correctly.
-        self._session_base: np.ndarray | None = None
-
-        # Pixels manually excluded by the erase brush.
-        # {(axis, slice_idx): bool 2-D array}  — True = excluded from pos-region expansion.
-        # Populated by commit_stroke (the single write path) on erase strokes.
-        # Un-populated when an erase stroke is undone.  Cleared by reset_render_state /
-        # end_session (segment switch, clearPrompts, etc.).
-        self._erase_acc: dict = {}
 
         # Confirmed W/L values (set via "Apply Window/Level").  When set, each
         # slice is normalized to [0, 255] before reaching the model.  Volume
@@ -99,36 +83,12 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         self._wl_window = None
         self._wl_level  = None
 
-        # Most recent MaskChange from write_slice; picked up by the async
-        # point-confirm flow (render fires → _capturePointChange reads this).
-        self._last_change = None
-
     def setDefaultParameters(self, parameterNode):
         pass
 
     # -------------------------
     # Cache management
     # -------------------------
-
-    def reset_render_state(self):
-        """Clear session render state: render key, session snapshot, erase tracking.
-
-        The tracker (mask cache) and W/L values are intentionally preserved —
-        the tracker holds the authoritative 3D mask and W/L is a user preference
-        that should survive segment changes.
-        """
-        self._last_render_key = None
-        self._session_base = None
-        self._erase_acc = {}
-
-    def invalidate_render_key(self):
-        """Invalidate the render cache key without disturbing session state.
-
-        Called at brush-stroke start so a pending prompt render is forced to
-        re-execute after the stroke, while ``_session_base`` is preserved for
-        ``commit_stroke`` to sync with the brush/erase changes.
-        """
-        self._last_render_key = None
 
     def _get_tracker(self, segNode, segmentID, volumeNode) -> SegmentTracker:
         """Return the active ``SegmentTracker``, creating one when necessary.
@@ -207,31 +167,7 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         write_slice_to_volume(tracker.get_mask(), before_slice, axis, idx)
 
         # Single write path: delta = after − before, updates _mask, pushes.
-        change = tracker.write_slice(axis, idx, after_slice, source=source)
-
-        # Keep _session_base in sync with manual brush/erase changes.
-        # Without this, any render that fires after the stroke would recompute
-        # result = (stale_base | pos_selections) and overwrite the brush work.
-        if self._session_base is not None:
-            write_slice_to_volume(self._session_base, after_slice, axis, idx)
-
-        # Record pixels removed by erase strokes so SPX renders don't re-expand
-        # into them.  Derive from change.delta (already cropped to the bbox of
-        # changed pixels) to avoid a redundant full-slice subtraction.
-        if source == 'erase' and change is not None:
-            r_end = change.r_min + change.delta.shape[0]
-            c_end = change.c_min + change.delta.shape[1]
-            removed = np.zeros(after_slice.shape, dtype=bool)
-            removed[change.r_min:r_end, change.c_min:c_end] = change.delta < 0
-            if np.any(removed):
-                key = (axis, idx)
-                acc = self._erase_acc.get(key)
-                if acc is None:
-                    self._erase_acc[key] = removed
-                else:
-                    acc |= removed
-
-        return change
+        return tracker.write_slice(axis, idx, after_slice, source=source)
 
     def reverse_change(self, widget, change) -> None:
         """Apply the inverse of *change* to the tracker and push to Slicer."""
@@ -242,32 +178,6 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
             return
         tracker = self._get_tracker(seg, seg_id, vol)
         tracker.reverse_delta(change)
-
-        # Keep _session_base in sync so subsequent renders start from the
-        # reverted state.
-        if self._session_base is not None:
-            reverted = tracker.get_slice(change.axis, change.slice_idx)
-            write_slice_to_volume(self._session_base, reverted, change.axis, change.slice_idx)
-
-        # Un-accumulate erased pixels when an erase stroke is undone.
-        if change.source == 'erase':
-            key = (change.axis, change.slice_idx)
-            if key in self._erase_acc:
-                r_end = change.r_min + change.delta.shape[0]
-                c_end = change.c_min + change.delta.shape[1]
-                restored = change.delta < 0  # delta < 0 = was erased; reversing restores them
-                self._erase_acc[key][change.r_min:r_end, change.c_min:c_end] &= ~restored
-                if not np.any(self._erase_acc[key]):
-                    del self._erase_acc[key]
-
-    def end_session(self):
-        """End the current annotation session.
-
-        Clears session state so the next render starts fresh from the current
-        committed base.  Slicer is not written here — every render already
-        commits directly, so there is never a stale preview to flush.
-        """
-        self.reset_render_state()
 
     # -------------------------
     # Window / Level
@@ -380,138 +290,6 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
             parameterNode.GetNodeReference(NEG_NODE),
         )
 
-    # -------------------------
-    # Render loop
-    # -------------------------
-
-    def onRender(self, modelFamily, widget):
-        """Compute and commit the prompt result for the current slice.
-
-        Called by ``_triggerRender()`` from point-confirmed / point-removed /
-        slice-scroll event handlers and by ``ctrl.request_render()``.
-
-        Design principle: **always commit**.  Every call writes the result
-        through the ``SegmentTracker`` (cache + Slicer together).  There is no
-        separate "preview" state — what Slicer shows is always the committed state.
-        The ``_session_base`` snapshot (taken on the first prompt)
-        lets us recompute any slice from scratch so that removing a point
-        correctly reverts to base without any per-point snapshot.
-        """
-        if not modelFamily or not modelFamily.model:
-            return
-
-        parameterNode = widget._parameterNode
-        posNode, negNode = self.getPromptNodes(parameterNode)
-
-        volumeNode = widget.ui.sourceVolumeSelector.currentNode()
-        if not volumeNode:
-            return
-
-        axis, sliceIndex = self.getAxisAndSlice(widget, volumeNode)
-
-        # Only include control points that have been placed (PositionDefined).
-        # The live placement cursor is in PositionPreview state and must not
-        # drive a render — it is not yet a confirmed annotation.
-        pos_points = [pos for (status, _, pos) in _node_records(posNode)
-                      if status == POSITION_DEFINED]
-        neg_points = [neg for (status, _, neg) in _node_records(negNode)
-                      if status == POSITION_DEFINED]
-
-        params = widget.getUserParameters()
-        if params is None:
-            log.warning("[onRender] Parameter parsing failed — skipping render")
-            return
-
-        render_key = (
-            tuple(tuple(p) for p in pos_points),
-            tuple(tuple(p) for p in neg_points),
-            axis,
-            sliceIndex,
-            tuple(sorted(params.items())) if params else (),
-        )
-
-        if render_key == self._last_render_key:
-            return
-
-        # -----------------------------------------------------------------
-        # No active prompts
-        # -----------------------------------------------------------------
-        if not pos_points and not neg_points:
-            if self._session_base is not None:
-                # Restore this slice to the session base (removes any
-                # prompt-driven region that was committed while prompts existed).
-                _, segNode, segmentID = self._get_context(widget)
-                if segNode and segmentID:
-                    self._get_tracker(segNode, segmentID, volumeNode).write_slice(
-                        axis, sliceIndex,
-                        get_slice_from_volume(self._session_base, axis, sliceIndex),
-                        source='prompt',
-                    )
-                # End session once all markup nodes are empty.
-                total = sum(n.GetNumberOfControlPoints() for n in (posNode, negNode) if n)
-                if total == 0:
-                    self._session_base = None
-            self._last_render_key = render_key
-            return
-
-        # -----------------------------------------------------------------
-        # Ensure a segment holder exists (create lazily on first prompt)
-        # -----------------------------------------------------------------
-        seg = widget.ui.segmentSelector.currentNode()
-        seg_id = widget.ui.segmentSelector.currentSegmentID()
-        if not seg or not seg_id:
-            self._ensure_seg_and_segment(widget, volumeNode)
-
-        _, segNode, segmentID = self._get_context(widget)
-        if not segNode or not segmentID:
-            return
-
-        # -----------------------------------------------------------------
-        # Start session on first prompt (snapshot committed state as base)
-        # -----------------------------------------------------------------
-        if self._session_base is None:
-            self._session_base = self._get_tracker(segNode, segmentID, volumeNode).snapshot()
-
-        # -----------------------------------------------------------------
-        # Compute
-        # -----------------------------------------------------------------
-        scribbles_ijk = self.ras_to_ijk(volumeNode, {
-            "positive": pos_points,
-            "negative": neg_points,
-        }, axis, slice_index=sliceIndex)
-
-        volumeArray = slicer.util.arrayFromVolume(volumeNode)
-        if volumeArray is None:
-            log.warning("[onRender] volume has no image data — skipping render")
-            return
-        img = get_slice_from_volume(volumeArray, axis, sliceIndex)
-        img = self._apply_wl_to_slice(img)
-
-        base_slice = get_slice_from_volume(self._session_base, axis, sliceIndex)
-
-        erase_slice = self._erase_acc.get((axis, sliceIndex))
-        result = call_if_exists(
-            modelFamily, "onRender",
-            img=img,
-            pos_points=scribbles_ijk["positive"],
-            neg_points=scribbles_ijk["negative"],
-            base_mask=base_slice.copy(),
-            erase_mask=erase_slice,
-            **params
-        )
-
-        # -----------------------------------------------------------------
-        # Commit — write result (or base) directly into tracker cache + Slicer
-        # -----------------------------------------------------------------
-        if result is None:
-            log.warning('[Logic] onRender: model returned None — writing base slice')
-        self._last_render_key = render_key
-        self._last_change = self._get_tracker(segNode, segmentID, volumeNode).write_slice(
-            axis, sliceIndex,
-            result if result is not None else base_slice,
-            source='prompt',
-        )
-
     def _ensure_seg_and_segment(self, widget, volumeNode):
         """Guarantee a segmentation node and at least one segment exist.
 
@@ -552,14 +330,85 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
 
         return segNode, segmentID
 
-    def applyResult(self, widget, mask2d, axis, sliceIndex):
-        volumeNode, segNode, segmentID = self._get_context(widget)
-        if not volumeNode or not segNode or not segmentID:
-            return
+    # -------------------------
+    # Point commit
+    # -------------------------
 
-        self._last_change = self._get_tracker(segNode, segmentID, volumeNode).write_slice(
-            axis, sliceIndex, mask2d, source='prompt'
-        )
+    def commit_point(self, widget, node, cp_id) -> 'MaskChange | None':
+        """Compute and write the superpixel selection for one control point.
+
+        Runs the SPX model on the current slice (reusing its label cache when
+        available), finds the superpixel at the point's 2-D position, and writes
+        current | label_pixels (positive) or current & ~label_pixels (negative)
+        through SegmentTracker.write_slice() — the same single write path used
+        by brush and erase strokes.
+        """
+        vol = widget.ui.sourceVolumeSelector.currentNode()
+        if not vol:
+            return None
+
+        seg, seg_id = (widget.ui.segmentSelector.currentNode(),
+                       widget.ui.segmentSelector.currentSegmentID())
+        if not seg or not seg_id:
+            self._ensure_seg_and_segment(widget, vol)
+            seg  = widget.ui.segmentSelector.currentNode()
+            seg_id = widget.ui.segmentSelector.currentSegmentID()
+        if not seg or not seg_id:
+            return None
+
+        modelFamily = widget.modelFamily
+        if not modelFamily or not modelFamily.model:
+            return None
+
+        posNode, negNode = self.getPromptNodes(widget._parameterNode)
+        is_negative = (node is negNode)
+
+        idx_in_node = node.GetControlPointIndexByID(cp_id)
+        if idx_in_node < 0:
+            return None
+
+        ras = [0.0, 0.0, 0.0]
+        node.GetNthControlPointPositionWorld(idx_in_node, ras)
+
+        axis, slice_idx = self.getAxisAndSlice(widget, vol)
+
+        # Convert RAS → 2-D slice coordinates; off-slice points are filtered out.
+        scrib_key = 'negative' if is_negative else 'positive'
+        scrib = {'positive': [], 'negative': []}
+        scrib[scrib_key] = [ras]
+        pts_2d = self.ras_to_ijk(vol, scrib, axis, slice_index=slice_idx)[scrib_key]
+        if not pts_2d:
+            return None  # point was placed on a different slice
+
+        px, py = int(round(pts_2d[0][0])), int(round(pts_2d[0][1]))
+
+        volumeArray = slicer.util.arrayFromVolume(vol)
+        if volumeArray is None:
+            return None
+        img = get_slice_from_volume(volumeArray, axis, slice_idx)
+        img = self._apply_wl_to_slice(img)
+
+        params = widget.getUserParameters() or {}
+        labels = call_if_exists(modelFamily, 'on_expand', img=img, **params)
+        if labels is None:
+            return None
+
+        if not (0 <= py < labels.shape[0] and 0 <= px < labels.shape[1]):
+            return None
+
+        spx_pixels = labels == labels[py, px]
+
+        tracker = self._get_tracker(seg, seg_id, vol)
+        current  = tracker.get_slice(axis, slice_idx).astype(bool)
+
+        if is_negative:
+            new_data = (current & ~spx_pixels).astype(np.uint8)
+            source   = 'neg_prompt'
+        else:
+            new_data = (current | spx_pixels).astype(np.uint8)
+            source   = 'prompt'
+
+        return tracker.write_slice(axis, slice_idx, new_data, source=source)
 
     # -------------------------
     # SPX boundary
@@ -627,10 +476,6 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         or when the expansion produced no net change.  The widget is responsible
         for appending the returned change to its ``_history`` list.
         """
-        # End the current session so the next prompt render starts from the
-        # post-expand committed state.
-        self.end_session()
-
         modelFamily = widget.modelFamily
 
         if not modelFamily:

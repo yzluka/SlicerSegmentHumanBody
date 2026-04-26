@@ -152,53 +152,6 @@ class SPXModelFamily(BaseModelFamily):
 
         return self._cache_labels
 
-    def onRender(self, img, pos_points, neg_points, **kwargs):
-        if not self.model:
-            return None
-
-        # Pop base_mask and erase_mask before building the SPX label-map cache key.
-        # The label map depends only on img content and algorithm params,
-        # not on the pre-existing painted state.
-        base_mask  = kwargs.pop('base_mask',  None)
-        erase_mask = kwargs.pop('erase_mask', None)
-
-        key = self._make_cache_key(img, kwargs)
-        if key != self._cache_key:
-            self._cache_labels = self.model.forward(img=img, **kwargs)
-            self._cache_key = key
-
-        labels = self._cache_labels
-
-        # Collect labels under positive and negative prompts.
-        pos_labels = labels_at_points(pos_points, labels)
-        neg_labels = labels_at_points(neg_points, labels)
-
-        # Neg has priority: a label under a neg point is never added by pos.
-        pos_only_labels = pos_labels - neg_labels
-
-        if base_mask is not None:
-            # Additive / subtractive mode — used in interactive sessions that
-            # have a pre-existing painted region:
-            #   result = (base_slice | pos_region) & ~neg_region
-            pos_region = (np.isin(labels, list(pos_only_labels))
-                          if pos_only_labels else np.zeros(labels.shape, dtype=bool))
-            neg_region = (np.isin(labels, list(neg_labels))
-                          if neg_labels else np.zeros(labels.shape, dtype=bool))
-
-            # Pixels manually excluded by the erase brush take priority over
-            # SPX-label expansion.  The exclusion mask is committed through the
-            # single write path (commit_stroke) so it is always current.
-            if erase_mask is not None:
-                pos_region = pos_region & ~erase_mask
-
-            return np.where(neg_region, 0,
-                            np.where(pos_region, 1, base_mask)).astype(np.uint8)
-
-        # Classic mode (no base mask): derive result entirely from prompts.
-        if not pos_only_labels:
-            return None
-
-        return np.isin(labels, list(pos_only_labels)).astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------

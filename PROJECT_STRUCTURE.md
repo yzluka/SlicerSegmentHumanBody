@@ -57,8 +57,8 @@ Loaded by Slicer. Contains:
 
 - **`SegmentHumanBody`** — `ScriptedLoadableModule` metadata (title, category, contributors).
 - **`SegmentHumanBodyWidget`** — the Qt widget.  Owns the UI, the undo history list
-  (`_history`), the active stroke handler, and SPX boundary overlay state.
-  Delegates all logic to the classes below.
+  (`_history`), the active stroke handler (`_active_handler`), and SPX boundary overlay
+  state.  Delegates all logic to the classes below.
 - **`SegmentHumanBodyTest`** — `ScriptedLoadableModuleTest` integration test runner.
 
 ### `core/_logic.py` — `SegmentHumanBodyLogic`
@@ -69,15 +69,9 @@ responsibilities:
 | Attribute / method | Purpose |
 |---|---|
 | `_tracker` | `SegmentTracker` instance; mask cache for the current segment |
-| `_session_base` | Frozen 3-D snapshot taken on the first prompt; base for SPX renders |
-| `_erase_acc` | `{(axis, idx): bool 2D array}` pixels excluded by manual erase strokes |
-| `_last_render_key` | Tuple of (points, axis, slice, params); skips render when unchanged |
-| `onRender()` | Main render loop: builds render key, extracts slice, calls model family |
-| `applyResult()` | Writes model output through `SegmentTracker.write_slice()` |
-| `commit_stroke()` | Reconciles a brush/erase stroke into `_tracker` and `_session_base` |
-| `reverse_change()` | Reverses a `MaskChange` via `_tracker.reverse_delta()`; syncs `_session_base` and `_erase_acc` |
-| `invalidate_render_key()` | Clears `_last_render_key` only — preserves `_session_base` and `_erase_acc` |
-| `reset_render_state()` | Clears render key, session snapshot, and erase accumulator |
+| `commit_stroke()` | Reconciles a brush/erase stroke: restores before-state, calls `tracker.write_slice()` |
+| `commit_point()` | Runs SPX model, finds label at click, writes union/subtract via `tracker.write_slice()` |
+| `reverse_change()` | Reverses a `MaskChange` via `tracker.reverse_delta()` |
 | `on_expand()` | Runs `expandSegWithSPX` and returns the `MaskChange` for undo |
 | `recreate_prompt_node()` | Replaces one markup node to reset its ID counter |
 | `recreatePromptNodes()` | Replaces both markup nodes (used by `clearPrompts`) |
@@ -90,26 +84,35 @@ Centralises all boolean semaphores to avoid race conditions:
 |---|---|
 | `activating_brush` | True while `StrokeHandler._activate_effect` is running |
 | `brush_in_progress` | True between mouse-down and mouse-up during a stroke |
-| `creating_segment` | Suppresses `onSegmentChanged` while a new segment is being added |
-| `is_paused` | Nestable pause; `request_render` is a no-op while paused |
-| `is_rendering` | True while the render callback is executing; guards re-entrancy |
+| `creating_segment` | Suppresses `onSegmentChanged` during auto-segment creation inside `applyResult` |
+| `is_paused` | Nestable pause; blocks `_onPlaceModeChanged`, `_onInteractionModeChanged`, render callbacks, and `_onPointRemoved` |
 
-Also owns `request_render()` — the single dispatching point for the render loop.
+`pause()` / `resume()` are nestable (depth counter).  `updateGUIFromParameterNode` wraps its two `setCurrentNode` calls inside `ctrl.pause()` so the `activeMarkupsFiducialPlaceModeChanged` signal they fire is blocked and cannot spuriously activate `PointHandler`.
 
 ### `core/_input.py` — input handler hierarchy
 
+All three concrete handlers write through the same `SegmentTracker.write_slice()` path:
+
 ```
 InputHandler          ← base (attach / detach / flush lifecycle)
-└── StrokeHandler     ← owns mouse filter + stroke-before snapshot
-    ├── BrushHandler  ← EFFECT='Paint', SOURCE='brush'
-    └── EraseHandler  ← EFFECT='Erase', SOURCE='erase'; skips no-op strokes
+├── StrokeHandler     ← owns Qt mouse filter + stroke-before snapshot
+│   ├── BrushHandler  ← EFFECT='Paint', SOURCE='brush'
+│   └── EraseHandler  ← EFFECT='Erase', SOURCE='erase'; skips no-op strokes
+└── PointHandler      ← lifecycle only; one instance per active placement session
 ```
 
 - **`_SliceViewMouseFilter`** — application-level Qt event filter; fires
   `on_press` / `on_release` callbacks on left-button events.
 - **`StrokeHandler`** — captures a before-snapshot on mouse-down, commits
   via `logic.commit_stroke()` on mouse-up (through a 0-ms timer so Slicer's
-  Paint effect apply() finishes first).  Stores the result in `_history`.
+  Paint effect `apply()` finishes first).  Stores the result in `_history`.
+  `attach()` includes a **supersession guard**: after `_activate_effect()`
+  returns it checks `widget._active_handler is self`; if not (because
+  `_activate_effect` triggered `onAddSegment` which restored a fresh handler),
+  it bails out without installing the mouse filter or effect callback.
+- **`PointHandler`** — on each `PointPositionDefinedEvent`, calls
+  `logic.commit_point()` synchronously and pushes the `MaskChange` to
+  `_history` immediately (no async timer).
 
 ### `core/_tracker.py` — `SegmentTracker` + `MaskChange`
 
@@ -134,20 +137,19 @@ MaskChange = namedtuple('MaskChange',
 
 ```
 BaseModelFamily      ← VARIANTS=[], VISIBLE_BUTTONS=frozenset()
-├── SAMFamily        ← SAM v1/v2 variants; onRender is a placeholder
-└── SPXModelFamily   ← superpixel algorithms; fully implemented
+├── SAMFamily        ← SAM v1/v2 variants; onRender stub only
+├── SPXModelFamily   ← superpixel algorithms; on_expand + label cache
+└── AutoModelFamily  ← automated (non-interactive) segmentation
 ```
 
 UI button visibility is driven entirely by `VISIBLE_BUTTONS` — the widget's
 `updateUIVisibility()` shows/hides each managed button based on set membership.
 Adding a button to a family = add its widget name to `VISIBLE_BUTTONS`.
 
-`SPXModelFamily.onRender()` implements the SPX formula:
-
-```
-result = where(neg_region, 0,
-           where(pos_region & ~erase_mask, 1, base_mask))
-```
+`SPXModelFamily.on_expand()` runs `model.forward()` with a label-map cache keyed
+on `img.ctypes.data` (O(1) pointer comparison, no copy).  Both `commit_point()`
+and the Expand action go through this method, so the label map is never recomputed
+for the same slice twice within one session.
 
 `FAMILY_REGISTRY` (dict of display-name → class) is the single source of truth
 for the model-family dropdown.
@@ -182,38 +184,87 @@ pops `img` and returns an integer label map.
 
 ---
 
-## Data flow summary
+## Mutual exclusion and handler lifecycle
+
+### One active handler at a time
+
+`widget._active_handler` is the single source of truth for the currently active input handler.  Every `attach()` implementation calls `_detach_current_tool_if_exists(widget)` as its first step — this flushes any pending stroke and calls `.detach()` on the previous handler before the new one is set up.
+
+Two signals switch to `PointHandler`:
+
+| Trigger | Path |
+|---|---|
+| User clicks a place-widget button | `activeMarkupsFiducialPlaceModeChanged(True)` → `_onPlaceModeChanged` |
+| Slicer global toolbar enters Place mode | VTK `InteractionModeChangedEvent` → `_onInteractionModeChanged` |
+
+Both handlers return immediately when `ctrl.is_paused` is True, so programmatic `setCurrentNode` calls (e.g. inside `updateGUIFromParameterNode` or `clearPrompts`) never spuriously activate `PointHandler`.
+
+### Segment creation — `onAddSegment`
+
+`clearPrompts()` (called from `onSegmentChanged` when a segment is selected or created) assigns `_active_handler = PointHandler()` directly, bypassing the `detach()` lifecycle.  To prevent it from orphaning an active stroke handler, `onAddSegment` follows a four-step sequence:
 
 ```
-User interaction (click / scroll / brush)
+1. cache  — remember type(self._active_handler) if StrokeHandler
+2. detach — call .detach() on current handler (flush + remove listeners)
+3. create — AddEmptySegment → setCurrentSegmentID fires onSegmentChanged
+               → clearPrompts → _active_handler = PointHandler()
+4. restore (finally) — if prior class cached, prior_class().attach(self)
+               → _detach_current_tool_if_exists removes the PointHandler
+               → fresh StrokeHandler fully attached
+```
+
+The restore runs in `finally` so it also fires on early return (e.g. no volume selected), keeping the handler state consistent.
+
+### `StrokeHandler.attach()` supersession guard
+
+`_activate_effect()` calls `onAddSegment()` when the active segmentation has 0 segments (auto-creates the first segment so Paint has somewhere to write).  Because `onAddSegment`'s restore path calls `attach()` on a **new** handler instance, `widget._active_handler` will no longer be `self` when `_activate_effect()` returns.  The guard in `StrokeHandler.attach()`:
+
+```python
+if widget._active_handler is not self:
+    return   # superseded — fresh handler already fully attached
+```
+
+prevents the original (now stale) `attach()` from installing a duplicate mouse filter and effect callback.
+
+---
+
+## Data flow summary
+
+All three interactive tools write through the same single path:
+
+```
+User interaction
   │
-  ├─ Brush / Erase ──► StrokeHandler ──► logic.commit_stroke()
-  │                                           │
-  │                                    SegmentTracker.write_slice()
-  │                                    _session_base sync
-  │                                    _erase_acc update
+  ├─ Brush stroke ──► StrokeHandler
+  │                       capture before-state (mouse-down)
+  │                       Slicer Paint effect draws
+  │                       logic.commit_stroke() (mouse-up, 0-ms timer)
+  │                           restore before in tracker
+  │                           tracker.write_slice()  ← single write path
+  │                           return MaskChange → _history
   │
-  ├─ Point placed ──► _onPointConfirmed ──► _triggerRender
+  ├─ Erase stroke ──► EraseHandler  (same as Brush, source='erase')
   │
-  └─ Slice scroll ──► slice observer ──► _triggerRender
-                                              │
-                                        WidgetState.request_render()
-                                              │
-                                        SegmentHumanBodyLogic.onRender()
-                                              │
-                                        render_key check (skip if unchanged)
-                                              │
-                                        SPXModelFamily.onRender()
-                                              │
-                                        logic.applyResult()
-                                              │
-                                        SegmentTracker.write_slice()
+  ├─ Point placed ──► PointHandler
+  │                       logic.commit_point()
+  │                           SPXModelFamily.on_expand() → label map (cached)
+  │                           find label at click position
+  │                           tracker.write_slice()  ← single write path
+  │                           return MaskChange → _history
+  │
+  └─ Expand (E) ──► logic.on_expand()
+                        SPXModelFamily.on_expand() → label map (cached)
+                        select_spx_labels (current mask drives selection)
+                        tracker.write_slice()  ← single write path
+                        return MaskChange → _history
 ```
 
 **Undo** (`Ctrl+Z`):  
-Pop from `_history` → `logic.reverse_change()` → `tracker.reverse_delta()` +
-`_session_base` sync + `_erase_acc` un-accumulate → `invalidate_render_key()` →
-trigger render.
+Pop from `_history` → `logic.reverse_change()` → `tracker.reverse_delta()` → mask pushed to Slicer.  
+For `'point'` entries: remove control point first; recreate node if now empty (resets ID counter).
+
+**Add Segment** (button or auto-triggered by Paint on empty segmentation):  
+`onAddSegment` → cache/detach active StrokeHandler → `AddEmptySegment` → `onSegmentChanged` → `clearPrompts` → restore StrokeHandler.
 
 ---
 
@@ -235,5 +286,29 @@ SPX 2-D point convention: `[x, y]` maps to `labels[y, x]` (row = y, col = x).
 |---|---|---|
 | `tests/` pure-Python unit tests | `PythonSlicer.exe -m pytest tests/ -v` | No |
 | `Testing/Python/SegmentHumanBodyTest.py` integration tests | `PythonSlicer.exe --testing --run SegmentHumanBodyTest` | Yes |
+
+### Pure-Python unit tests (`tests/`)
+
+| File | Covers |
+|---|---|
+| `test_families.py` | SPX label cache hit/miss, `on_expand` behaviour, registry lookup |
+| `test_undo_widget.py` | unified undo stack entry format, LIFO ordering, clear semantics, snapshot integrity |
+| `test_registry.py` | model registry caching and factory lookup |
+| `test_spx_models.py` | individual SPX model algorithms |
+| `test_utils.py` | slice read/write helpers, coordinate helpers |
+
+### Slicer-native integration tests (`Testing/Python/SegmentHumanBodyTest.py`)
+
+| Class | Covers |
+|---|---|
+| `SegmentHumanBodyLogicTest` | `applyResult`, `expandSegWithSPX`, `ras_to_ijk`, `getAxisAndSlice` |
+| `TrackerUndoTest` | `write_slice` / `reverse_delta` round-trips, bbox efficiency, no-op writes, LIFO undo |
+| `UnifiedHistoryTest` | expand returns `MaskChange`; `reverse_change` restores state; LIFO ordering |
+| `MouseFilterTest` | `_SliceViewMouseFilter` return value, callback routing, exception safety |
+| `AddSegmentHandlerTest` | `onAddSegment` cache/detach/create/restore; detach order; full regression (brush → add segment → place deactivates brush); `StrokeHandler.attach()` supersession guard |
+| `BrushStrokeUndoTest` | `commit_stroke` records MaskChange; `onUndo` restores slice; two-stroke LIFO; `EraseHandler._should_track` (no-op vs real erase) |
+| `PointPlacementUndoTest` | `_onPointConfirmed` paints correct SPX region (pos/neg); undo removes point + restores mask; two-point LIFO; off-slice point ignored |
+| `ManualPointDeletionTest` | `_onPointRemoved` reverses mask and removes history entry; suppressed while paused |
+| `MixedActionUndoTest` | brush + point in one session; LIFO ordering across action types; both orderings tested |
 
 See `CLAUDE.md` for exact run commands.

@@ -43,6 +43,16 @@ class _SliceViewMouseFilter(qt.QObject):
 class InputHandler:
     """Base class for interactive input modes."""
 
+    def _detach_current_tool_if_exists(self, widget):
+        """Flush and detach whatever handler is currently active on *widget*.
+
+        Called at the top of every ``attach()`` implementation so that
+        activating any tool automatically deactivates the previous one.
+        """
+        current = getattr(widget, '_active_handler', None)
+        if current is not None and current is not self:
+            current.detach(widget)
+
     def attach(self, widget):
         """Install this handler on *widget*."""
 
@@ -76,8 +86,18 @@ class StrokeHandler(InputHandler):
     # ------------------------------------------------------------------ #
 
     def attach(self, widget):
-        """Activate the Segment Editor effect and install event listeners."""
+        """Deactivate the current tool, then activate this stroke handler."""
+        self._detach_current_tool_if_exists(widget)
+        widget._active_handler = self
+
         self._activate_effect(widget)
+
+        # _activate_effect may call onAddSegment (0-segment case), which
+        # caches/detaches/recreates/restores — ending with a fresh handler
+        # already fully attached.  If _active_handler is no longer self we
+        # were superseded; bail out so we don't install a stale mouse filter.
+        if widget._active_handler is not self:
+            return
 
         self._mouse_filter = _SliceViewMouseFilter(
             on_press   = lambda: self._on_stroke_start(widget),
@@ -111,6 +131,9 @@ class StrokeHandler(InputHandler):
             btn.blockSignals(True)
             btn.setChecked(False)
             btn.blockSignals(False)
+
+        if getattr(widget, '_active_handler', None) is self:
+            widget._active_handler = None
 
     def reset(self, widget):
         """Discard any pending before-state without committing."""
@@ -155,7 +178,6 @@ class StrokeHandler(InputHandler):
         if before is not None:
             self._stroke_before = (axis, idx, before)
         widget.ctrl.brush_in_progress = True
-        widget.logic.invalidate_render_key()   # preserves _session_base for commit_stroke
         log.debug('[%s] stroke start — history %d', self.SOURCE, len(widget._history))
 
     def _on_stroke_end(self, widget):
@@ -184,7 +206,7 @@ class StrokeHandler(InputHandler):
         editor = widget._segEditor()
         effect = editor.activeEffect() if editor else None
         if (effect.name if effect else None) != self.EFFECT:
-            widget._set_stroke_handler(None)
+            self.detach(widget)
 
     # ------------------------------------------------------------------ #
     # Helpers                                                              #
@@ -256,3 +278,40 @@ class EraseHandler(StrokeHandler):
 
     def _should_track(self, change) -> bool:
         return bool(np.any(change.delta < 0))
+
+
+class PointHandler(InputHandler):
+    """Treats each confirmed control point as a superpixel brush/erase stroke.
+
+    Finds the SPX label at the point's 2-D position on the current slice,
+    then writes current | label_pixels (positive point) or
+    current & ~label_pixels (negative point) through
+    SegmentTracker.write_slice() — the same single write path used by
+    BrushHandler and EraseHandler.
+    """
+
+    def attach(self, widget):
+        """Deactivate the current tool, then switch to persistent placement mode."""
+        self._detach_current_tool_if_exists(widget)
+        posNode, _ = widget.logic.getPromptNodes(widget._parameterNode)
+        if not posNode:
+            return
+        widget._active_handler = self
+        interactionNode = slicer.app.applicationLogic().GetInteractionNode()
+        # Already in placement mode (e.g. _onInteractionModeChanged called us while
+        # Place mode is already active) — registration done, no mode switch needed.
+        if interactionNode.GetCurrentInteractionMode() == interactionNode.Place:
+            return
+        selectionNode = slicer.app.applicationLogic().GetSelectionNode()
+        selectionNode.SetActivePlaceNodeID(posNode.GetID())
+        selectionNode.SetActivePlaceNodeClassName(posNode.GetClassName())
+        interactionNode.SwitchToPersistentPlaceMode()
+
+    def detach(self, widget):
+        """Return Slicer to view-transform mode and unregister."""
+        if getattr(widget, '_active_handler', None) is self:
+            widget._active_handler = None
+        interactionNode = slicer.app.applicationLogic().GetInteractionNode()
+        if interactionNode.GetCurrentInteractionMode() == interactionNode.Place:
+            interactionNode.SwitchToViewTransformMode()
+

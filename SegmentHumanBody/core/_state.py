@@ -94,7 +94,7 @@ class WidgetState:
             return
 
         if on_render is None:
-            on_render = lambda: w.logic.onRender(w.modelFamily, w)
+            return
 
         self._pending   = False
         self._rendering = True

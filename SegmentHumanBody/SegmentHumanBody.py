@@ -18,7 +18,7 @@ from core.utils import (
 from core.modelRegistry import ModelRegistry
 from core._logic import SegmentHumanBodyLogic
 from core._state import WidgetState
-from core._input import BrushHandler, EraseHandler
+from core._input import StrokeHandler, BrushHandler, EraseHandler, PointHandler
 
 log = logging.getLogger(__name__)
 
@@ -69,9 +69,11 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._history = []
         self._undo_shortcut = None
 
-        # Active stroke handler (BrushHandler or EraseHandler), or None when
-        # neither tool is active.  Owns the mouse filter and stroke-before state.
-        self._stroke_handler = None
+        # The currently active input handler (BrushHandler, EraseHandler, or
+        # PointHandler), or None before setup completes.  Mutual exclusion is
+        # enforced by InputHandler._detach_current_tool_if_exists: every
+        # attach() call deactivates the previous handler first.
+        self._active_handler = None
 
         # SPX boundary overlay
         self._spx_boundary_node    = None   # vtkMRMLLabelMapVolumeNode
@@ -85,9 +87,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     # -------------------------
     def cleanup(self):
         """Called by Slicer when the module is unloaded."""
-        if self._stroke_handler:
-            self._stroke_handler.detach(self)
-            self._stroke_handler = None
+        if self._active_handler:
+            self._active_handler.detach(self)
         super().cleanup()
 
     def setup(self):
@@ -137,13 +138,6 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         log.debug('[Setup complete]')
 
-    def _set_stroke_handler(self, handler):
-        """Switch the active stroke handler, detaching the old one first."""
-        if self._stroke_handler:
-            self._stroke_handler.detach(self)
-        self._stroke_handler = handler
-        if handler:
-            handler.attach(self)
 
     def _add_history(self, entry):
         """Append *entry* to the undo history (called by input handlers)."""
@@ -175,14 +169,13 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def _onExpandShortcut(self):
         """Handle the E hotkey: flush any active stroke → expand → restore tool."""
-        prior_class = type(self._stroke_handler) if self._stroke_handler else None
-        if self._stroke_handler:
-            # detach() flushes (apply + commit) then deactivates the editor effect.
-            self._stroke_handler.detach(self)
-            self._stroke_handler = None
+        active = self._active_handler
+        prior_stroke_class = type(active) if isinstance(active, StrokeHandler) else None
+        if prior_stroke_class:
+            active.detach(self)
         self._onExpand()
-        if prior_class:
-            self._set_stroke_handler(prior_class())
+        if prior_stroke_class:
+            prior_stroke_class().attach(self)
 
 
     def _initializeAfterSetup(self):
@@ -209,19 +202,11 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # setParameterNode).  No direct call needed here.
 
     def _connectSliceObservers(self):
-        """Add VTK observers for slice scrolling, cursor tracking, and interaction mode.
+        """Add VTK observer for interaction mode changes.
 
-        All three are registered here so they survive the removeObservers() call
-        inside _observeMarkupsNodes.
+        Registered here so it survives the removeObservers() call inside
+        _observeMarkupsNodes.
         """
-        lm = slicer.app.layoutManager()
-        for viewName in ("Red", "Green", "Yellow"):
-            sw = lm.sliceWidget(viewName)
-            if sw:
-                self.addObserver(sw.mrmlSliceNode(),
-                                 vtk.vtkCommand.ModifiedEvent,
-                                 self._onSliceNodeModified)
-
         # Deactivate the brush when the user switches to point-placement mode.
         interactionNode = slicer.app.applicationLogic().GetInteractionNode()
         if interactionNode:
@@ -229,50 +214,21 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                              vtk.vtkCommand.ModifiedEvent,
                              self._onInteractionModeChanged)
 
-    def _onSliceNodeModified(self, caller=None, event=None):
-        """Re-render when the active slice view scrolls to a new slice.
+    def _onPlaceModeChanged(self, active: bool):
+        """Qt slot: fires when the user clicks either markup place-widget button.
 
-        Fires for every ``vtkMRMLSliceNode.ModifiedEvent`` (pan, zoom, scroll,
-        window/level adjust from the display node, etc.).  We only act when:
-          - not paused
-          - the modified node belongs to the currently active view
-          - the slice index actually differs from the last-rendered index
-
-        Intentionally does NOT write to ``_last_render_key`` — that field is
-        owned by ``onRender`` alone.  Writing None here before ``_triggerRender``
-        would break the guard: if the triggered render is then dropped (because
-        ``_isRendering`` is True) the key stays None, causing every subsequent
-        slice-node event to bypass the guard until a render finally succeeds.
-        Instead we rely on the fact that ``onRender`` already compares the full
-        render key (which includes sliceIndex) and skips when nothing changed.
+        Activates PointHandler (flushing and detaching any active stroke handler)
+        when placement mode is turned on.  No-op when turned off — the point
+        handler stays registered as the active handler in the background.
         """
-        if self.ctrl.is_paused:
+        if not active or self.ctrl.is_paused:
             return
-        if not self.modelFamily or not self.modelFamily.model:
-            return
-        volumeNode = self.ui.sourceVolumeSelector.currentNode()
-        if not volumeNode:
-            return
-        # Only react to the slice view we are rendering for.
-        sw = slicer.app.layoutManager().sliceWidget(self.currentViewName)
-        if not sw or sw.mrmlSliceNode() is not caller:
-            return
-        try:
-            axis, sliceIndex = self.logic.getAxisAndSlice(self, volumeNode)
-        except Exception:
-            return
-        # Skip if the slice hasn't moved since the last render.
-        # When last_key is None (after a reset) we always proceed so the
-        # committed state is refreshed on the first scroll after a reset.
-        last_key = self.logic._last_render_key
-        if (last_key is not None
-                and last_key[2] == axis and last_key[3] == sliceIndex):
-            return
-        self._triggerRender()
+        if not isinstance(self._active_handler, PointHandler):
+            PointHandler().attach(self)
 
     def _onInteractionModeChanged(self, caller=None, event=None):
-        """Deactivate the brush when the user enters point-placement mode."""
-        if not self._stroke_handler:
+        """Activate point mode when Slicer enters placement mode for our nodes."""
+        if self.ctrl.is_paused:
             return
         interactionNode = caller
         if interactionNode.GetCurrentInteractionMode() != interactionNode.Place:
@@ -280,11 +236,13 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         selectionNode = slicer.app.applicationLogic().GetSelectionNode()
         posNode, negNode = self.logic.getPromptNodes(self._parameterNode)
         activePlaceID = selectionNode.GetActivePlaceNodeID()
-        if activePlaceID in (
+        if activePlaceID not in (
             posNode.GetID() if posNode else None,
             negNode.GetID() if negNode else None,
         ):
-            self._set_stroke_handler(None)
+            return
+        if not isinstance(self._active_handler, PointHandler):
+            PointHandler().attach(self)
 
     def _preloadSegmentEditor(self):
         """Silently initialize the Segment Editor module widget if not done yet.
@@ -348,6 +306,14 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         ui.brushDiameterSpinBox.connect('valueChanged(int)', self._onBrushDiameterSpinBoxChanged)
         ui.brushSphereCheckBox.connect('toggled(bool)', lambda _: self._applyBrushParams())
 
+        # Point placement widgets — activating either place widget must deactivate
+        # the active stroke handler.  Connected via Qt signal (not the VTK observer)
+        # so it fires immediately when the user clicks the place button.
+        ui.positivePrompts.activeMarkupsFiducialPlaceModeChanged.connect(
+            self._onPlaceModeChanged)
+        ui.negativePrompts.activeMarkupsFiducialPlaceModeChanged.connect(
+            self._onPlaceModeChanged)
+
     # -------------------------
     # Observers
     # -------------------------
@@ -384,65 +350,45 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def _onPointConfirmed(self, caller=None, event=None):
         """PointPositionDefinedEvent — a placement was just confirmed by the user.
 
-        At the moment this fires, the just-confirmed point is always the last
-        one (index n-1): Slicer raises PointPositionDefinedEvent before creating
-        the next placement cursor, so the new cursor's PointAddedEvent always
-        follows this one.
-
-        Push the confirmed point to the undo stack, then trigger a render so
-        the result is computed without waiting for the next event-loop tick.
+        Treats the point as a superpixel brush/erase stroke: runs the SPX model,
+        finds the label at the click position, and writes the selection directly
+        through SegmentTracker.write_slice() — the same single write path used
+        by BrushHandler and EraseHandler.  The resulting MaskChange is stored in
+        history immediately (no async timer needed).
         """
         if caller is None:
             return
 
         self._resolveActiveView()
         n = caller.GetNumberOfControlPoints()
-        if n > 0:
-            cp_id = caller.GetNthControlPointID(n - 1)
-            # Create the history entry now; fill the MaskChange after the render.
-            entry = ['point', None, caller, cp_id]
-            self._history.append(entry)
-            # Clear the logic's last-change staging area before triggering the
-            # render so we can detect whether the render produced a new change.
-            self.logic._last_change = None
-            # Render fires first; capture fires second (FIFO 0-ms timers).
-            qt.QTimer.singleShot(0, self._triggerRender)
-            qt.QTimer.singleShot(0, lambda: self._capturePointChange(entry))
-        else:
-            qt.QTimer.singleShot(0, self._triggerRender)
+        if n == 0:
+            return
+        cp_id = caller.GetNthControlPointID(n - 1)
+        change = self.logic.commit_point(self, caller, cp_id)
+        self._history.append(['point', change, caller, cp_id])
+        log.debug('[Widget] point confirmed — change=%s  history=%d',
+                  change is not None, len(self._history))
 
     def _onPointRemoved(self, caller=None, event=None):
-        """PointRemovedEvent — a prompt point was deleted.
+        """PointRemovedEvent — a prompt point was manually deleted.
 
-        The session's base_mask is unchanged; the next render recomputes from
-        base + remaining points and commits the correct result directly.
-
-        Guard: skip when paused (e.g. during clearPrompts or onUndo — the undo
-        path removes the markup point itself, pausing to suppress this handler,
-        then resets render state and triggers its own render explicitly).
+        Finds the removed point's history entry by comparing current cp_ids
+        against history, then reverses its MaskChange through the single write
+        path.  Paused during Ctrl+Z and clearPrompts (those paths handle their
+        own mask reversal explicitly).
         """
         if self.ctrl.is_paused:
             return
-        qt.QTimer.singleShot(0, self._triggerRender)
-
-    def _capturePointChange(self, entry):
-        """Fill the MaskChange field of a 'point' history entry after the render fires.
-
-        Scheduled as a 0-ms QTimer *after* the render timer queued in
-        _onPointConfirmed, so ``logic._last_change`` is already populated when
-        this runs (FIFO timer ordering within the same event-loop tick).
-        """
-        entry[1] = self.logic._last_change
-        log.debug('[Widget] point change captured: %s', entry[1] is not None)
-
-    def _triggerRender(self):
-        """Request a single immediate render via the controller.
-
-        Used when confirmed point placements, point removals, undos, and slice
-        scrolls need the display updated immediately.
-        Re-entrancy and pending-render bookkeeping are handled by ctrl.request_render.
-        """
-        self.ctrl.request_render()
+        current_ids = {caller.GetNthControlPointID(i)
+                       for i in range(caller.GetNumberOfControlPoints())}
+        for i in range(len(self._history) - 1, -1, -1):
+            entry = self._history[i]
+            if entry[0] == 'point' and entry[2] is caller and entry[3] not in current_ids:
+                change = entry[1]
+                del self._history[i]
+                if change is not None:
+                    self.logic.reverse_change(self, change)
+                return
 
     # -------------------------
     # Window / Level
@@ -550,10 +496,18 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                                 "1" if self.ui.brushSphereCheckBox.isChecked() else "0")
 
     def onBrushToggled(self, checked: bool):
-        self._set_stroke_handler(BrushHandler() if checked else None)
+        if checked:
+            BrushHandler().attach(self)
+        elif isinstance(self._active_handler, BrushHandler):
+            self._active_handler.detach(self)
+            PointHandler().attach(self)
 
     def onEraseToggled(self, checked: bool):
-        self._set_stroke_handler(EraseHandler() if checked else None)
+        if checked:
+            EraseHandler().attach(self)
+        elif isinstance(self._active_handler, EraseHandler):
+            self._active_handler.detach(self)
+            PointHandler().attach(self)
 
     def _onBrushDiameterSliderChanged(self, value):
         self.ui.brushDiameterSpinBox.blockSignals(True)
@@ -659,8 +613,12 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         posNode, negNode = self.logic.getPromptNodes(self._parameterNode)
         volumeNode, segNode = self.logic.getVolumeAndSegmentation(self._parameterNode)
 
-        self.ui.positivePrompts.setCurrentNode(posNode)
-        self.ui.negativePrompts.setCurrentNode(negNode)
+        self.ctrl.pause()
+        try:
+            self.ui.positivePrompts.setCurrentNode(posNode)
+            self.ui.negativePrompts.setCurrentNode(negNode)
+        finally:
+            self.ctrl.resume()
 
         self.ui.sourceVolumeSelector.setCurrentNode(volumeNode)
         self.ui.segmentationNodeSelector.setCurrentNode(segNode)
@@ -829,10 +787,6 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 editor.setCurrentSegmentID(segmentID)
                 self.ctrl.brush_in_progress = False
 
-        # The working mask and render key are segment-specific — switching
-        # segments must invalidate both so the next render reads fresh data.
-        self.logic.reset_render_state()
-
         # clearPrompts resets the prompt stack and preview IDs,
         # recreates fresh prompt nodes, and re-wires the markups widgets.
         self.ctrl.pause()
@@ -843,13 +797,13 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         segNode = self.ui.segmentSelector.currentNode()
         if segNode and segmentID:
             self._history.clear()
-            if self._stroke_handler:
-                self._stroke_handler.reset(self)
+            if isinstance(self._active_handler, StrokeHandler):
+                self._active_handler.reset(self)
 
     def clearPrompts(self):
         self._history.clear()
-        if self._stroke_handler:
-            self._stroke_handler.reset(self)
+        if isinstance(self._active_handler, StrokeHandler):
+            self._active_handler.reset(self)
 
         # Recreate fresh markup nodes (counter=0).  This is the structural
         # fix for "starts at Positive 2": fresh nodes have never had a point
@@ -884,13 +838,16 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         selectionNode.SetActivePlaceNodeID(posNode.GetID())
         selectionNode.SetActivePlaceNodeClassName(posNode.GetClassName())
         interactionNode.SwitchToPersistentPlaceMode()
+        # Placement mode is now active; register PointHandler directly without
+        # calling attach() (which would re-enter the mode switch we just did).
+        self._active_handler = PointHandler()
 
     def onUndo(self):
         log.debug('[Widget] Undo pressed — history depth %d', len(self._history))
 
         # Flush any in-flight stroke so it lands in history before we pop.
-        if self._stroke_handler:
-            self._stroke_handler.flush(self)
+        if isinstance(self._active_handler, StrokeHandler):
+            self._active_handler.flush(self)
 
         if not self._history:
             return
@@ -941,11 +898,6 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
             self.logic.reverse_change(self, change)
 
-        # Invalidate the render cache key so the next render recomputes,
-        # but preserve _session_base and _erase_acc.
-        self.logic.invalidate_render_key()
-
-        qt.QTimer.singleShot(0, self._triggerRender)
     # -------------------------
     # SPX Boundary Overlay  (Q)
     # -------------------------
@@ -1047,6 +999,20 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.showSPXBoundaryCheckBox.blockSignals(False)
 
     def onAddSegment(self, *args):
+        # Cache and detach the active stroke handler before creating the segment.
+        # clearPrompts() (triggered via onSegmentChanged → setCurrentSegmentID)
+        # sets _active_handler = PointHandler() directly without going through
+        # the detach lifecycle.  We flush + detach first so the handler is
+        # cleanly removed, then restore it in the finally block after creation.
+        prior_handler_class = (
+            type(self._active_handler)
+            if isinstance(self._active_handler, StrokeHandler)
+            else None
+        )
+        if self._active_handler is not None:
+            self._active_handler.detach(self)
+
+        segment_created = False
         self.ctrl.pause()
         try:
             segNode = self.getOrCreateSegmentationNode()
@@ -1063,13 +1029,15 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             segmentID = segmentation.AddEmptySegment(next_segment_name(existing))
 
             self.ui.segmentSelector.setCurrentSegmentID(segmentID)
+            segment_created = True
 
         finally:
             self.ctrl.resume()
+            if prior_handler_class is not None:
+                prior_handler_class().attach(self)
 
-        self._history.clear()
-        if self._stroke_handler:
-            self._stroke_handler.reset(self)
+        if segment_created:
+            self._history.clear()
 
     def onRemoveSegment(self, *args):
         self.ctrl.pause()
@@ -1088,8 +1056,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         
         if segNode and segmentID:
             self._history.clear()
-            if self._stroke_handler:
-                self._stroke_handler.reset(self)
+            if isinstance(self._active_handler, StrokeHandler):
+                self._active_handler.reset(self)
 
     def getOrCreateSegmentationNode(self):
         volumeNode = self.ui.sourceVolumeSelector.currentNode()
