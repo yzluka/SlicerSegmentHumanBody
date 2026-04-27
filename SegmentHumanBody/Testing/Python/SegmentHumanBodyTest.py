@@ -691,11 +691,15 @@ class AddSegmentHandlerTest(unittest.TestCase):
             def _apply_saved_segments_visibility(self, exclude=None):
                 from SegmentHumanBody import SegmentHumanBodyWidget
                 SegmentHumanBodyWidget._apply_saved_segments_visibility(self, exclude=exclude)
+            def _clear_history(self):
+                from SegmentHumanBody import SegmentHumanBodyWidget
+                SegmentHumanBodyWidget._clear_history(self)
 
         w = _W()
         w.ctrl                     = WidgetState(w)
         w._active_handler          = None
         w._history                 = []
+        w._redo_stack              = []
         w.logic                    = logic
         w._parameterNode           = paramNode
         w._spx_boundary_visible    = False
@@ -947,11 +951,15 @@ def _make_undo_test_widget(volNode, segNode, segID, paramNode, logic,
         def _apply_saved_segments_visibility(self, exclude=None):
             from SegmentHumanBody import SegmentHumanBodyWidget
             SegmentHumanBodyWidget._apply_saved_segments_visibility(self, exclude=exclude)
+        def _clear_history(self):
+            self._history.clear()
+            self._redo_stack.clear()
 
     w = _W()
     w.ctrl                     = WidgetState(w)
     w._active_handler          = None
     w._history                 = []
+    w._redo_stack              = []
     w.logic                    = logic
     w._parameterNode           = paramNode
     w.currentViewName          = "Red"

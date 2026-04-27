@@ -179,6 +179,16 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         tracker = self._get_tracker(seg, seg_id, vol)
         tracker.reverse_delta(change)
 
+    def forward_change(self, widget, change) -> None:
+        """Re-apply *change* to the tracker and push to Slicer (redo path)."""
+        if change is None:
+            return
+        vol, seg, seg_id = self._get_context(widget)
+        if not vol or not seg or not seg_id:
+            return
+        tracker = self._get_tracker(seg, seg_id, vol)
+        tracker.forward_delta(change)
+
     # -------------------------
     # Window / Level
     # -------------------------

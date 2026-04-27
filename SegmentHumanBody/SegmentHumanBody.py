@@ -58,13 +58,13 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.currentViewName = None
 
         # Undo history — each entry is a list:
-        #   ['brush',  change]               — Paint stroke
-        #   ['erase',  change]               — Erase stroke
-        #   ['expand', change]               — Expand operation
-        #   ['point',  change, node, cp_id]  — confirmed prompt control point
-        # change is a MaskChange or None.  Lists (not tuples) so the 'point'
-        # path can back-fill change after an async render completes.
-        self._history = []
+        #   ['brush',  change]                              — Paint stroke
+        #   ['erase',  change]                              — Erase stroke
+        #   ['expand', change]                              — Expand operation
+        #   ['point',  change, node, cp_id, ras, is_neg]   — confirmed prompt control point
+        # change is a MaskChange or None.
+        self._history    = []
+        self._redo_stack = []
 
         # Currently active input handler (BrushHandler / EraseHandler /
         # PointHandler), or None before setup completes.  Mutual exclusion is
@@ -73,6 +73,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         # Keyboard shortcuts — assigned in setup(), parented to the UI widget.
         self._undo_shortcut         = None
+        self._redo_shortcut         = None
         self._expand_shortcut       = None
         self._spx_boundary_shortcut = None
         self._segments_shortcut     = None
@@ -118,6 +119,9 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # while this panel is visible.
         self._undo_shortcut = qt.QShortcut(qt.QKeySequence("Ctrl+Z"), uiWidget)
         self._undo_shortcut.connect('activated()', self.onUndo)
+
+        self._redo_shortcut = qt.QShortcut(qt.QKeySequence("Ctrl+Shift+Z"), uiWidget)
+        self._redo_shortcut.connect('activated()', self.onRedo)
 
         self._expand_shortcut = qt.QShortcut(qt.QKeySequence("E"), uiWidget)
         self._expand_shortcut.connect('activated()', self._onExpandShortcut)
@@ -501,7 +505,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 prior_handler_class().attach(self)
 
         if segment_created:
-            self._history.clear()
+            self._clear_history()
 
     def onRemoveSegment(self, *args):
         self.ctrl.pause()
@@ -515,7 +519,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         finally:
             self.ctrl.resume()
         if segNode and segmentID:
-            self._history.clear()
+            self._clear_history()
             if isinstance(self._active_handler, StrokeHandler):
                 self._active_handler.reset(self)
 
@@ -534,7 +538,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.ctrl.resume()
         segNode = self.ui.segmentSelector.currentNode()
         if segNode and segmentID:
-            self._history.clear()
+            self._clear_history()
             if isinstance(self._active_handler, StrokeHandler):
                 self._active_handler.reset(self)
             # Apply saved-segment rule to all others; always show the new current.
@@ -548,7 +552,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.ui.showCurrentSegmentCheckBox.blockSignals(False)
 
     def clearPrompts(self):
-        self._history.clear()
+        self._clear_history()
         if isinstance(self._active_handler, StrokeHandler):
             self._active_handler.reset(self)
 
@@ -615,15 +619,21 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def _onPointConfirmed(self, caller=None, event=None):
         """PointPositionDefinedEvent — a placement was just confirmed by the user."""
-        if caller is None:
+        if caller is None or self.ctrl.is_paused:
             return
         self._resolveActiveView()
         n = caller.GetNumberOfControlPoints()
         if n == 0:
             return
-        cp_id  = caller.GetNthControlPointID(n - 1)
+        cp_id = caller.GetNthControlPointID(n - 1)
+        idx   = caller.GetControlPointIndexByID(cp_id)
+        ras   = [0.0, 0.0, 0.0]
+        caller.GetNthControlPointPositionWorld(idx, ras)
+        _, negNode  = self.logic.getPromptNodes(self._parameterNode)
+        is_negative = (caller is negNode)
         change = self.logic.commit_point(self, caller, cp_id)
-        self._history.append(['point', change, caller, cp_id])
+        self._redo_stack.clear()
+        self._history.append(['point', change, caller, cp_id, list(ras), is_negative])
         log.debug('[Widget] point confirmed — change=%s  history=%d',
                   change is not None, len(self._history))
 
@@ -778,6 +788,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._resolveActiveView()
         change = self.logic.on_expand(self)
         if change is not None:
+            self._redo_stack.clear()
             self._history.append(['expand', change])
 
     def _onExpandShortcut(self):
@@ -794,8 +805,14 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     # Undo  (Ctrl+Z)
     # -------------------------
 
+    def _clear_history(self):
+        """Clear both undo and redo stacks (segment switch, add, remove)."""
+        self._history.clear()
+        self._redo_stack.clear()
+
     def _add_history(self, entry):
         """Append *entry* to the undo history (called by input handlers)."""
+        self._redo_stack.clear()
         self._history.append(entry)
 
     def _resolveActiveView(self):
@@ -819,11 +836,14 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         if action_type in ('brush', 'erase', 'expand'):
             self.logic.reverse_change(self, entry[1])
+            self._redo_stack.append(entry)
 
         elif action_type == 'point':
-            _, change, node, cp_id = entry
-            _, negNode   = self.logic.getPromptNodes(self._parameterNode)
-            is_negative  = (node is negNode)
+            change      = entry[1]
+            node        = entry[2]
+            cp_id       = entry[3]
+            ras         = entry[4]
+            is_negative = entry[5]
 
             self.ctrl.pause()
             try:
@@ -851,6 +871,43 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 self.ctrl.resume()
 
             self.logic.reverse_change(self, change)
+            # Push to redo with the live node reference (the original may be
+            # stale if the node was just recreated above).
+            posNode, negNode = self.logic.getPromptNodes(self._parameterNode)
+            live_node = negNode if is_negative else posNode
+            self._redo_stack.append(['point', change, live_node, None, ras, is_negative])
+
+    def onRedo(self):
+        log.debug('[Widget] Redo pressed — redo stack depth %d', len(self._redo_stack))
+        if isinstance(self._active_handler, StrokeHandler):
+            self._active_handler.flush(self)
+        if not self._redo_stack:
+            return
+
+        entry       = self._redo_stack.pop()
+        action_type = entry[0]
+
+        if action_type in ('brush', 'erase', 'expand'):
+            self.logic.forward_change(self, entry[1])
+            self._history.append(entry)
+
+        elif action_type == 'point':
+            change      = entry[1]
+            ras         = entry[4]
+            is_negative = entry[5]
+
+            posNode, negNode = self.logic.getPromptNodes(self._parameterNode)
+            live_node = negNode if is_negative else posNode
+
+            self.ctrl.pause()
+            try:
+                new_idx   = live_node.AddControlPoint(vtk.vtkVector3d(ras[0], ras[1], ras[2]))
+                new_cp_id = live_node.GetNthControlPointID(new_idx)
+            finally:
+                self.ctrl.resume()
+
+            self.logic.forward_change(self, change)
+            self._history.append(['point', change, live_node, new_cp_id, ras, is_negative])
 
     # -------------------------
     # SPX Boundary Overlay  (Q)

@@ -196,3 +196,23 @@ class SegmentTracker:
         self._push_to_slicer()
         log.debug('[Tracker] reversed %s change axis=%d slice=%d key=%s',
                   change.source, change.axis, change.slice_idx, self._key)
+
+    def forward_delta(self, change: MaskChange):
+        """Re-apply *change* to ``_mask`` and push to Slicer (redo path).
+
+        Adds the stored delta back to the bounding-box sub-region —
+        the exact inverse of ``reverse_delta``.
+        """
+        mask    = self.get_mask()
+        current = get_slice_from_volume(mask, change.axis, change.slice_idx)
+
+        r_end = change.r_min + change.delta.shape[0]
+        c_end = change.c_min + change.delta.shape[1]
+
+        sub = current[change.r_min:r_end, change.c_min:c_end].astype(np.int16)
+        redone_sub = (sub + change.delta > 0).astype(np.uint8)
+        current[change.r_min:r_end, change.c_min:c_end] = redone_sub
+
+        self._push_to_slicer()
+        log.debug('[Tracker] re-applied %s change axis=%d slice=%d key=%s',
+                  change.source, change.axis, change.slice_idx, self._key)

@@ -1,46 +1,88 @@
 # Upcoming Sprint — TODO
 
-## TODO 1: Point ID drift when Ctrl+Z fires while point tool is active
+## TODO 1: Dependency checking with lazy evaluation and live cached results
 
-**Problem**  
-When the user presses Ctrl+Z while the point placement tool is active, the
-auto-cursor (the "Positive N" preview point) already exists in the node.
-`onUndo` removes the last *confirmed* control point and may recreate the node,
-but the interaction node / selection node state is not always re-synchronized
-after the recreation path, which can leave the widget tracking a stale control
-point ID for the active cursor.
+**Problem**
+The module has no mechanism to verify that required Python dependencies
+(e.g. `scikit-image`, `torch`, model weight files) are present before a
+model family is used.  Missing deps surface as cryptic import errors at
+inference time.
 
-**Expected behaviour**  
-After every point undo, the active placement cursor should reflect the correct
-next label (e.g. "Positive 2" → "Positive 1" after undoing the only confirmed
-point), and the widget's internal cp_id bookkeeping must stay consistent so that
-subsequent undos pop the right entry.
+**Design**
+- Each model family / model class declares its dependencies (packages,
+  files) via a class-level descriptor.
+- Checking is **lazy**: a dependency is only probed the first time it is
+  needed, not at module load.
+- The check result is **cached in process space** (module-level dict or
+  class attribute) so repeated calls are O(1) after the first probe.
+- The UI surfaces a human-readable message ("Missing: torch≥2.0") rather
+  than a raw traceback when a dep is absent.
 
-**Where to look**  
-- `SegmentHumanBody.py` → `onUndo` (point branch, node-recreation path)  
-- `SegmentHumanBody.py` → `_onPointConfirmed` (how cp_id is captured)  
-- `core/_logic.py` → `recreate_prompt_node` (interaction node re-wiring)
+**Where to look**
+- `core/modelFamilies.py` → `BaseModelFamily`, `confirm_model`
+- `core/modelRegistry.py` → factory lookup (good place to probe before
+  instantiating)
+- `SegmentHumanBody.py` → `onConfirmClicked` (display the dep error)
 
 ---
 
-## TODO 2: Redo functionality (Ctrl+Shift+Z)
+## TODO 2: "Tab" key creates a new segment
 
-**Design sketch**  
-- Maintain a `_redo_stack` list alongside `_history`.
-- On every **undo**: pop from `_history`, apply the reverse, push the entry
-  onto `_redo_stack`.
-- On every **redo** (Ctrl+Shift+Z): pop from `_redo_stack`, re-apply the
-  forward change (via `tracker.write_slice` and re-place the control point if applicable),
-  push the entry back onto `_history`.
-- Any new user modification (brush stroke, erase stroke, expand, point
-  confirmed) **clears `_redo_stack`** so the linear history invariant holds.
+**Problem**
+Adding a new segment requires clicking the "Add Segment" button.  A
+keyboard shortcut would speed up the annotation workflow.
 
-**Scope**  
-All four history entry types must be redoable: `brush`, `erase`, `expand`,
-`point`.  Point redo needs to re-add the control point to the markup node
-(and re-trigger the render) as well as re-apply the stored `MaskChange`.
+**Design**
+- Register a `QShortcut` for `Tab` in `setup()`, parented to `uiWidget`
+  (same pattern as `Ctrl+Z`, `E`, `Q`, `V`).
+- The handler simply calls `self.onAddSegment()`.
+- Ensure the shortcut does not fire while a text field (e.g.
+  `paramTextEdit`) has focus — Qt's default shortcut context
+  (`Qt::WindowShortcut`) already handles this for most widgets; verify
+  with `brushDiameterSpinBox` and `paramTextEdit`.
 
-**Where to look**  
-- `SegmentHumanBody.py` → `onUndo`, `_add_history`, keyboard shortcut setup  
-- `core/_tracker.py` → `write_slice` (already the forward write path)  
-- `core/_logic.py` → `reverse_change` (inverse; redo needs the forward version)
+**Where to look**
+- `SegmentHumanBody.py` → `setup()` (shortcut registration block)
+- `SegmentHumanBody.py` → `onAddSegment` (the target handler)
+
+---
+
+## TODO 3: Annotation log model family
+
+**Goal**
+A new model family that records, for each segment, every prompt point
+the user places — along with a wall-clock timestamp — and can export the
+full log as a structured list.
+
+**Export format**
+```python
+[
+    {
+        "segment_id": str,
+        "coord_ras": [x, y, z],   # 3-D world (RAS) coordinates
+        "timestamp": str,          # ISO-8601, e.g. "2026-04-27T14:32:05.123"
+    },
+    ...
+]
+```
+
+**Design**
+- Subclass `BaseModelFamily` in `core/modelFamilies.py`; add to
+  `FAMILY_REGISTRY`.
+- The family maintains an in-memory log list.  Each entry is appended in
+  `_onPointConfirmed` (or a family-specific hook) with
+  `datetime.now().isoformat()`.
+- The markup nodes that back the log **must not be deleted** when the user
+  switches segments or calls `clearPrompts` — either store them outside
+  the parameter-node reference slots or mark them as persistent.
+- Expose an **Export** button (add its widget name to `VISIBLE_BUTTONS`)
+  that writes the log to a user-chosen JSON or CSV file via
+  `qt.QFileDialog`.
+- Undo (`Ctrl+Z`) of a point must also remove the corresponding log entry
+  (scan by `cp_id`).
+
+**Where to look**
+- `core/modelFamilies.py` → `BaseModelFamily`, `FAMILY_REGISTRY`
+- `SegmentHumanBody.py` → `_onPointConfirmed`, `onUndo` (point branch),
+  `clearPrompts` (must not wipe log nodes)
+- `SegmentHumanBody.ui` → add Export button widget
