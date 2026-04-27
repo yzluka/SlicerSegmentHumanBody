@@ -14,6 +14,12 @@ These tests require a live Slicer process and exercise:
   - Point placement workflow: _onPointConfirmed, positive/negative SPX selection, undo.
   - Manual point deletion: _onPointRemoved reverses the mask without Ctrl+Z.
   - Mixed-action undo: brush + point in one session, LIFO across action types.
+  - Segment visibility: onToggleCurrentSegment (V), onToggleSavedSegments (checkbox),
+    _apply_saved_segments_visibility isolation, multi-segment scenarios.
+  - Window / Level: apply_window_level clipping and normalization, logic integration,
+    W/L applied to model input before point placement and expansion.
+  - CT-like workflow: brush delta on realistic intensity data, expandSegWithSPX on
+    a real intensity gradient, multi-segment brush-then-undo across two segments.
 """
 
 import unittest
@@ -28,6 +34,15 @@ import slicer
 # ---------------------------------------------------------------------------
 
 _K, _J, _I = 12, 15, 18   # volume shape used by all test classes
+
+# True when running inside full Slicer GUI; False in --no-main-window / headless mode.
+# Tests that require a live slice widget (layout manager + slice views) are skipped
+# when this is False.
+_HAS_LAYOUT_MANAGER = slicer.app.layoutManager() is not None
+_SKIP_LAYOUT = unittest.skipUnless(
+    _HAS_LAYOUT_MANAGER,
+    "requires Slicer layout manager (run with full GUI, not --no-main-window)"
+)
 
 
 def _make_volume():
@@ -71,15 +86,8 @@ def _mock_widget(volumeNode, segNode, segmentID, paramNode=None):
     return w
 
 
-def _mock_expand_widget(logic, volumeNode, segNode, segmentID, axis, slice_index):
-    """Minimal widget stub kept for tests in SegmentHumanBodyLogicTest that
-    still pass the widget to helper methods.  No longer used for expandSegWithSPX
-    itself (that method no longer takes a widget argument)."""
-    return _mock_widget(volumeNode, segNode, segmentID)
-
-
 # ===========================================================================
-# applyResult tests
+# SegmentHumanBodyLogic tests
 # ===========================================================================
 
 class SegmentHumanBodyLogicTest(unittest.TestCase):
@@ -89,54 +97,26 @@ class SegmentHumanBodyLogicTest(unittest.TestCase):
         slicer.mrmlScene.Clear()
         self._logic = _make_logic()
 
-    def test_apply_result_auto_creates_segment(self):
-        """applyResult auto-creates a segment when the segmentation is empty."""
-        volumeNode = _make_volume()
-        segNode, _ = _make_seg(volumeNode, with_segment=False)
-        paramNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLScriptedModuleNode')
-        self._logic.setVolumeAndSegmentation(paramNode, volumeNode, segNode)
-
-        widget = _mock_widget(volumeNode, segNode, segmentID=None, paramNode=paramNode)
-        mask2d = np.ones((_J, _I), dtype=np.uint8)
-        self._logic.applyResult(widget, mask2d, axis=0, sliceIndex=5)
-
-        self.assertEqual(segNode.GetSegmentation().GetNumberOfSegments(), 1)
-
-    def test_apply_result_writes_correct_axial_slice(self):
+    def test_logic_reuses_tracker_for_same_segment(self):
+        """Logic caches the tracker between consecutive operations on the same
+        segment; a new instance is only created when segment or volume changes."""
         volumeNode = _make_volume()
         segNode, segmentID = _make_seg(volumeNode, with_segment=True)
-        widget = _mock_widget(volumeNode, segNode, segmentID)
 
-        mask2d = np.ones((_J, _I), dtype=np.uint8)
-        target = 4
-        self._logic.applyResult(widget, mask2d, axis=0, sliceIndex=target)
+        labels = np.ones((_J, _I), dtype=np.int32)
+        seed = np.zeros((_K, _J, _I), dtype=np.uint8)
+        seed[2, 0, 0] = 1
+        seed[4, 0, 0] = 1
+        _write_lm(segNode, segmentID, volumeNode, seed)
 
-        result = _read_lm(segNode, segmentID, volumeNode)
-        np.testing.assert_array_equal(result[target], 1)
-        np.testing.assert_array_equal(result[:target], 0)
-        np.testing.assert_array_equal(result[target + 1:], 0)
-
-    def test_apply_result_reuses_tracker_across_frames(self):
-        """write_slice reuses the same tracker object across consecutive frames."""
-        volumeNode = _make_volume()
-        segNode, segmentID = _make_seg(volumeNode, with_segment=True)
-        widget = _mock_widget(volumeNode, segNode, segmentID)
-
-        mask_a = np.ones((_J, _I), dtype=np.uint8)
-        mask_b = np.zeros((_J, _I), dtype=np.uint8)
-        mask_b[:, :_I // 2] = 1
-
-        self._logic.applyResult(widget, mask_a, axis=0, sliceIndex=2)
+        self._logic.expandSegWithSPX(segNode, segmentID, volumeNode,
+                                     labels, axis=0, sliceIndex=2)
         tracker_id = id(self._logic._tracker)
 
-        self._logic.applyResult(widget, mask_b, axis=0, sliceIndex=3)
+        self._logic.expandSegWithSPX(segNode, segmentID, volumeNode,
+                                     labels, axis=0, sliceIndex=4)
         self.assertEqual(id(self._logic._tracker), tracker_id,
-                         "Tracker must be reused across frames for the same segment")
-
-        result = _read_lm(segNode, segmentID, volumeNode)
-        np.testing.assert_array_equal(result[2], 1)
-        np.testing.assert_array_equal(result[3, :, :_I // 2], 1)
-        np.testing.assert_array_equal(result[3, :, _I // 2:], 0)
+                         "Tracker must be reused across calls for the same segment")
 
     # ---- expandSegWithSPX ----
 
@@ -219,6 +199,7 @@ class SegmentHumanBodyLogicTest(unittest.TestCase):
 
     # ---- getAxisAndSlice ----
 
+    @_SKIP_LAYOUT
     def test_get_axis_and_slice_uses_volume_geometry(self):
         import vtk
         slicer.app.layoutManager().setLayout(
@@ -310,8 +291,8 @@ class TrackerUndoTest(unittest.TestCase):
         _write_lm(segNode, segmentID, volumeNode, initial)
 
         tracker = _make_tracker(segNode, segmentID, volumeNode)
-        ones = np.ones((_J, _I), dtype=np.uint8)
-        change = tracker.write_slice(axis=0, idx=3, new_data=ones, source='test')
+        zeros = np.zeros((_J, _I), dtype=np.uint8)
+        change = tracker.write_slice(axis=0, idx=3, new_data=zeros, source='test')
         tracker.reverse_delta(change)
 
         result = _read_lm(segNode, segmentID, volumeNode)
@@ -438,6 +419,11 @@ class UnifiedHistoryTest(unittest.TestCase):
         segNode, segmentID = _make_seg(volumeNode, with_segment=True)
         labels = np.ones((_J, _I), dtype=np.int32)
 
+        # Seed one painted pixel so expand selects label 1 and produces a real change.
+        seed = np.zeros((_K, _J, _I), dtype=np.uint8)
+        seed[3, 0, 0] = 1
+        _write_lm(segNode, segmentID, volumeNode, seed)
+
         change = self._logic.expandSegWithSPX(segNode, segmentID, volumeNode,
                                               labels, axis=0, sliceIndex=3)
 
@@ -465,7 +451,6 @@ class UnifiedHistoryTest(unittest.TestCase):
         # Undo via reverse_change.
         widget = _mock_widget(volumeNode, segNode, segmentID)
         self._logic.reverse_change(widget, change)
-        self._logic.reset_render_state()
 
         restored = _read_lm(segNode, segmentID, volumeNode)
         np.testing.assert_array_equal(restored[3, :, :_I // 2], 1,
@@ -504,6 +489,12 @@ class UnifiedHistoryTest(unittest.TestCase):
 
         labels = np.ones((_J, _I), dtype=np.int32)
 
+        # Seed one pixel per slice so each expand selects label 1 and produces a change.
+        seed = np.zeros((_K, _J, _I), dtype=np.uint8)
+        seed[2, 0, 0] = 1
+        seed[4, 0, 0] = 1
+        _write_lm(segNode, segmentID, volumeNode, seed)
+
         change_2 = self._logic.expandSegWithSPX(segNode, segmentID, volumeNode,
                                                 labels, axis=0, sliceIndex=2)
         change_4 = self._logic.expandSegWithSPX(segNode, segmentID, volumeNode,
@@ -514,15 +505,18 @@ class UnifiedHistoryTest(unittest.TestCase):
         self.assertEqual(change_2.slice_idx, 2, "First change must be slice 2")
         self.assertEqual(change_4.slice_idx, 4, "Second change must be slice 4")
 
-        # Undo only slice 4 (LIFO) — slice 2 must remain painted.
+        # Undo only slice 4 (LIFO) — slice 2 must remain fully painted.
         widget = _mock_widget(volumeNode, segNode, segmentID)
         self._logic.reverse_change(widget, change_4)
 
         result = _read_lm(segNode, segmentID, volumeNode)
         np.testing.assert_array_equal(result[2], 1,
                                       err_msg="slice 2 must remain after undoing slice 4")
-        np.testing.assert_array_equal(result[4], 0,
-                                      err_msg="slice 4 must be cleared by undo")
+        # Undo restores slice 4 to its pre-expand state: the single seed pixel at (0,0).
+        expected_4 = np.zeros((_J, _I), dtype=np.uint8)
+        expected_4[0, 0] = 1
+        np.testing.assert_array_equal(result[4], expected_4,
+                                      err_msg="slice 4 must be restored to pre-expand state")
 
     # ---- history entry format ----
 
@@ -685,19 +679,29 @@ class AddSegmentHandlerTest(unittest.TestCase):
         segNode   = self._segNode
 
         class _W:
-            def _segEditor(self):          return None
-            def _observeMarkupsNodes(self): pass
-            def _applyBrushParams(self):    pass
+            def _segEditor(self):              return None
+            def _observeMarkupsNodes(self):    pass
+            def _applyBrushParams(self):       pass
             def _get_composite_node(self, *a): return None
+            def getOrCreateSegmentationNode(self):
+                return self.ui.segmentationNodeSelector.currentNode()
+            def clearPrompts(self):
+                from SegmentHumanBody import SegmentHumanBodyWidget
+                SegmentHumanBodyWidget.clearPrompts(self)
+            def _apply_saved_segments_visibility(self, exclude=None):
+                from SegmentHumanBody import SegmentHumanBodyWidget
+                SegmentHumanBodyWidget._apply_saved_segments_visibility(self, exclude=exclude)
 
         w = _W()
-        w.ctrl             = WidgetState(w)
-        w._active_handler  = None
-        w._history         = []
-        w.logic            = logic
-        w._parameterNode   = paramNode
-        w._spx_boundary_visible = False
-        w._spx_boundary_node    = None
+        w.ctrl                     = WidgetState(w)
+        w._active_handler          = None
+        w._history                 = []
+        w.logic                    = logic
+        w._parameterNode           = paramNode
+        w._spx_boundary_visible    = False
+        w._spx_boundary_node       = None
+        w._saved_segments_visible  = False
+        w._current_segment_visible = True
 
         w.ui = MagicMock()
         w.ui.sourceVolumeSelector.currentNode.return_value      = volNode
@@ -845,8 +849,15 @@ class AddSegmentHandlerTest(unittest.TestCase):
 
         original_activate = BrushHandler._activate_effect
 
+        _called = [False]
         def _hijack_activate(self_h, widget):
             # Simulate: Paint activated on 0-segment segmentation → onAddSegment.
+            # One-shot guard: the restore path inside onAddSegment creates a fresh
+            # BrushHandler and calls attach() on it, which would re-enter here and
+            # recurse infinitely without this check.
+            if _called[0]:
+                return
+            _called[0] = True
             SegmentHumanBodyWidget.onAddSegment(widget)
 
         BrushHandler._activate_effect = _hijack_activate
@@ -928,24 +939,35 @@ def _make_undo_test_widget(volNode, segNode, segID, paramNode, logic,
         def _get_composite_node(self, *a): return None
         def _resolveActiveView(self):      pass
         def getUserParameters(self):       return {}
+        def getOrCreateSegmentationNode(self):
+            return self.ui.segmentationNodeSelector.currentNode()
+        def clearPrompts(self):
+            from SegmentHumanBody import SegmentHumanBodyWidget
+            SegmentHumanBodyWidget.clearPrompts(self)
+        def _apply_saved_segments_visibility(self, exclude=None):
+            from SegmentHumanBody import SegmentHumanBodyWidget
+            SegmentHumanBodyWidget._apply_saved_segments_visibility(self, exclude=exclude)
 
     w = _W()
-    w.ctrl                  = WidgetState(w)
-    w._active_handler       = None
-    w._history              = []
-    w.logic                 = logic
-    w._parameterNode        = paramNode
-    w.currentViewName       = "Red"
-    w.modelFamily           = modelFamily
-    w._spx_boundary_visible = False
-    w._spx_boundary_node    = None
+    w.ctrl                     = WidgetState(w)
+    w._active_handler          = None
+    w._history                 = []
+    w.logic                    = logic
+    w._parameterNode           = paramNode
+    w.currentViewName          = "Red"
+    w.modelFamily              = modelFamily
+    w._spx_boundary_visible    = False
+    w._spx_boundary_node       = None
+    w._saved_segments_visible  = False
+    w._current_segment_visible = True
 
     w.ui = MagicMock()
-    w.ui.sourceVolumeSelector.currentNode.return_value     = volNode
-    w.ui.segmentSelector.currentNode.return_value          = segNode
-    w.ui.segmentSelector.currentSegmentID.return_value     = segID
-    w.ui.brushToolButton.isChecked.return_value            = False
-    w.ui.eraseToolButton.isChecked.return_value            = False
+    w.ui.sourceVolumeSelector.currentNode.return_value        = volNode
+    w.ui.segmentationNodeSelector.currentNode.return_value    = segNode
+    w.ui.segmentSelector.currentNode.return_value             = segNode
+    w.ui.segmentSelector.currentSegmentID.return_value        = segID
+    w.ui.brushToolButton.isChecked.return_value               = False
+    w.ui.eraseToolButton.isChecked.return_value               = False
 
     def _on_set_segment(sid):
         SegmentHumanBodyWidget.onSegmentChanged(w, sid)
@@ -1151,6 +1173,7 @@ class BrushStrokeUndoTest(unittest.TestCase):
 # Point placement (positive and negative prompts) and undo
 # ===========================================================================
 
+@_SKIP_LAYOUT
 class PointPlacementUndoTest(unittest.TestCase):
     """Simulates clicking positive or negative prompt points on a slice and
     undoing them via Ctrl+Z.
@@ -1197,7 +1220,7 @@ class PointPlacementUndoTest(unittest.TestCase):
         w = self._w()
         posNode, _ = self._logic.getPromptNodes(self._pNode)
         ras_pt = _ijk_to_ras_pt(self._ijkToRAS, col, row, self._TARGET_K)
-        posNode.AddControlPointWorldCoordinates(ras_pt)
+        posNode.AddControlPoint(ras_pt)
         SegmentHumanBodyWidget._onPointConfirmed(w, posNode)
         return w, posNode
 
@@ -1235,7 +1258,7 @@ class PointPlacementUndoTest(unittest.TestCase):
         w = self._w()
         _, negNode = self._logic.getPromptNodes(self._pNode)
         ras_pt = _ijk_to_ras_pt(self._ijkToRAS, 4, 3, self._TARGET_K)
-        negNode.AddControlPointWorldCoordinates(ras_pt)
+        negNode.AddControlPoint(ras_pt)
         SegmentHumanBodyWidget._onPointConfirmed(w, negNode)
 
         result = _read_lm(self._segNode, self._segID, self._volNode)
@@ -1280,12 +1303,12 @@ class PointPlacementUndoTest(unittest.TestCase):
 
         # Point A — left half.
         ras_a = _ijk_to_ras_pt(self._ijkToRAS, 4, 3, self._TARGET_K)
-        posNode.AddControlPointWorldCoordinates(ras_a)
+        posNode.AddControlPoint(ras_a)
         SegmentHumanBodyWidget._onPointConfirmed(w, posNode)
 
         # Point B — right half (unions with the existing left-half paint).
         ras_b = _ijk_to_ras_pt(self._ijkToRAS, 11, 3, self._TARGET_K)
-        posNode.AddControlPointWorldCoordinates(ras_b)
+        posNode.AddControlPoint(ras_b)
         SegmentHumanBodyWidget._onPointConfirmed(w, posNode)
 
         after_both = _read_lm(self._segNode, self._segID, self._volNode)
@@ -1316,7 +1339,7 @@ class PointPlacementUndoTest(unittest.TestCase):
 
         # Place the point at K=9 (different from _TARGET_K=5).
         ras_pt = _ijk_to_ras_pt(self._ijkToRAS, 4, 3, 9)
-        posNode.AddControlPointWorldCoordinates(ras_pt)
+        posNode.AddControlPoint(ras_pt)
         SegmentHumanBodyWidget._onPointConfirmed(w, posNode)
 
         result = _read_lm(self._segNode, self._segID, self._volNode)
@@ -1334,6 +1357,7 @@ class PointPlacementUndoTest(unittest.TestCase):
 # Manual point deletion (_onPointRemoved)
 # ===========================================================================
 
+@_SKIP_LAYOUT
 class ManualPointDeletionTest(unittest.TestCase):
     """Simulates the user placing a prompt point then deleting it directly
     through the Markups module or the control-point list — without using Ctrl+Z.
@@ -1376,7 +1400,7 @@ class ManualPointDeletionTest(unittest.TestCase):
         from SegmentHumanBody import SegmentHumanBodyWidget
         posNode, _ = self._logic.getPromptNodes(self._pNode)
         ras_pt = _ijk_to_ras_pt(self._ijkToRAS, col, row, self._TARGET_K)
-        posNode.AddControlPointWorldCoordinates(ras_pt)
+        posNode.AddControlPoint(ras_pt)
         SegmentHumanBodyWidget._onPointConfirmed(w, posNode)
         cp_id = posNode.GetNthControlPointID(posNode.GetNumberOfControlPoints() - 1)
         return posNode, cp_id
@@ -1456,6 +1480,7 @@ class ManualPointDeletionTest(unittest.TestCase):
 # Mixed-action undo (brush + point + expand in one session)
 # ===========================================================================
 
+@_SKIP_LAYOUT
 class MixedActionUndoTest(unittest.TestCase):
     """Simulates a realistic annotation session that combines brush strokes
     and point placements, then undoes them in LIFO order.
@@ -1511,7 +1536,7 @@ class MixedActionUndoTest(unittest.TestCase):
         _setup_red_slice_at_k(self._volNode, k)
         posNode, _ = self._logic.getPromptNodes(self._pNode)
         ras_pt = _ijk_to_ras_pt(self._ijkToRAS, col, row, k)
-        posNode.AddControlPointWorldCoordinates(ras_pt)
+        posNode.AddControlPoint(ras_pt)
         SegmentHumanBodyWidget._onPointConfirmed(w, posNode)
         return posNode
 
@@ -1589,3 +1614,667 @@ class MixedActionUndoTest(unittest.TestCase):
             "Point placement on slice 5 must survive the first undo")
         np.testing.assert_array_equal(result[self._BRUSH_K], 0,
             "Brush stroke on slice 4 must be undone by the first Ctrl+Z")
+
+
+# ===========================================================================
+# CT-like synthetic volume helper (shared by the new workflow tests)
+# ===========================================================================
+
+def _make_ct_volume():
+    """Synthetic CT-like volume with a soft-tissue background and a bright
+    bone-like stripe, plus mild noise so SPX algorithms find real gradients.
+
+    Shape is (_K, _J, _I) matching all other helpers in this file.
+    Intensities are in Hounsfield-unit range: soft tissue ≈ −200 HU,
+    bone stripe ≈ +400 HU.
+    """
+    arr = np.full((_K, _J, _I), -200, dtype=np.int16)
+    # Central third → bright 'bone' region.
+    arr[:, _J // 3: 2 * _J // 3, :] = 400
+    # Mild noise so SLIC / Felzenszwalb find meaningful edges.
+    rng = np.random.default_rng(0)
+    noise = rng.integers(-20, 20, arr.shape, dtype=np.int16)
+    arr = np.clip(arr.astype(np.int32) + noise, -32768, 32767).astype(np.int16)
+    return slicer.util.addVolumeFromArray(arr)
+
+
+# ===========================================================================
+# Segment visibility (two-checkbox system)
+# ===========================================================================
+
+class SegmentVisibilityTest(unittest.TestCase):
+    """Tests for the two-checkbox segment visibility system.
+
+    showCurrentSegmentCheckBox / V hotkey — controls the segment being edited.
+    showSegmentsCheckBox                  — controls all other (saved) segments.
+
+    Each test uses a real vtkMRMLSegmentationNode with a real display node so
+    that SetSegmentVisibility / GetSegmentVisibility reflect actual MRML state.
+    """
+
+    def setUp(self):
+        slicer.mrmlScene.Clear()
+        self._volNode = _make_volume()
+        self._segNode, _ = _make_seg(self._volNode)
+        seg = self._segNode.GetSegmentation()
+        self._segID_A = seg.AddEmptySegment('SegA')
+        self._segID_B = seg.AddEmptySegment('SegB')
+
+    def tearDown(self):
+        slicer.mrmlScene.Clear()
+
+    def _w(self, current_id=None):
+        from core._state import WidgetState
+
+        class _W:
+            def _apply_saved_segments_visibility(self, exclude=None):
+                from SegmentHumanBody import SegmentHumanBodyWidget
+                SegmentHumanBodyWidget._apply_saved_segments_visibility(self, exclude=exclude)
+
+        w = _W()
+        w.ctrl = WidgetState(w)
+        w._saved_segments_visible  = False
+        w._current_segment_visible = True
+        w.ui = MagicMock()
+        w.ui.segmentationNodeSelector.currentNode.return_value = self._segNode
+        w.ui.segmentSelector.currentSegmentID.return_value = (
+            current_id if current_id is not None else self._segID_A
+        )
+        return w
+
+    # -- onToggleCurrentSegment --
+
+    def test_toggle_current_hides_current_segment(self):
+        """visible=False hides only the current segment and updates state."""
+        from SegmentHumanBody import SegmentHumanBodyWidget
+        w = self._w(self._segID_A)
+        SegmentHumanBodyWidget.onToggleCurrentSegment(w, visible=False)
+        dn = self._segNode.GetDisplayNode()
+        self.assertFalse(dn.GetSegmentVisibility(self._segID_A))
+        self.assertFalse(w._current_segment_visible)
+
+    def test_toggle_current_shows_current_segment(self):
+        """visible=True shows a previously hidden current segment."""
+        from SegmentHumanBody import SegmentHumanBodyWidget
+        w = self._w(self._segID_A)
+        w._current_segment_visible = False
+        dn = self._segNode.GetDisplayNode()
+        dn.SetSegmentVisibility(self._segID_A, False)
+        SegmentHumanBodyWidget.onToggleCurrentSegment(w, visible=True)
+        self.assertTrue(dn.GetSegmentVisibility(self._segID_A))
+        self.assertTrue(w._current_segment_visible)
+
+    def test_toggle_current_flips_on_each_call(self):
+        """visible=None (V hotkey path) alternates between hidden and shown."""
+        from SegmentHumanBody import SegmentHumanBodyWidget
+        w = self._w(self._segID_A)
+        dn = self._segNode.GetDisplayNode()
+        SegmentHumanBodyWidget.onToggleCurrentSegment(w)   # flip → hidden
+        self.assertFalse(dn.GetSegmentVisibility(self._segID_A))
+        SegmentHumanBodyWidget.onToggleCurrentSegment(w)   # flip → shown
+        self.assertTrue(dn.GetSegmentVisibility(self._segID_A))
+
+    def test_toggle_current_does_not_affect_other_segments(self):
+        """Hiding SegA must leave SegB's display state untouched."""
+        from SegmentHumanBody import SegmentHumanBodyWidget
+        w = self._w(self._segID_A)
+        dn = self._segNode.GetDisplayNode()
+        dn.SetSegmentVisibility(self._segID_B, True)
+        SegmentHumanBodyWidget.onToggleCurrentSegment(w, visible=False)
+        self.assertTrue(dn.GetSegmentVisibility(self._segID_B),
+            "SegB visibility must not change when the current (SegA) is toggled")
+
+    def test_toggle_current_no_segnode_is_graceful(self):
+        """onToggleCurrentSegment must not raise when no segmentation is selected."""
+        from core._state import WidgetState
+
+        class _W:
+            pass
+
+        w = _W()
+        w.ctrl = WidgetState(w)
+        w._saved_segments_visible  = False
+        w._current_segment_visible = True
+        w.ui = MagicMock()
+        w.ui.segmentationNodeSelector.currentNode.return_value = None
+        w.ui.segmentSelector.currentSegmentID.return_value = ''
+        from SegmentHumanBody import SegmentHumanBodyWidget
+        try:
+            SegmentHumanBodyWidget.onToggleCurrentSegment(w)
+        except Exception as exc:
+            self.fail(f"onToggleCurrentSegment raised {exc} with no segmentation node")
+
+    # -- onToggleSavedSegments --
+
+    def test_toggle_saved_hides_all_except_current(self):
+        """Unchecking saved-segments must hide SegB but not SegA (current)."""
+        from SegmentHumanBody import SegmentHumanBodyWidget
+        w = self._w(self._segID_A)
+        w._saved_segments_visible = True
+        dn = self._segNode.GetDisplayNode()
+        dn.SetSegmentVisibility(self._segID_A, True)
+        dn.SetSegmentVisibility(self._segID_B, True)
+        SegmentHumanBodyWidget.onToggleSavedSegments(w, visible=False)
+        self.assertFalse(dn.GetSegmentVisibility(self._segID_B),
+            "SegB must be hidden after unchecking saved-segments")
+        self.assertTrue(dn.GetSegmentVisibility(self._segID_A),
+            "Current segment (SegA) must not be hidden by saved-segments toggle")
+
+    def test_toggle_saved_shows_all_except_current(self):
+        """Checking saved-segments must reveal SegB; SegA state is unchanged."""
+        from SegmentHumanBody import SegmentHumanBodyWidget
+        w = self._w(self._segID_A)
+        dn = self._segNode.GetDisplayNode()
+        dn.SetSegmentVisibility(self._segID_B, False)
+        SegmentHumanBodyWidget.onToggleSavedSegments(w, visible=True)
+        self.assertTrue(dn.GetSegmentVisibility(self._segID_B),
+            "SegB must become visible after checking saved-segments")
+
+    def test_toggle_saved_flips_on_each_call(self):
+        """visible=None alternates the saved-segment state and applies it."""
+        from SegmentHumanBody import SegmentHumanBodyWidget
+        w = self._w(self._segID_A)
+        w._saved_segments_visible = True
+        dn = self._segNode.GetDisplayNode()
+        dn.SetSegmentVisibility(self._segID_B, True)
+        SegmentHumanBodyWidget.onToggleSavedSegments(w)    # flip → hidden
+        self.assertFalse(dn.GetSegmentVisibility(self._segID_B))
+        self.assertFalse(w._saved_segments_visible)
+        SegmentHumanBodyWidget.onToggleSavedSegments(w)    # flip → shown
+        self.assertTrue(dn.GetSegmentVisibility(self._segID_B))
+        self.assertTrue(w._saved_segments_visible)
+
+    def test_three_segments_saved_hides_both_non_current(self):
+        """With three segments, toggle saved must hide B and C but not A (current)."""
+        from SegmentHumanBody import SegmentHumanBodyWidget
+        seg = self._segNode.GetSegmentation()
+        segID_C = seg.AddEmptySegment('SegC')
+        w = self._w(self._segID_A)
+        w._saved_segments_visible = True
+        dn = self._segNode.GetDisplayNode()
+        for sid in [self._segID_A, self._segID_B, segID_C]:
+            dn.SetSegmentVisibility(sid, True)
+        SegmentHumanBodyWidget.onToggleSavedSegments(w, visible=False)
+        self.assertFalse(dn.GetSegmentVisibility(self._segID_B), "SegB must be hidden")
+        self.assertFalse(dn.GetSegmentVisibility(segID_C),       "SegC must be hidden")
+        self.assertTrue(dn.GetSegmentVisibility(self._segID_A),  "SegA must stay visible")
+
+    # -- _apply_saved_segments_visibility --
+
+    def test_apply_saved_excludes_current_touches_others(self):
+        """_apply_saved(exclude=SegA) must set SegB to _saved_segments_visible
+        while leaving SegA's state untouched."""
+        from SegmentHumanBody import SegmentHumanBodyWidget
+        w = self._w(self._segID_A)
+        w._saved_segments_visible = False
+        dn = self._segNode.GetDisplayNode()
+        dn.SetSegmentVisibility(self._segID_A, True)
+        dn.SetSegmentVisibility(self._segID_B, True)
+        SegmentHumanBodyWidget._apply_saved_segments_visibility(w, exclude=self._segID_A)
+        self.assertFalse(dn.GetSegmentVisibility(self._segID_B))
+        self.assertTrue(dn.GetSegmentVisibility(self._segID_A))
+
+    def test_apply_saved_no_exclude_affects_all_segments(self):
+        """_apply_saved(exclude=None) applies to every segment including SegA."""
+        from SegmentHumanBody import SegmentHumanBodyWidget
+        w = self._w(self._segID_A)
+        w._saved_segments_visible = False
+        dn = self._segNode.GetDisplayNode()
+        dn.SetSegmentVisibility(self._segID_A, True)
+        dn.SetSegmentVisibility(self._segID_B, True)
+        SegmentHumanBodyWidget._apply_saved_segments_visibility(w, exclude=None)
+        self.assertFalse(dn.GetSegmentVisibility(self._segID_A))
+        self.assertFalse(dn.GetSegmentVisibility(self._segID_B))
+
+    def test_apply_saved_no_segnode_is_graceful(self):
+        """_apply_saved must return silently when no segmentation node is present."""
+        from SegmentHumanBody import SegmentHumanBodyWidget
+        w = self._w()
+        w.ui.segmentationNodeSelector.currentNode.return_value = None
+        try:
+            SegmentHumanBodyWidget._apply_saved_segments_visibility(w, exclude=None)
+        except Exception as exc:
+            self.fail(f"_apply_saved raised {exc} with no segmentation node")
+
+
+# ===========================================================================
+# Window / Level preprocessing
+# ===========================================================================
+
+class WindowLevelTest(unittest.TestCase):
+    """Tests for the W/L normalization applied to model input slices.
+
+    apply_window_level (core/utils.py) is the pure-numpy implementation.
+    SegmentHumanBodyLogic.set_window_level / _apply_wl_to_slice are the
+    integration points exercised during model inference.
+    """
+
+    def setUp(self):
+        slicer.mrmlScene.Clear()
+        from core._logic import SegmentHumanBodyLogic
+        self._logic = SegmentHumanBodyLogic()
+
+    def tearDown(self):
+        slicer.mrmlScene.Clear()
+
+    # -- apply_window_level utility --
+
+    def test_no_wl_returns_input_unchanged(self):
+        """apply_window_level(img, None, None) must return the original array."""
+        from core.utils import apply_window_level
+        arr = np.arange(12, dtype=np.int16).reshape(3, 4)
+        result = apply_window_level(arr, None, None)
+        np.testing.assert_array_equal(result, arr)
+
+    def test_values_below_lo_clip_to_zero(self):
+        """Intensities at or below level−window/2 must map to 0."""
+        from core.utils import apply_window_level
+        # window=200, level=40 → lo=−60, hi=140
+        arr = np.array([[-200, -61, -60]], dtype=np.float32)
+        result = apply_window_level(arr, window=200, level=40)
+        self.assertEqual(result[0, 0], 0, "−200 is below lo=−60 → 0")
+        self.assertEqual(result[0, 1], 0, "−61  is below lo=−60 → 0")
+        self.assertEqual(result[0, 2], 0, "−60 == lo itself → 0 (inclusive clipping)")
+
+    def test_values_above_hi_clip_to_255(self):
+        """Intensities at or above level+window/2 must map to 255."""
+        from core.utils import apply_window_level
+        arr = np.array([[3000, 141, 140]], dtype=np.float32)
+        result = apply_window_level(arr, window=200, level=40)
+        self.assertEqual(result[0, 0], 255, "3000 is above hi=140 → 255")
+        self.assertEqual(result[0, 1], 255, "141  is above hi=140 → 255")
+        self.assertEqual(result[0, 2], 255, "140 == hi itself → 255 (inclusive clipping)")
+
+    def test_output_range_is_0_to_255(self):
+        """For any float input the output must be within [0, 255]."""
+        from core.utils import apply_window_level
+        rng = np.random.default_rng(42)
+        arr = rng.uniform(-2000, 4000, (30, 30)).astype(np.float32)
+        result = apply_window_level(arr, window=400, level=40)
+        self.assertGreaterEqual(int(result.min()), 0)
+        self.assertLessEqual(int(result.max()), 255)
+
+    def test_output_dtype_is_uint8(self):
+        from core.utils import apply_window_level
+        arr = np.zeros((_J, _I), dtype=np.float32)
+        self.assertEqual(apply_window_level(arr, window=400, level=40).dtype,
+                         np.uint8)
+
+    def test_midpoint_intensity_maps_to_127(self):
+        """A pixel exactly at *level* must map to the midpoint of [0, 255]."""
+        from core.utils import apply_window_level
+        arr = np.full((_J, _I), 40.0, dtype=np.float32)   # all == level
+        result = apply_window_level(arr, window=400, level=40)
+        np.testing.assert_array_equal(result,
+                                      np.full((_J, _I), 127, dtype=np.uint8),
+                                      err_msg="All-at-level slice must produce all-127 output")
+
+    def test_source_array_is_not_modified(self):
+        """apply_window_level must operate on a copy; the caller's array is unchanged."""
+        from core.utils import apply_window_level
+        arr = np.array([[0, 100, 500, -500]], dtype=np.float32)
+        original = arr.copy()
+        apply_window_level(arr, window=400, level=40)
+        np.testing.assert_array_equal(arr, original)
+
+    # -- logic integration --
+
+    def test_logic_no_wl_passes_raw_slice(self):
+        """Before set_window_level is called, _apply_wl_to_slice is a no-op."""
+        arr = np.arange(12, dtype=np.int16).reshape(3, 4)
+        np.testing.assert_array_equal(self._logic._apply_wl_to_slice(arr), arr)
+
+    def test_logic_set_wl_normalizes_extremes(self):
+        """After set_window_level, a value far above hi maps to 255 and far
+        below lo maps to 0."""
+        self._logic.set_window_level(window=400, level=40)
+        arr = np.array([[3000, -1000, 40]], dtype=np.float32)
+        result = self._logic._apply_wl_to_slice(arr)
+        self.assertEqual(result.dtype, np.uint8)
+        self.assertEqual(result[0, 0], 255, "3000 → 255")
+        self.assertEqual(result[0, 1], 0,   "−1000 → 0")
+
+    def test_logic_clear_wl_reverts_to_passthrough(self):
+        """set_window_level(None, None) after a prior set must revert to no-op."""
+        self._logic.set_window_level(window=400, level=40)
+        self._logic.set_window_level(None, None)
+        arr = np.array([[3000]], dtype=np.float32)
+        result = self._logic._apply_wl_to_slice(arr)
+        np.testing.assert_array_equal(result, arr)
+
+    def test_logic_wl_does_not_write_back_to_volume(self):
+        """Applying W/L must never modify the source MRML volume data."""
+        volNode = _make_ct_volume()
+        before = slicer.util.arrayFromVolume(volNode).copy()
+        self._logic.set_window_level(window=600, level=100)
+        from core.utils import apply_window_level, get_slice_from_volume
+        raw = get_slice_from_volume(slicer.util.arrayFromVolume(volNode), 0, 6)
+        apply_window_level(raw, window=600, level=100)
+        after = slicer.util.arrayFromVolume(volNode)
+        np.testing.assert_array_equal(after, before,
+            "MRML volume data must be unchanged after W/L preprocessing")
+
+
+# ===========================================================================
+# CT-like workflow — end-to-end with realistic intensity data
+# ===========================================================================
+
+@_SKIP_LAYOUT
+class SampleDataWorkflowTest(unittest.TestCase):
+    """End-to-end workflow tests using a synthetic CT-like volume.
+
+    The volume has a soft-tissue background (−200 HU) and a bright stripe
+    (≈+400 HU), giving SPX algorithms real intensity gradients to work with.
+    Tests cover brush deltas on non-trivial data, SPX expansion on a CT slice,
+    multi-segment brush + undo, and W/L integration with point placement.
+    """
+
+    _SLICE_K = 6
+
+    def setUp(self):
+        slicer.mrmlScene.Clear()
+        slicer.app.layoutManager().setLayout(
+            slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
+        from core._logic import SegmentHumanBodyLogic
+        self._logic   = SegmentHumanBodyLogic()
+        self._pNode   = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLScriptedModuleNode')
+        self._logic.ensurePromptNodesExist(self._pNode)
+        self._volNode = _make_ct_volume()
+        self._segNode, self._segID = _make_seg(self._volNode, with_segment=True)
+        self._logic.setVolumeAndSegmentation(self._pNode, self._volNode, self._segNode)
+        self._ijkToRAS = _setup_red_slice_at_k(self._volNode, self._SLICE_K)
+
+    def tearDown(self):
+        slicer.app.applicationLogic().GetInteractionNode().SwitchToViewTransformMode()
+        slicer.mrmlScene.Clear()
+
+    def _w(self, modelFamily=None):
+        return _make_undo_test_widget(
+            self._volNode, self._segNode, self._segID,
+            self._pNode, self._logic, modelFamily=modelFamily)
+
+    # -- W/L preprocessing --
+
+    def test_wl_normalizes_ct_range_to_uint8(self):
+        """W/L on a slice spanning [−220, 420] HU must produce uint8 output."""
+        from core.utils import apply_window_level, get_slice_from_volume
+        volumeArray = slicer.util.arrayFromVolume(self._volNode)
+        raw = get_slice_from_volume(volumeArray, 0, self._SLICE_K)
+        result = apply_window_level(raw, window=600, level=100)
+        self.assertEqual(result.dtype, np.uint8)
+        self.assertFalse(np.array_equal(raw, result),
+            "W/L must change the pixel values of a CT-range slice")
+
+    def test_wl_integration_model_receives_normalized_image(self):
+        """When W/L is set, the image reaching on_expand must be uint8 normalized,
+        not the raw int16 CT values.  Verified by recording the argument."""
+        from core.utils import apply_window_level, get_slice_from_volume
+
+        self._logic.set_window_level(window=600, level=100)
+        volumeArray = slicer.util.arrayFromVolume(self._volNode)
+        expected_img = apply_window_level(
+            get_slice_from_volume(volumeArray, 0, self._SLICE_K),
+            window=600, level=100,
+        )
+
+        received = []
+
+        class _RecordingFamily:
+            model = object()
+            def on_expand(self, img, **kwargs):
+                received.append(img.copy())
+                labels = np.ones(img.shape[:2], dtype=np.int32)
+                labels[:, img.shape[1] // 2:] = 2
+                return labels
+
+        w = self._w(modelFamily=_RecordingFamily())
+        posNode, _ = self._logic.getPromptNodes(self._pNode)
+        ras_pt = _ijk_to_ras_pt(self._ijkToRAS, 4, 3, self._SLICE_K)
+        posNode.AddControlPoint(ras_pt)
+        from SegmentHumanBody import SegmentHumanBodyWidget
+        SegmentHumanBodyWidget._onPointConfirmed(w, posNode)
+
+        self.assertEqual(len(received), 1,
+            "on_expand must be called exactly once per point placement")
+        np.testing.assert_array_equal(received[0], expected_img,
+            "The image passed to on_expand must be the W/L-normalized uint8 slice")
+
+    # -- Brush on CT volume --
+
+    def test_brush_delta_on_ct_volume_matches_painted_patch(self):
+        """Brush delta on a CT volume must be the tight bbox of the painted region,
+        confirming the tracker works correctly with non-zero intensity data."""
+        w = self._w()
+        before = np.zeros((_J, _I), dtype=np.uint8)
+        after  = np.zeros((_J, _I), dtype=np.uint8)
+        after[3:8, 4:12] = 1    # 5-row × 8-col patch
+
+        full = np.zeros((_K, _J, _I), dtype=np.uint8)
+        full[self._SLICE_K] = after
+        _write_lm(self._segNode, self._segID, self._volNode, full)
+
+        change = self._logic.commit_stroke(w, axis=0, idx=self._SLICE_K,
+                                           before_slice=before, source='brush')
+
+        self.assertIsNotNone(change)
+        self.assertEqual(change.delta.shape, (5, 8),
+            "Delta must be the 5×8 tight bounding box of the painted patch")
+
+    def test_brush_undo_on_ct_volume_restores_slice(self):
+        """Painting then undoing a brush stroke on the CT volume fully restores
+        the slice — not just on a zeros volume."""
+        from SegmentHumanBody import SegmentHumanBodyWidget
+        from core.utils import write_slice_to_volume
+
+        w = self._w()
+        before = np.zeros((_J, _I), dtype=np.uint8)
+        after  = np.zeros((_J, _I), dtype=np.uint8)
+        after[1:14, 2:16] = 1
+
+        full = np.zeros((_K, _J, _I), dtype=np.uint8)
+        write_slice_to_volume(full, after, 0, self._SLICE_K)
+        _write_lm(self._segNode, self._segID, self._volNode, full)
+
+        change = self._logic.commit_stroke(w, axis=0, idx=self._SLICE_K,
+                                           before_slice=before, source='brush')
+        w._history.append(['brush', change])
+        SegmentHumanBodyWidget.onUndo(w)
+
+        result = _read_lm(self._segNode, self._segID, self._volNode)
+        np.testing.assert_array_equal(result[self._SLICE_K], 0,
+            "Brush undo on CT volume must restore the slice to empty")
+
+    # -- SPX expansion on CT slice --
+
+    def test_expand_on_ct_slice_paints_nonzero_region(self):
+        """expandSegWithSPX on a real CT-intensity slice must paint at least one
+        pixel (regression: the tracker must accept non-zero source arrays)."""
+        try:
+            from skimage.segmentation import slic as _check  # noqa: F401
+        except ImportError:
+            self.skipTest("scikit-image not available")
+
+        from core.models.spx import SPX_SLIC2D
+        from core.utils import get_slice_from_volume, apply_window_level
+
+        volumeArray = slicer.util.arrayFromVolume(self._volNode)
+        img = get_slice_from_volume(volumeArray, 0, self._SLICE_K)
+        img_wl = apply_window_level(img, window=600, level=100)
+
+        labels = SPX_SLIC2D().forward(img=img_wl, n_segments=50)
+
+        # Seed the mask at the bright bone-stripe region.
+        seed = np.zeros((_K, _J, _I), dtype=np.uint8)
+        seed[self._SLICE_K, _J // 3, _I // 2] = 1
+        _write_lm(self._segNode, self._segID, self._volNode, seed)
+
+        change = self._logic.expandSegWithSPX(
+            self._segNode, self._segID, self._volNode,
+            labels, axis=0, sliceIndex=self._SLICE_K,
+        )
+        result = _read_lm(self._segNode, self._segID, self._volNode)
+        self.assertGreater(result[self._SLICE_K].sum(), 0,
+            "expandSegWithSPX must paint pixels on a non-trivial CT slice")
+        self.assertIsNotNone(change,
+            "expandSegWithSPX must return a MaskChange for a real expansion")
+
+    def test_expand_undo_on_ct_volume_restores_state(self):
+        """Expand then undo on a CT volume must restore the pre-expand mask."""
+        try:
+            from skimage.segmentation import slic as _check  # noqa: F401
+        except ImportError:
+            self.skipTest("scikit-image not available")
+
+        from core.models.spx import SPX_SLIC2D
+        from core.utils import get_slice_from_volume, apply_window_level
+
+        volumeArray = slicer.util.arrayFromVolume(self._volNode)
+        img = get_slice_from_volume(volumeArray, 0, self._SLICE_K)
+        labels = SPX_SLIC2D().forward(img=apply_window_level(img, 600, 100),
+                                      n_segments=50)
+
+        pre = np.zeros((_K, _J, _I), dtype=np.uint8)
+        pre[self._SLICE_K, _J // 3, _I // 2] = 1
+        _write_lm(self._segNode, self._segID, self._volNode, pre)
+
+        change = self._logic.expandSegWithSPX(
+            self._segNode, self._segID, self._volNode,
+            labels, axis=0, sliceIndex=self._SLICE_K,
+        )
+        after_expand = _read_lm(self._segNode, self._segID, self._volNode)
+        self.assertGreater(after_expand[self._SLICE_K].sum(), 1,
+            "Expand must paint more than the single seed pixel")
+
+        widget = _mock_widget(self._volNode, self._segNode, self._segID)
+        self._logic.reverse_change(widget, change)
+
+        restored = _read_lm(self._segNode, self._segID, self._volNode)
+        np.testing.assert_array_equal(restored, pre,
+            "reverse_change must fully restore the pre-expand mask")
+
+    # -- Multi-segment workflow --
+
+    def test_multi_segment_independent_brush_and_undo(self):
+        """Two separate segments each get a brush stroke; undoing one must not
+        affect the other.
+
+        This is a realistic annotation session: the user paints segment A,
+        switches to segment B, paints it, then undoes both in reverse order.
+        """
+        from SegmentHumanBody import SegmentHumanBodyWidget
+        from core._logic import SegmentHumanBodyLogic
+        from core.utils import write_slice_to_volume
+
+        # Add segment B alongside the existing segment A.
+        segID_B = self._segNode.GetSegmentation().AddEmptySegment('SegB')
+
+        # Segment A: brush stroke on axial slice 4.
+        logic_A = SegmentHumanBodyLogic()
+        logic_A.setVolumeAndSegmentation(self._pNode, self._volNode, self._segNode)
+        w_A = _make_undo_test_widget(
+            self._volNode, self._segNode, self._segID, self._pNode, logic_A)
+
+        after_A = np.zeros((_J, _I), dtype=np.uint8)
+        after_A[2:9, 1:15] = 1
+        full_A = np.zeros((_K, _J, _I), dtype=np.uint8)
+        write_slice_to_volume(full_A, after_A, 0, 4)
+        _write_lm(self._segNode, self._segID, self._volNode, full_A)
+        change_A = logic_A.commit_stroke(w_A, axis=0, idx=4,
+                                         before_slice=np.zeros((_J, _I), dtype=np.uint8),
+                                         source='brush')
+        w_A._history.append(['brush', change_A])
+
+        # Segment B: brush stroke on axial slice 7.
+        logic_B = SegmentHumanBodyLogic()
+        logic_B.setVolumeAndSegmentation(self._pNode, self._volNode, self._segNode)
+        w_B = _make_undo_test_widget(
+            self._volNode, self._segNode, segID_B, self._pNode, logic_B)
+
+        after_B = np.zeros((_J, _I), dtype=np.uint8)
+        after_B[5:12, 3:10] = 1
+        full_B = np.zeros((_K, _J, _I), dtype=np.uint8)
+        write_slice_to_volume(full_B, after_B, 0, 7)
+        _write_lm(self._segNode, segID_B, self._volNode, full_B)
+        change_B = logic_B.commit_stroke(w_B, axis=0, idx=7,
+                                         before_slice=np.zeros((_J, _I), dtype=np.uint8),
+                                         source='brush')
+        w_B._history.append(['brush', change_B])
+
+        # Verify both are painted.
+        self.assertTrue(_read_lm(self._segNode, self._segID, self._volNode)[4].any(),
+                        "Segment A must have pixels on slice 4")
+        self.assertTrue(_read_lm(self._segNode, segID_B,       self._volNode)[7].any(),
+                        "Segment B must have pixels on slice 7")
+
+        # Undo segment B — must not touch segment A.
+        SegmentHumanBodyWidget.onUndo(w_B)
+        np.testing.assert_array_equal(
+            _read_lm(self._segNode, segID_B, self._volNode)[7], 0,
+            "Undoing segment B must clear its slice 7")
+        self.assertTrue(
+            _read_lm(self._segNode, self._segID, self._volNode)[4].any(),
+            "Segment A must be unaffected by undoing segment B")
+
+        # Undo segment A.
+        SegmentHumanBodyWidget.onUndo(w_A)
+        np.testing.assert_array_equal(
+            _read_lm(self._segNode, self._segID, self._volNode)[4], 0,
+            "Undoing segment A must clear its slice 4")
+
+    def test_point_then_expand_then_undo_all(self):
+        """Realistic click-expand-undo cycle on a CT slice.
+
+        1. Place a positive point → paints one SPX region.
+        2. Run expandSegWithSPX (Expand E) → grows to all matching regions.
+        3. Undo expand → back to post-point state.
+        4. Undo point → mask is empty.
+        """
+        try:
+            from skimage.segmentation import slic as _check  # noqa: F401
+        except ImportError:
+            self.skipTest("scikit-image not available")
+
+        from core.models.spx import SPX_SLIC2D
+        from core.utils import get_slice_from_volume, apply_window_level
+        from SegmentHumanBody import SegmentHumanBodyWidget
+
+        volumeArray  = slicer.util.arrayFromVolume(self._volNode)
+        img          = get_slice_from_volume(volumeArray, 0, self._SLICE_K)
+        labels       = SPX_SLIC2D().forward(img=apply_window_level(img, 600, 100),
+                                            n_segments=50)
+        spx_family   = _make_spx_family(labels)
+
+        w = self._w(modelFamily=spx_family)
+        self._logic.set_window_level(window=600, level=100)
+
+        # Step 1: positive point.
+        posNode, _ = self._logic.getPromptNodes(self._pNode)
+        ras_pt = _ijk_to_ras_pt(self._ijkToRAS, _I // 2, _J // 3, self._SLICE_K)
+        posNode.AddControlPoint(ras_pt)
+        SegmentHumanBodyWidget._onPointConfirmed(w, posNode)
+        after_point = _read_lm(self._segNode, self._segID, self._volNode).copy()
+        self.assertGreater(after_point[self._SLICE_K].sum(), 0,
+            "Positive point must paint at least one pixel")
+
+        # Step 2: expand.
+        widget_for_expand = _mock_widget(self._volNode, self._segNode, self._segID)
+        change_expand = self._logic.expandSegWithSPX(
+            self._segNode, self._segID, self._volNode,
+            labels, axis=0, sliceIndex=self._SLICE_K,
+        )
+        if change_expand is not None:
+            w._history.append(['expand', change_expand])
+
+        # Step 3: undo expand → should restore post-point state.
+        if change_expand is not None:
+            SegmentHumanBodyWidget.onUndo(w)
+            after_undo_expand = _read_lm(self._segNode, self._segID, self._volNode)
+            np.testing.assert_array_equal(
+                after_undo_expand[self._SLICE_K], after_point[self._SLICE_K],
+                "Undoing expand must restore the post-point mask state")
+
+        # Step 4: undo point → mask empty.
+        SegmentHumanBodyWidget.onUndo(w)
+        final = _read_lm(self._segNode, self._segID, self._volNode)
+        np.testing.assert_array_equal(final[self._SLICE_K], 0,
+            "Undoing the point must restore the mask to empty")
