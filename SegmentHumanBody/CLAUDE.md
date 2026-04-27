@@ -151,12 +151,65 @@ for name in _BUTTON_NAMES:
 
 Adding a button to a family = add its widget name to `VISIBLE_BUTTONS`.
 
+### Segment Visibility
+
+Two independent visibility controls, each with their own checkbox and state variable:
+
+| Widget | Hotkey | State var | Default | Controls |
+|---|---|---|---|---|
+| `showCurrentSegmentCheckBox` | `V` | `_current_segment_visible` | `True` | The segment currently being edited |
+| `showSegmentsCheckBox` | — | `_saved_segments_visible` | `False` | All other (saved) segments |
+
+`_apply_saved_segments_visibility(exclude=segmentID)` iterates every segment in the segmentation node and calls `dn.SetSegmentVisibility(sid, _saved_segments_visible)` for all except `exclude`. It is called from:
+- `onToggleSavedSegments` (checkbox / direct call)
+- `onSegmentChanged` (segment switch — hides the previous segment if saved-segments are off)
+- `updateGUIFromParameterNode` (segmentation node switch)
+
+On segment switch (`onSegmentChanged`) and on segmentation node change (`updateGUIFromParameterNode`), the incoming current segment is always made visible and `_current_segment_visible` is reset to `True`, so `showCurrentSegmentCheckBox` snaps back to checked.
+
 ### Coordinate System
 
 - Prompt points come from Slicer in **RAS** space
 - They are converted to **IJK** (voxel) space via `ras_to_ijk()` before passing to models
 - Slice extraction: `axis=0` → Red (axial), `axis=1` → Green (coronal), `axis=2` → Yellow (sagittal)
 - SPX 2-D point convention: `[x, y]` maps to `labels[y, x]` (row = y, col = x)
+
+### Widget `__init__` attribute groups
+
+```python
+# Core state
+self.logic           = SegmentHumanBodyLogic()
+self.ctrl            = WidgetState(self)
+self._parameterNode  = None
+self.modelFamily     = None
+self.currentViewName = None
+
+# Undo history — entries: ['brush'|'erase'|'expand', MaskChange]
+#                          ['point', MaskChange, node, cp_id]
+self._history = []
+
+# Active input handler
+self._active_handler = None
+
+# Keyboard shortcuts (assigned in setup())
+self._undo_shortcut         = None   # Ctrl+Z
+self._expand_shortcut       = None   # E
+self._spx_boundary_shortcut = None   # Q
+self._segments_shortcut     = None   # V
+
+# SPX boundary overlay
+self._spx_boundary_node    = None
+self._spx_boundary_visible = False
+self._spx_boundary_view    = None
+
+# Segment visibility
+self._saved_segments_visible  = False   # saved segments checkbox
+self._current_segment_visible = True    # current segment / V hotkey
+```
+
+### Widget method sections (in order)
+
+`# Lifecycle` → `# UI` → `# Signals & Observers` → `# Parameter Node` → `# Model selection` → `# Segment management` → `# Interaction mode` → `# Point events` → `# Brush tool` → `# Window / Level` → `# Expand (E)` → `# Undo (Ctrl+Z)` → `# SPX Boundary Overlay (Q)` → `# Segment Visibility`
 
 ### Undo System
 

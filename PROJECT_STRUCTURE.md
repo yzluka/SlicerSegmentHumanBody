@@ -57,8 +57,9 @@ Loaded by Slicer. Contains:
 
 - **`SegmentHumanBody`** — `ScriptedLoadableModule` metadata (title, category, contributors).
 - **`SegmentHumanBodyWidget`** — the Qt widget.  Owns the UI, the undo history list
-  (`_history`), the active stroke handler (`_active_handler`), and SPX boundary overlay
-  state.  Delegates all logic to the classes below.
+  (`_history`), the active stroke handler (`_active_handler`), SPX boundary overlay
+  state, and segment visibility state (`_current_segment_visible`,
+  `_saved_segments_visible`).  Delegates all logic to the classes below.
 - **`SegmentHumanBodyTest`** — `ScriptedLoadableModuleTest` integration test runner.
 
 ### `core/_logic.py` — `SegmentHumanBodyLogic`
@@ -225,6 +226,19 @@ if widget._active_handler is not self:
 ```
 
 prevents the original (now stale) `attach()` from installing a duplicate mouse filter and effect callback.
+
+---
+
+## Segment visibility
+
+Two independent controls live in `SegmentHumanBody.py`:
+
+| Checkbox | Hotkey | Default | Scope |
+|---|---|---|---|
+| `showCurrentSegmentCheckBox` ("Show Current Seg") | `V` | checked | Segment being edited |
+| `showSegmentsCheckBox` ("Show Saved Segments") | — | unchecked | All other segments |
+
+`_apply_saved_segments_visibility(exclude)` sets `dn.SetSegmentVisibility(sid, _saved_segments_visible)` for every segment except `exclude`.  Called on checkbox toggle, segment switch, and segmentation node change.  On every segment switch the incoming segment is always forced visible and `showCurrentSegmentCheckBox` resets to checked.
 
 ---
 
