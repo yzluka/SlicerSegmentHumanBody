@@ -370,6 +370,32 @@
     </layout>
    </item>
    <item>
+    <widget class="QCheckBox" name="showCurrentSegmentCheckBox">
+     <property name="text">
+      <string>Show Current Seg (V)</string>
+     </property>
+     <property name="checked">
+      <bool>true</bool>
+     </property>
+     <property name="toolTip">
+      <string>Toggle visibility of the segment currently being edited (hotkey: V)</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QCheckBox" name="showSegmentsCheckBox">
+     <property name="text">
+      <string>Show Saved Segments</string>
+     </property>
+     <property name="checked">
+      <bool>false</bool>
+     </property>
+     <property name="toolTip">
+      <string>Show/hide all segments except the one currently being edited.</string>
+     </property>
+    </widget>
+   </item>
+   <item>
     <widget class="qSlicerSimpleMarkupsWidget" name="positivePrompts"/>
    </item>
    <item>
