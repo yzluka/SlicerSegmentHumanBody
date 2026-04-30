@@ -134,6 +134,26 @@
     </layout>
    </item>
    <item>
+    <widget class="QPushButton" name="exportAnnotationLogButton">
+     <property name="text">
+      <string>Export Annotation Log</string>
+     </property>
+     <property name="toolTip">
+      <string>Save all placed points with timestamps to a JSON file</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QPushButton" name="importAnnotationLogButton">
+     <property name="text">
+      <string>Import Annotation Log</string>
+     </property>
+     <property name="toolTip">
+      <string>Load a previously exported annotation log JSON and replay the points</string>
+     </property>
+    </widget>
+   </item>
+   <item>
     <widget class="QLabel" name="label_2">
      <property name="text">
       <string>Select Image Volume and Segmentation Mask:</string>
@@ -396,10 +416,17 @@
     </widget>
    </item>
    <item>
+    <widget class="QLabel" name="positivePromptLabel">
+     <property name="text">
+      <string>Positive Prompt</string>
+     </property>
+    </widget>
+   </item>
+   <item>
     <widget class="qSlicerSimpleMarkupsWidget" name="positivePrompts"/>
    </item>
    <item>
-    <widget class="QLabel" name="label">
+    <widget class="QLabel" name="negativePromptLabel">
      <property name="text">
       <string>Negative Prompt</string>
      </property>

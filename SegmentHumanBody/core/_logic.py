@@ -337,6 +337,12 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
             finally:
                 widget.ui.segmentSelector.blockSignals(False)
                 widget.ctrl.creating_segment = False
+            # Pre-acknowledge the new segment so the deferred currentSegmentChanged
+            # emitted by qMRMLSegmentSelectorWidget's internal QTimer after
+            # blockSignals(False) is treated as a duplicate by onSegmentChanged
+            # and does not trigger clearPrompts() or wipe _history.
+            if segmentID:
+                widget._acknowledged_segment_id = segmentID
 
         return segNode, segmentID
 

@@ -14,6 +14,7 @@ from core.utils import (
     write_slice_to_volume,
     next_segment_name,
     parse_user_parameters,
+    ras_to_ijk_3d,
 )
 from core.modelRegistry import ModelRegistry
 from core._logic import SegmentHumanBodyLogic
@@ -77,6 +78,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._expand_shortcut       = None
         self._spx_boundary_shortcut = None
         self._segments_shortcut     = None
+        self._tab_shortcut          = None
 
         # SPX boundary overlay state
         self._spx_boundary_node    = None   # vtkMRMLLabelMapVolumeNode
@@ -86,6 +88,11 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # Segment visibility toggle state
         self._saved_segments_visible   = False  # other segments (checkbox)
         self._current_segment_visible  = True   # segment being worked on (V)
+
+        # Last segment ID processed by onSegmentChanged.  Used to suppress the
+        # spurious deferred currentSegmentChanged emitted by
+        # qMRMLSegmentSelectorWidget after blockSignals(False).
+        self._acknowledged_segment_id  = None
 
     # -------------------------
     # Lifecycle
@@ -131,6 +138,9 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         self._segments_shortcut = qt.QShortcut(qt.QKeySequence("V"), uiWidget)
         self._segments_shortcut.connect('activated()', lambda: self.onToggleCurrentSegment())
+
+        self._tab_shortcut = qt.QShortcut(qt.QKeySequence("A"), uiWidget)
+        self._tab_shortcut.connect('activated()', self.onAddSegment)
 
         qt.QTimer.singleShot(0, self._initializeAfterSetup)
         log.debug('[Setup complete]')
@@ -193,6 +203,10 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             'assignLabel2D', 'assignLabel3D',
             'expandSelectedLabelButton', 'showSPXBoundaryCheckBox',
             'runAutomaticSegmentation', 'goToMarkupsButton', 'samMaskDropdown',
+            'exportAnnotationLogButton',
+            'importAnnotationLogButton',
+            'negativePrompts', 'negativePromptLabel',
+            'positivePrompts', 'positivePromptLabel',
         }
         for name in ALL_BUTTONS:
             getattr(self.ui, name).setVisible(name in visible)
@@ -221,6 +235,15 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             ('applyWindowLevelButton', self.onApplyWindowLevel),
         ]:
             getattr(ui, ui_name).connect('clicked(bool)', method)
+
+        ui.exportAnnotationLogButton.connect(
+            'clicked(bool)',
+            lambda _=None: call_if_exists(self.modelFamily, 'on_export', self),
+        )
+        ui.importAnnotationLogButton.connect(
+            'clicked(bool)',
+            lambda _=None: call_if_exists(self.modelFamily, 'on_import', self),
+        )
 
         ui.showSPXBoundaryCheckBox.connect('toggled(bool)', self.onToggleSPXBoundary)
         ui.showCurrentSegmentCheckBox.connect('toggled(bool)', self.onToggleCurrentSegment)
@@ -328,6 +351,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             dn = segNode.GetDisplayNode()
             if dn:
                 dn.SetSegmentVisibility(currentID, True)
+        self._sync_annotation_visibility()
         self.ui.showCurrentSegmentCheckBox.blockSignals(True)
         self.ui.showCurrentSegmentCheckBox.setChecked(True)
         self.ui.showCurrentSegmentCheckBox.blockSignals(False)
@@ -375,6 +399,10 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.updateParamPlaceholder()
         if not isinstance(self.modelFamily, SPXModelFamily):
             self._hideSPXBoundary()
+        # Auto-confirm families that declare no variants (e.g. TimedAnnotatorFamily).
+        if hasattr(self.modelFamily, 'VARIANTS') and not self.modelFamily.VARIANTS:
+            self.logic.on_confirm_model(self)
+            self.setConfirmState(True)
 
     def updateModelVariants(self):
         dropdown = self.ui.modelVariantDropdown
@@ -496,7 +524,10 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 segmentation.GetNthSegment(i).GetName()
                 for i in range(segmentation.GetNumberOfSegments())
             }
-            segmentID = segmentation.AddEmptySegment(next_segment_name(existing))
+            seg_name  = next_segment_name(existing)
+            segmentID = segmentation.AddEmptySegment(seg_name)
+            call_if_exists(self.modelFamily, 'on_segment_created', segmentID, seg_name,
+                           segmentation_node=segNode)
             self.ui.segmentSelector.setCurrentSegmentID(segmentID)
             segment_created = True
         finally:
@@ -526,6 +557,9 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def onSegmentChanged(self, segmentID):
         if not segmentID or self.ctrl.creating_segment:
             return
+        if segmentID == self._acknowledged_segment_id:
+            return
+        self._acknowledged_segment_id = segmentID
         if self.ui.brushToolButton.isChecked() or self.ui.eraseToolButton.isChecked():
             editor = self._segEditor()
             if editor:
@@ -547,6 +581,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             dn = segNode.GetDisplayNode()
             if dn:
                 dn.SetSegmentVisibility(segmentID, True)
+            self._sync_annotation_visibility()
             self.ui.showCurrentSegmentCheckBox.blockSignals(True)
             self.ui.showCurrentSegmentCheckBox.setChecked(True)
             self.ui.showCurrentSegmentCheckBox.blockSignals(False)
@@ -617,6 +652,26 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     # Point events
     # -------------------------
 
+    def _restore_prompt_placement(self):
+        """Re-sync persistent placement on the positive prompt node.
+
+        Called after on_point_confirmed so that family hooks which create new
+        markup nodes (e.g. TimedAnnotatorFamily._mirror_to_node) cannot steal
+        the active placement node away from the prompt node.
+        """
+        if not isinstance(self._active_handler, PointHandler):
+            return
+        posNode, _ = self.logic.getPromptNodes(self._parameterNode)
+        if not posNode:
+            return
+        interactionNode = slicer.app.applicationLogic().GetInteractionNode()
+        selectionNode   = slicer.app.applicationLogic().GetSelectionNode()
+        if (selectionNode.GetActivePlaceNodeID() != posNode.GetID() or
+                interactionNode.GetCurrentInteractionMode() != interactionNode.Place):
+            selectionNode.SetActivePlaceNodeID(posNode.GetID())
+            selectionNode.SetActivePlaceNodeClassName(posNode.GetClassName())
+            interactionNode.SwitchToPersistentPlaceMode()
+
     def _onPointConfirmed(self, caller=None, event=None):
         """PointPositionDefinedEvent — a placement was just confirmed by the user."""
         if caller is None or self.ctrl.is_paused:
@@ -634,6 +689,12 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         change = self.logic.commit_point(self, caller, cp_id)
         self._redo_stack.clear()
         self._history.append(['point', change, caller, cp_id, list(ras), is_negative])
+        seg_id = self.ui.segmentSelector.currentSegmentID()
+        vol    = self.ui.sourceVolumeSelector.currentNode()
+        seg_node = self.ui.segmentationNodeSelector.currentNode()
+        call_if_exists(self.modelFamily, 'on_point_confirmed', seg_id, ras, cp_id, is_negative,
+                       volume_node=vol, segmentation_node=seg_node)
+        self._restore_prompt_placement()
         log.debug('[Widget] point confirmed — change=%s  history=%d',
                   change is not None, len(self._history))
 
@@ -681,7 +742,6 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             BrushHandler().attach(self)
         elif isinstance(self._active_handler, BrushHandler):
             self._active_handler.detach(self)
-            PointHandler().attach(self)
 
     def onEraseToggled(self, checked: bool):
         if checked:
@@ -871,6 +931,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 self.ctrl.resume()
 
             self.logic.reverse_change(self, change)
+            call_if_exists(self.modelFamily, 'on_point_undone', cp_id)
             # Push to redo with the live node reference (the original may be
             # stale if the node was just recreated above).
             posNode, negNode = self.logic.getPromptNodes(self._parameterNode)
@@ -907,6 +968,11 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 self.ctrl.resume()
 
             self.logic.forward_change(self, change)
+            seg_id = self.ui.segmentSelector.currentSegmentID()
+            vol      = self.ui.sourceVolumeSelector.currentNode()
+            seg_node = self.ui.segmentationNodeSelector.currentNode()
+            call_if_exists(self.modelFamily, 'on_point_confirmed', seg_id, ras, new_cp_id, is_negative,
+                           volume_node=vol, segmentation_node=seg_node)
             self._history.append(['point', change, live_node, new_cp_id, ras, is_negative])
 
     # -------------------------
@@ -1001,6 +1067,14 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     # Segment Visibility
     # -------------------------
 
+    def _sync_annotation_visibility(self):
+        """Forward current/saved visibility states to the active family's mirror nodes."""
+        seg_id = self.ui.segmentSelector.currentSegmentID()
+        call_if_exists(
+            self.modelFamily, 'sync_visibility',
+            seg_id, self._current_segment_visible, self._saved_segments_visible,
+        )
+
     def _apply_saved_segments_visibility(self, exclude=None):
         """Set visibility of every segment except `exclude` to _saved_segments_visible."""
         segNode = self.ui.segmentationNodeSelector.currentNode()
@@ -1022,6 +1096,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._saved_segments_visible = visible
         currentID = self.ui.segmentSelector.currentSegmentID()
         self._apply_saved_segments_visibility(exclude=currentID)
+        self._sync_annotation_visibility()
         self.ui.showSegmentsCheckBox.blockSignals(True)
         self.ui.showSegmentsCheckBox.setChecked(visible)
         self.ui.showSegmentsCheckBox.blockSignals(False)
@@ -1039,6 +1114,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self._current_segment_visible = visible
         else:
             visible = self._current_segment_visible   # snap back
+        self._sync_annotation_visibility()
         self.ui.showCurrentSegmentCheckBox.blockSignals(True)
         self.ui.showCurrentSegmentCheckBox.setChecked(visible)
         self.ui.showCurrentSegmentCheckBox.blockSignals(False)

@@ -10,6 +10,7 @@ set(MODULE_PYTHON_SCRIPTS
   core/modelRegistry.py
   core/models/__init__.py
   core/models/spx.py
+  core/models/timed_annotator.py
   core/_state.py
   core/_input.py
   core/_logic.py

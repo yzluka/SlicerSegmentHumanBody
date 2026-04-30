@@ -40,14 +40,18 @@ Test files:
 - `test_registry.py` — model registry caching and factory lookup
 - `test_spx_models.py` — individual SPX model algorithms
 - `test_utils.py` — slice read/write helpers, coordinate helpers
+- `test_deps.py` — `DependencyCheck` package/file probing, caching, version comparison
 
 ### Slicer-native integration tests (`SegmentHumanBodyTest`)
 
 Defined as `class SegmentHumanBodyTest(ScriptedLoadableModuleTest)` at the bottom of `SegmentHumanBody.py`. These run **inside** a Slicer process and exercise MRML scene interactions (`arrayFromSegmentBinaryLabelmap`, `updateSegmentBinaryLabelmapFromArray`, segmentation node lifecycle, coordinate conversion, and undo).
 
 ```bash
-# From the command line (requires a build with Slicer in PATH):
-PythonSlicer.exe --testing --run SegmentHumanBodyTest
+# Headless (no window, 24 layout-dependent tests skipped):
+Slicer.exe --no-main-window --python-script D:/SlicerSegmentHumanBody/run_slicer_tests.py
+
+# Full GUI (all 89 tests run):
+Slicer.exe --python-script D:/SlicerSegmentHumanBody/run_slicer_tests.py
 ```
 
 Or from inside Slicer: **Developer Tools ▸ Run Unittests**, select `SegmentHumanBodyTest`.
@@ -59,8 +63,9 @@ Covered by the integration tests:
 - `commit_point` writes pos/neg superpixel selections through the tracker
 - `_ras_to_ijk` maps the RAS centre of a volume to the middle voxel
 - `onAddSegment` cache/detach/create/restore handler lifecycle
-- `StrokeHandler.attach()` supersession guard when `_activate_effect` triggers `onAddSegment`
+- `StrokeHandler.attach()` supersession guard (defensive: fires if `_active_handler` changes during `_activate_effect`)
 - Full regression: brush active → Add Segment → click place deactivates brush
+- Unified pre-attach guard: `PointHandler`, `BrushHandler`, and `EraseHandler` each auto-create a segment when attaching to an empty segmentation (via `_detach_current_tool_if_exists`)
 - `commit_stroke` records a MaskChange; `onUndo` restores the pre-stroke slice
 - Brush LIFO: two strokes on different slices undo in reverse order
 - `EraseHandler._should_track`: no-op erase returns None; pixel-removing erase is tracked
@@ -84,11 +89,13 @@ core/
   _logic.py                  ← SegmentHumanBodyLogic: commit_point, commit_stroke, SPX expansion, prompt nodes, W/L
   _state.py                  ← WidgetState: pause/resume, tool-mode flags
   _input.py                  ← InputHandler hierarchy: StrokeHandler, BrushHandler, EraseHandler, PointHandler
-  _tracker.py                ← SegmentTracker: write_slice, reverse_delta, MaskChange
-  modelFamilies.py           ← BaseModelFamily, SPXModelFamily, FAMILY_REGISTRY
+  _tracker.py                ← SegmentTracker: write_slice, reverse_delta, forward_delta, MaskChange
+  _deps.py                   ← DependencyCheck: lazy, cached package/file probing (process-scoped)
+  modelFamilies.py           ← BaseModelFamily, SPXModelFamily, TimedAnnotatorFamily, FAMILY_REGISTRY
   modelRegistry.py           ← Lazy-instantiating session cache (ModelRegistry)
   models/spx.py              ← Concrete SPX algorithms (SPX_Tester2D, SPX_SLIC2D, SPX_Felzenszwalb2D)
-  utils.py                   ← get_slice_from_volume, write_slice_to_volume, select_spx_labels, call_if_exists
+  models/timed_annotator.py  ← TimedAnnotatorModel: per-segment timestamped log + mirror markup nodes
+  utils.py                   ← slice helpers, coordinate helpers, apply_window_level, spx_boundary_mask
 ```
 
 ### Single Write Path (Abstract Factory)
@@ -107,11 +114,20 @@ PointHandler           (lifecycle only — no business logic)
 
 ### Mutual Exclusion
 
-Only one handler is active at a time, tracked by `widget._active_handler`. Every `attach()` calls `_detach_current_tool_if_exists(widget)` first, which flushes and detaches the previous handler before the new one activates. Two triggers switch to `PointHandler`:
+Only one handler is active at a time, tracked by `widget._active_handler`. Every `attach()` calls `_detach_current_tool_if_exists(widget)` first, which:
+
+1. Flushes and detaches the previous handler before the new one activates.
+2. **Unified pre-attach guard**: if a volume is selected but no segment exists yet, calls `widget.onAddSegment()` — before any Slicer element (placement node, Paint/Erase effect, mouse filter) is installed.  This single check in the base class applies to all handler types (PointHandler, BrushHandler, EraseHandler, and any future handlers).
+
+Two triggers switch to `PointHandler`:
 - `_onPlaceModeChanged(active=True)` — Qt signal from the place widgets (direct path)
 - `_onInteractionModeChanged` — VTK observer fallback for Slicer's global toolbar
 
-Both triggers are guarded by `ctrl.is_paused` and return immediately when paused, so programmatic `setCurrentNode` calls inside `updateGUIFromParameterNode` (which run inside `ctrl.pause()`) never spuriously activate `PointHandler`.
+Both triggers are guarded by `ctrl.is_paused` and return immediately when paused, so programmatic `setCurrentNode` calls inside `updateGUIFromParameterNode` (only the markup-node `setCurrentNode` calls are wrapped in `ctrl.pause()`) never spuriously activate `PointHandler`.
+
+#### `onSegmentChanged` deferred-signal guard
+
+`qMRMLSegmentSelectorWidget` fires a deferred `currentSegmentChanged` via an internal QTimer after `blockSignals(False)` — by then `creating_segment` is already False. To prevent this spurious second call from wiping `_history` and replacing prompt nodes via `clearPrompts()`, `onSegmentChanged` stores the last processed segment ID in `_acknowledged_segment_id` and returns immediately if the incoming ID matches.
 
 #### Segment creation lifecycle (`onAddSegment`)
 
@@ -126,14 +142,14 @@ The restore runs in `finally` so it also executes on early return (e.g. no volum
 
 #### `StrokeHandler.attach()` supersession guard
 
-`_activate_effect()` calls `onAddSegment()` when the segmentation has 0 segments (auto-creates the first segment). Because `onAddSegment`'s restore path calls `attach()` on a **new** handler instance, `_active_handler` will no longer point to `self` when `_activate_effect()` returns. The guard:
+After `_activate_effect()` returns, `StrokeHandler.attach()` checks:
 
 ```python
 if widget._active_handler is not self:
     return
 ```
 
-prevents the original (now superseded) `attach()` from installing a dangling mouse filter and effect callback.
+This is defensive code: if anything inside `_activate_effect()` were to change `_active_handler` (e.g. a signal handler re-entering `onAddSegment`), the stale original `attach()` bails out instead of installing a duplicate mouse filter and effect callback.  In normal operation `_detach_current_tool_if_exists` has already created the segment before `_activate_effect` is called, so `_activate_effect` itself no longer triggers `onAddSegment`.
 
 ### SPX Label Cache
 
@@ -150,6 +166,18 @@ for name in _BUTTON_NAMES:
 ```
 
 Adding a button to a family = add its widget name to `VISIBLE_BUTTONS`.
+
+Families currently in `FAMILY_REGISTRY`:
+
+| Key | Class | Purpose |
+|---|---|---|
+| `'None'` | `BaseModelFamily` | No-op placeholder |
+| `'SAM-Style'` | `SAMFamily` | SAM v1/v2 interactive (stub) |
+| `'SPX-Assisted Annotation'` | `SPXModelFamily` | Superpixel-guided annotation |
+| `'Auto'` | `AutoModelFamily` | Non-interactive automated models |
+| `'TimedMarker'` | `TimedAnnotatorFamily` | Timestamped annotation log |
+
+`TimedAnnotatorFamily` has no model weights — it auto-confirms on family switch. All logic lives in `TimedAnnotatorModel` (loaded once via `ModelRegistry`, cached for the session so switching away and back preserves the accumulated log). It exposes `on_segment_created`, `on_point_confirmed`, `on_point_undone`, `sync_visibility`, `on_export`, and `on_import` hooks.
 
 ### Segment Visibility
 
@@ -184,18 +212,25 @@ self._parameterNode  = None
 self.modelFamily     = None
 self.currentViewName = None
 
-# Undo history — entries: ['brush'|'erase'|'expand', MaskChange]
-#                          ['point', MaskChange, node, cp_id]
-self._history = []
+# Undo/redo history — each entry is a list:
+#   ['brush',  change]                              — Paint stroke
+#   ['erase',  change]                              — Erase stroke
+#   ['expand', change]                              — Expand operation
+#   ['point',  change, node, cp_id, ras, is_neg]   — confirmed prompt control point
+# change is a MaskChange or None.
+self._history    = []
+self._redo_stack = []   # populated by onUndo; cleared by any new action
 
 # Active input handler
 self._active_handler = None
 
 # Keyboard shortcuts (assigned in setup())
 self._undo_shortcut         = None   # Ctrl+Z
+self._redo_shortcut         = None   # Ctrl+Shift+Z
 self._expand_shortcut       = None   # E
 self._spx_boundary_shortcut = None   # Q
 self._segments_shortcut     = None   # V
+self._tab_shortcut          = None   # A  (add segment)
 
 # SPX boundary overlay
 self._spx_boundary_node    = None
@@ -203,26 +238,33 @@ self._spx_boundary_visible = False
 self._spx_boundary_view    = None
 
 # Segment visibility
-self._saved_segments_visible  = False   # saved segments checkbox
-self._current_segment_visible = True    # current segment / V hotkey
+self._saved_segments_visible   = False   # saved segments checkbox
+self._current_segment_visible  = True    # current segment / V hotkey
+
+# Deferred-signal guard: last segment ID processed by onSegmentChanged.
+# Suppresses the duplicate currentSegmentChanged emitted by
+# qMRMLSegmentSelectorWidget after blockSignals(False).
+self._acknowledged_segment_id  = None
 ```
 
 ### Widget method sections (in order)
 
-`# Lifecycle` → `# UI` → `# Signals & Observers` → `# Parameter Node` → `# Model selection` → `# Segment management` → `# Interaction mode` → `# Point events` → `# Brush tool` → `# Window / Level` → `# Expand (E)` → `# Undo (Ctrl+Z)` → `# SPX Boundary Overlay (Q)` → `# Segment Visibility`
+`# Lifecycle` → `# UI` → `# Signals & Observers` → `# Parameter Node` → `# Model selection` → `# Segment management` → `# Interaction mode` → `# Point events` → `# Brush tool` → `# Window / Level` → `# Expand (E)` → `# Undo (Ctrl+Z)` → `# Redo (Ctrl+Shift+Z)` → `# SPX Boundary Overlay (Q)` → `# Segment Visibility`
 
 ### Undo System
 
-All undo actions follow one path: pop a `['type', MaskChange, ...]` entry from `_history`, call `logic.reverse_change()` which calls `tracker.reverse_delta()`.
+All undo actions follow one path: pop a `['type', MaskChange, ...]` entry from `_history`, call `logic.reverse_change()` which calls `tracker.reverse_delta()`, then push the entry onto `_redo_stack`.
 
 | Entry type | Extra fields | What undo does |
 |---|---|---|
-| `'brush'` | change | reverse delta |
-| `'erase'` | change | reverse delta |
-| `'expand'` | change | reverse delta |
-| `'point'` | change, node, cp_id | remove control point + reverse delta; recreate node if now empty (resets ID counter) |
+| `'brush'` | change | reverse delta → push to redo stack |
+| `'erase'` | change | reverse delta → push to redo stack |
+| `'expand'` | change | reverse delta → push to redo stack |
+| `'point'` | change, node, cp_id, ras, is_neg | remove control point + reverse delta; recreate node if now empty; push to redo stack |
 
-Manual point deletion (not via Ctrl+Z) is handled by `_onPointRemoved`, which scans `_history` for the matching cp_id and calls `reverse_change()`.
+**Redo** (`Ctrl+Shift+Z`) pops from `_redo_stack`, calls `logic.forward_change()` which calls `tracker.forward_delta()`, then pushes back onto `_history`. Any new action (brush, point, expand) calls `_redo_stack.clear()`.
+
+Manual point deletion (not via Ctrl+Z) is handled by `_onPointRemoved`, which scans `_history` for the matching cp_id and calls `reverse_change()` (no redo entry is created for manual deletes).
 
 ### Adding a New SPX Model
 

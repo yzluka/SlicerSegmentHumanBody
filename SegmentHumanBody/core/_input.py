@@ -44,14 +44,29 @@ class InputHandler:
     """Base class for interactive input modes."""
 
     def _detach_current_tool_if_exists(self, widget):
-        """Flush and detach whatever handler is currently active on *widget*.
+        """Flush and detach whatever handler is currently active on *widget*,
+        then ensure at least one segment exists before any Slicer interaction
+        is installed.
 
         Called at the top of every ``attach()`` implementation so that
         activating any tool automatically deactivates the previous one.
+        The segment-existence check is unified here so no handler needs its
+        own per-type logic.
         """
         current = getattr(widget, '_active_handler', None)
         if current is not None and current is not self:
             current.detach(widget)
+        # Unified pre-attach guard: if a volume is selected but no segment
+        # exists yet, create one now — before any Slicer element/observer is
+        # installed.  Applies to all handler types (PointHandler, BrushHandler,
+        # EraseHandler, and any future handlers).
+        pn = getattr(widget, '_parameterNode', None)
+        if pn is None:
+            return
+        volNode, segNode = widget.logic.getVolumeAndSegmentation(pn)
+        if volNode and (not segNode
+                        or segNode.GetSegmentation().GetNumberOfSegments() == 0):
+            widget.onAddSegment()
 
     def attach(self, widget):
         """Install this handler on *widget*."""
@@ -92,7 +107,7 @@ class StrokeHandler(InputHandler):
 
         self._activate_effect(widget)
 
-        # _activate_effect may call onAddSegment (0-segment case), which
+        # _detach_current_tool_if_exists may have called onAddSegment, which
         # caches/detaches/recreates/restores — ending with a fresh handler
         # already fully attached.  If _active_handler is no longer self we
         # were superseded; bail out so we don't install a stale mouse filter.
@@ -223,10 +238,6 @@ class StrokeHandler(InputHandler):
             return
 
         volNode, segNode = widget.logic.getVolumeAndSegmentation(widget._parameterNode)
-
-        if self.EFFECT == "Paint" and segNode and \
-                segNode.GetSegmentation().GetNumberOfSegments() == 0:
-            widget.onAddSegment()
 
         if not volNode or not segNode:
             return

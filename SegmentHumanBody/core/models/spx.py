@@ -10,6 +10,7 @@ Callers receive a label map of the same H×W shape as the input image.
 
 import numpy as np
 from abc import ABC, abstractmethod
+from .._deps import DependencyCheck
 
 
 class SPXModel(ABC):
@@ -67,6 +68,7 @@ class SPX_SLIC2D(SPXModel):
     PARAM_HINT = "n_segments=100, compactness=10, sigma=1"
 
     def __init__(self):
+        DependencyCheck.require_package('skimage', display_name='scikit-image')
         from skimage.segmentation import slic
         self._slic = slic
 
@@ -87,6 +89,7 @@ class SPX_Felzenszwalb2D(SPXModel):
     PARAM_HINT = "scale=100, sigma=0.5, min_size=50"
 
     def __init__(self):
+        DependencyCheck.require_package('skimage', display_name='scikit-image')
         from skimage.segmentation import felzenszwalb
         self._felzenszwalb = felzenszwalb
 

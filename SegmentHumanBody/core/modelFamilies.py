@@ -69,6 +69,8 @@ class SAMFamily(BaseModelFamily):
     VISIBLE_BUTTONS = frozenset({
         'goToMarkupsButton',
         'samMaskDropdown',
+        'positivePrompts', 'positivePromptLabel',
+        'negativePrompts', 'negativePromptLabel',
     })
 
     def get_requested_mask(self, **kwargs):
@@ -98,6 +100,8 @@ class SPXModelFamily(BaseModelFamily):
         'expandSelectedLabelButton',
         'showSPXBoundaryCheckBox',
         'goToMarkupsButton',
+        'positivePrompts', 'positivePromptLabel',
+        'negativePrompts', 'negativePromptLabel',
     })
 
     def __init__(self, variant=None):
@@ -167,6 +171,8 @@ class AutoModelFamily(BaseModelFamily):
         'assignLabel2D',
         'assignLabel3D',
         'runAutomaticSegmentation',
+        'positivePrompts', 'positivePromptLabel',
+        'negativePrompts', 'negativePromptLabel',
     })
 
     def on_assign_2d(self, **kwargs):
@@ -184,6 +190,52 @@ class AutoModelFamily(BaseModelFamily):
 
 
 # ---------------------------------------------------------------------------
+# TimedMarker family
+# ---------------------------------------------------------------------------
+
+class TimedAnnotatorFamily(BaseModelFamily):
+    """Thin delegate shell for the TimedMarker workflow.
+
+    All logic lives in TimedAnnotatorModel (core/models/timed_annotator.py),
+    which is loaded from ModelRegistry on confirm.  The family exposes only
+    the hook interface the widget expects and forwards each call to the model.
+    """
+
+    VARIANTS: list = []   # no model weights; auto-confirmed on family switch
+
+    VISIBLE_BUTTONS = frozenset({
+        'exportAnnotationLogButton', 'importAnnotationLogButton',
+        'positivePrompts', 'positivePromptLabel',
+    })
+
+    def confirm_model(self):
+        self.model = ModelRegistry.get_model('TimedAnnotatorModel')
+
+    def on_segment_created(self, segment_id, seg_name, segmentation_node=None):
+        self.model.on_segment_created(segment_id, seg_name, segmentation_node=segmentation_node)
+
+    def on_point_confirmed(self, segment_id, ras, cp_id, is_negative=False,
+                           volume_node=None, segmentation_node=None):
+        self.model.on_point_confirmed(segment_id, ras, cp_id, is_negative,
+                                      volume_node=volume_node, segmentation_node=segmentation_node)
+
+    def on_point_undone(self, cp_id):
+        self.model.on_point_undone(cp_id)
+
+    def sync_visibility(self, current_seg_id, current_visible, saved_visible):
+        self.model.sync_visibility(current_seg_id, current_visible, saved_visible)
+
+    def export_data(self):
+        return self.model.export_data()
+
+    def on_export(self, widget):
+        self.model.on_export(widget)
+
+    def on_import(self, widget):
+        self.model.on_import(widget)
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -195,4 +247,5 @@ FAMILY_REGISTRY: dict = {
     'SAM-Style':                 SAMFamily,
     'SPX-Assisted Annotation':   SPXModelFamily,
     'Auto':                      AutoModelFamily,
+    'TimedMarker':               TimedAnnotatorFamily,
 }

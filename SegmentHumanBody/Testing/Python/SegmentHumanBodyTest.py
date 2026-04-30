@@ -35,14 +35,28 @@ import slicer
 
 _K, _J, _I = 12, 15, 18   # volume shape used by all test classes
 
-# True when running inside full Slicer GUI; False in --no-main-window / headless mode.
-# Tests that require a live slice widget (layout manager + slice views) are skipped
-# when this is False.
-_HAS_LAYOUT_MANAGER = slicer.app.layoutManager() is not None
-_SKIP_LAYOUT = unittest.skipUnless(
-    _HAS_LAYOUT_MANAGER,
-    "requires Slicer layout manager (run with full GUI, not --no-main-window)"
-)
+# Decorator that gates tests on the layout manager being available.
+# Checked at test-run time (not module-import time) so that --python-script
+# mode works even when the GUI finishes initializing after the module loads.
+# Handles both method-level and class-level usage: when applied to a class the
+# test methods inside are individually wrapped so the class stays a class and
+# remains discoverable by unittest.TestLoader.
+def _SKIP_LAYOUT(obj):
+    import functools
+    _MSG = "requires Slicer layout manager (run with full GUI, not --no-main-window)"
+    def _guard(fn):
+        @functools.wraps(fn)
+        def _wrapper(*args, **kwargs):
+            if slicer.app.layoutManager() is None:
+                raise unittest.SkipTest(_MSG)
+            return fn(*args, **kwargs)
+        return _wrapper
+    if isinstance(obj, type):
+        for name in list(vars(obj)):
+            if name.startswith('test') or name == 'setUp':
+                setattr(obj, name, _guard(getattr(obj, name)))
+        return obj
+    return _guard(obj)
 
 
 def _make_volume():
@@ -685,12 +699,21 @@ class AddSegmentHandlerTest(unittest.TestCase):
             def _get_composite_node(self, *a): return None
             def getOrCreateSegmentationNode(self):
                 return self.ui.segmentationNodeSelector.currentNode()
+            def onAddSegment(self, *args):
+                from SegmentHumanBody import SegmentHumanBodyWidget
+                SegmentHumanBodyWidget.onAddSegment(self, *args)
             def clearPrompts(self):
                 from SegmentHumanBody import SegmentHumanBodyWidget
                 SegmentHumanBodyWidget.clearPrompts(self)
+            def _restore_prompt_placement(self):
+                from SegmentHumanBody import SegmentHumanBodyWidget
+                SegmentHumanBodyWidget._restore_prompt_placement(self)
             def _apply_saved_segments_visibility(self, exclude=None):
                 from SegmentHumanBody import SegmentHumanBodyWidget
                 SegmentHumanBodyWidget._apply_saved_segments_visibility(self, exclude=exclude)
+            def _sync_annotation_visibility(self):
+                from SegmentHumanBody import SegmentHumanBodyWidget
+                SegmentHumanBodyWidget._sync_annotation_visibility(self)
             def _clear_history(self):
                 from SegmentHumanBody import SegmentHumanBodyWidget
                 SegmentHumanBodyWidget._clear_history(self)
@@ -706,6 +729,8 @@ class AddSegmentHandlerTest(unittest.TestCase):
         w._spx_boundary_node       = None
         w._saved_segments_visible  = False
         w._current_segment_visible = True
+        w._acknowledged_segment_id = None
+        w.modelFamily              = None
 
         w.ui = MagicMock()
         w.ui.sourceVolumeSelector.currentNode.return_value      = volNode
@@ -877,6 +902,94 @@ class AddSegmentHandlerTest(unittest.TestCase):
         self.assertIsInstance(w._active_handler, BrushHandler,
             "A fresh BrushHandler from the resume path must be active")
 
+    # ------------------------------------------------------------------
+    # Sequence 5: unified pre-attach segment guard
+    # ------------------------------------------------------------------
+
+    def test_point_handler_attach_creates_segment_when_empty(self):
+        """PointHandler.attach() on a 0-segment segmentation auto-creates a
+        segment before activating placement mode.
+
+        Bug regression: previously PointHandler had no segment check and went
+        straight to Slicer placement mode.  The segment was only created lazily
+        on the first click (inside commit_point → _ensure_seg_and_segment),
+        which caused a deferred qMRMLSegmentSelectorWidget signal to fire and
+        call clearPrompts(), detaching the handler mid-session.
+
+        Fix: _detach_current_tool_if_exists (base class, called by all handlers)
+        calls onAddSegment() when no segment exists — before any Slicer
+        interaction element is installed.
+        """
+        from core._input import PointHandler
+
+        w = self._make_widget()
+        segNode = w.ui.segmentationNodeSelector.currentNode()
+        self.assertEqual(segNode.GetSegmentation().GetNumberOfSegments(), 0,
+            "Pre-condition: segmentation starts with 0 segments")
+
+        ph = PointHandler()
+        try:
+            ph.attach(w)
+            self.assertEqual(
+                segNode.GetSegmentation().GetNumberOfSegments(), 1,
+                "PointHandler.attach() must create a segment before placement mode")
+            self.assertIsInstance(w._active_handler, PointHandler,
+                "PointHandler must remain active after attach on empty segmentation")
+        finally:
+            ph.detach(w)
+
+    def test_erase_handler_attach_creates_segment_when_empty(self):
+        """EraseHandler.attach() on a 0-segment segmentation auto-creates a
+        segment before activating the Erase effect.
+
+        The old per-handler check in _activate_effect only guarded the 'Paint'
+        effect (self.EFFECT == 'Paint'); 'Erase' was never covered.  The
+        unified guard in _detach_current_tool_if_exists covers all handlers.
+        """
+        from core._input import EraseHandler
+
+        w = self._make_widget()
+        segNode = w.ui.segmentationNodeSelector.currentNode()
+        self.assertEqual(segNode.GetSegmentation().GetNumberOfSegments(), 0,
+            "Pre-condition: segmentation starts with 0 segments")
+
+        eh = EraseHandler()
+        try:
+            eh.attach(w)
+            self.assertEqual(
+                segNode.GetSegmentation().GetNumberOfSegments(), 1,
+                "EraseHandler.attach() must create a segment before Erase effect")
+            self.assertIsInstance(w._active_handler, EraseHandler,
+                "EraseHandler must remain active after attach on empty segmentation")
+        finally:
+            eh.detach(w)
+
+    def test_brush_handler_attach_creates_segment_when_empty(self):
+        """BrushHandler.attach() auto-creates a segment via the unified guard.
+
+        Verifies that the guard in _detach_current_tool_if_exists fires for
+        BrushHandler and that _active_handler ends up pointing to the
+        BrushHandler (not superseded by the onAddSegment restore path, since no
+        prior stroke handler was active when attach() was called).
+        """
+        from core._input import BrushHandler
+
+        w = self._make_widget()
+        segNode = w.ui.segmentationNodeSelector.currentNode()
+        self.assertEqual(segNode.GetSegmentation().GetNumberOfSegments(), 0,
+            "Pre-condition: segmentation starts with 0 segments")
+
+        bh = BrushHandler()
+        try:
+            bh.attach(w)
+            self.assertEqual(
+                segNode.GetSegmentation().GetNumberOfSegments(), 1,
+                "BrushHandler.attach() must create a segment before Paint effect")
+            self.assertIsInstance(w._active_handler, BrushHandler,
+                "BrushHandler must remain active after attach on empty segmentation")
+        finally:
+            bh.detach(w)
+
 
 # ===========================================================================
 # Shared helpers for workflow tests
@@ -952,8 +1065,14 @@ def _make_undo_test_widget(volNode, segNode, segID, paramNode, logic,
             from SegmentHumanBody import SegmentHumanBodyWidget
             SegmentHumanBodyWidget._apply_saved_segments_visibility(self, exclude=exclude)
         def _clear_history(self):
-            self._history.clear()
-            self._redo_stack.clear()
+            from SegmentHumanBody import SegmentHumanBodyWidget
+            SegmentHumanBodyWidget._clear_history(self)
+        def _restore_prompt_placement(self):
+            from SegmentHumanBody import SegmentHumanBodyWidget
+            SegmentHumanBodyWidget._restore_prompt_placement(self)
+        def _sync_annotation_visibility(self):
+            from SegmentHumanBody import SegmentHumanBodyWidget
+            SegmentHumanBodyWidget._sync_annotation_visibility(self)
 
     w = _W()
     w.ctrl                     = WidgetState(w)
@@ -968,6 +1087,7 @@ def _make_undo_test_widget(volNode, segNode, segID, paramNode, logic,
     w._spx_boundary_node       = None
     w._saved_segments_visible  = False
     w._current_segment_visible = True
+    w._acknowledged_segment_id = segID   # segment already selected; suppress deferred duplicate
 
     w.ui = MagicMock()
     w.ui.sourceVolumeSelector.currentNode.return_value        = volNode
@@ -1678,11 +1798,16 @@ class SegmentVisibilityTest(unittest.TestCase):
             def _apply_saved_segments_visibility(self, exclude=None):
                 from SegmentHumanBody import SegmentHumanBodyWidget
                 SegmentHumanBodyWidget._apply_saved_segments_visibility(self, exclude=exclude)
+            def _sync_annotation_visibility(self):
+                from SegmentHumanBody import SegmentHumanBodyWidget
+                SegmentHumanBodyWidget._sync_annotation_visibility(self)
 
         w = _W()
         w.ctrl = WidgetState(w)
         w._saved_segments_visible  = False
         w._current_segment_visible = True
+        w._acknowledged_segment_id = None
+        w.modelFamily              = None
         w.ui = MagicMock()
         w.ui.segmentationNodeSelector.currentNode.return_value = self._segNode
         w.ui.segmentSelector.currentSegmentID.return_value = (
@@ -1737,12 +1862,16 @@ class SegmentVisibilityTest(unittest.TestCase):
         from core._state import WidgetState
 
         class _W:
-            pass
+            def _sync_annotation_visibility(self):
+                from SegmentHumanBody import SegmentHumanBodyWidget
+                SegmentHumanBodyWidget._sync_annotation_visibility(self)
 
         w = _W()
         w.ctrl = WidgetState(w)
         w._saved_segments_visible  = False
         w._current_segment_visible = True
+        w._acknowledged_segment_id = None
+        w.modelFamily              = None
         w.ui = MagicMock()
         w.ui.segmentationNodeSelector.currentNode.return_value = None
         w.ui.segmentSelector.currentSegmentID.return_value = ''
@@ -2286,3 +2415,215 @@ class SampleDataWorkflowTest(unittest.TestCase):
         final = _read_lm(self._segNode, self._segID, self._volNode)
         np.testing.assert_array_equal(final[self._SLICE_K], 0,
             "Undoing the point must restore the mask to empty")
+
+
+# ===========================================================================
+# Bug regressions: SPX unexpected behaviors
+# ===========================================================================
+
+class SPXBrushToggleBugTest(unittest.TestCase):
+    """Bug regression: toggling the brush button OFF unconditionally
+    re-enters persistent point-placement mode.
+
+    Root cause: ``onBrushToggled(checked=False)`` always calls
+    ``PointHandler().attach(self)`` regardless of what mode was active
+    before the brush was turned on.  A user who switches to brush (which
+    detaches point mode) and then toggles brush off is silently dropped
+    back into point-placement mode without any explicit action.
+
+    The tests below FAIL with the current code to document the bug.
+    They will PASS once the fix prevents the unconditional re-attachment.
+    """
+
+    def setUp(self):
+        slicer.mrmlScene.Clear()
+        from core._logic import SegmentHumanBodyLogic
+        self._logic  = SegmentHumanBodyLogic()
+        self._pNode  = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLScriptedModuleNode')
+        self._logic.ensurePromptNodesExist(self._pNode)
+        self._volNode = _make_volume()
+        self._segNode, self._segID = _make_seg(self._volNode, with_segment=True)
+        self._logic.setVolumeAndSegmentation(self._pNode, self._volNode, self._segNode)
+
+    def tearDown(self):
+        slicer.app.applicationLogic().GetInteractionNode().SwitchToViewTransformMode()
+        slicer.mrmlScene.Clear()
+
+    def test_brush_toggle_off_does_not_reenter_point_mode(self):
+        """onBrushToggled(False) must not unconditionally re-attach PointHandler.
+
+        FAILS: current code always calls PointHandler().attach(self) when
+        the brush button is unchecked, switching Slicer into persistent
+        point-placement mode even when the user never intended it.
+        """
+        from SegmentHumanBody import SegmentHumanBodyWidget
+        from core._input import BrushHandler, PointHandler
+
+        w = _make_undo_test_widget(
+            self._volNode, self._segNode, self._segID, self._pNode,
+            self._logic, modelFamily=None,
+        )
+        # Simulate brush being the active tool (bypass attach() to avoid
+        # the Segment Editor effect machinery which needs a full GUI).
+        brush = BrushHandler()
+        brush._mouse_filter = None
+        w._active_handler = brush
+
+        SegmentHumanBodyWidget.onBrushToggled(w, False)
+
+        self.assertNotIsInstance(
+            w._active_handler, PointHandler,
+            "Toggling brush off must not unconditionally re-enter point "
+            "placement mode — expected a neutral (no-tool) state",
+        )
+
+
+@_SKIP_LAYOUT
+class SPXSpuriousSegmentChangeBugTest(unittest.TestCase):
+    """Bug regression: a deferred onSegmentChanged() after point confirmation
+    calls clearPrompts(), wiping the just-confirmed point from _history.
+
+    Root cause: ``_ensure_seg_and_segment()`` (called from ``commit_point``
+    when no segment exists) creates a segment with Qt signals blocked.
+    In real Slicer, ``qMRMLSegmentSelectorWidget`` schedules a deferred
+    ``currentSegmentChanged`` via an internal QTimer.  By the time that
+    timer fires, ``blockSignals`` is False and ``ctrl.creating_segment``
+    is False, so ``onSegmentChanged`` has no guard and calls
+    ``clearPrompts()``, which:
+      • wipes ``_history`` (Ctrl+Z stops working for confirmed points), and
+      • recreates the prompt nodes (observers are now on orphaned old nodes).
+
+    The tests simulate the deferred signal by calling ``onSegmentChanged``
+    directly after ``_onPointConfirmed`` returns.  They FAIL with the
+    current code and will PASS after a guard (e.g. ``is_paused`` check or
+    segment-ID equality check) is added to ``onSegmentChanged``.
+    """
+
+    _TARGET_K = 5
+
+    def setUp(self):
+        slicer.mrmlScene.Clear()
+        slicer.app.layoutManager().setLayout(
+            slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
+        from core._logic import SegmentHumanBodyLogic
+        self._logic   = SegmentHumanBodyLogic()
+        self._pNode   = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLScriptedModuleNode')
+        self._logic.ensurePromptNodesExist(self._pNode)
+        self._volNode = _make_volume()
+        self._segNode, self._segID = _make_seg(self._volNode, with_segment=True)
+        self._logic.setVolumeAndSegmentation(self._pNode, self._volNode, self._segNode)
+        self._ijkToRAS = _setup_red_slice_at_k(self._volNode, self._TARGET_K)
+
+        synthetic = np.ones((_J, _I), dtype=np.int32)
+        synthetic[:, _I // 2:] = 2
+        self._spx_fam = _make_spx_family(synthetic)
+
+    def tearDown(self):
+        slicer.app.applicationLogic().GetInteractionNode().SwitchToViewTransformMode()
+        slicer.mrmlScene.Clear()
+
+    def _place_pos_point(self):
+        from SegmentHumanBody import SegmentHumanBodyWidget
+        w = _make_undo_test_widget(
+            self._volNode, self._segNode, self._segID, self._pNode,
+            self._logic, modelFamily=self._spx_fam,
+        )
+        posNode, _ = self._logic.getPromptNodes(self._pNode)
+        ras_pt = _ijk_to_ras_pt(self._ijkToRAS, 4, 3, self._TARGET_K)
+        posNode.AddControlPoint(ras_pt)
+        SegmentHumanBodyWidget._onPointConfirmed(w, posNode)
+        return w
+
+    def test_spurious_segment_change_does_not_clear_point_history(self):
+        """A deferred onSegmentChanged(current_segID) after point confirmation
+        must NOT discard the confirmed point from _history.
+
+        FAILS: onSegmentChanged has no guard against calls with the
+        already-active segment ID, so clearPrompts() always fires and
+        empties _history, breaking Ctrl+Z for all confirmed points.
+        """
+        from SegmentHumanBody import SegmentHumanBodyWidget
+
+        w = self._place_pos_point()
+        self.assertEqual(len(w._history), 1,
+            "Point placement must add exactly one history entry before the test")
+
+        # Simulate the deferred currentSegmentChanged fired by
+        # qMRMLSegmentSelectorWidget after _ensure_seg_and_segment unblocks signals.
+        SegmentHumanBodyWidget.onSegmentChanged(w, self._segID)
+
+        self.assertEqual(len(w._history), 1,
+            "A spurious onSegmentChanged with the already-active segment ID "
+            "must not clear point history — clearPrompts() must not fire")
+
+    def test_spurious_segment_change_does_not_replace_prompt_nodes(self):
+        """clearPrompts() replaces the prompt nodes; observers on the old
+        nodes are silently orphaned, so subsequent placements are invisible
+        to _onPointConfirmed.
+
+        FAILS: the deferred onSegmentChanged triggers clearPrompts() which
+        calls recreatePromptNodes(), replacing posNode with a brand-new node
+        that has no VTK observers attached to it.
+        """
+        from SegmentHumanBody import SegmentHumanBodyWidget
+
+        w = self._place_pos_point()
+        posNode_id_before = self._logic.getPromptNodes(self._pNode)[0].GetID()
+
+        # Simulate deferred event.
+        SegmentHumanBodyWidget.onSegmentChanged(w, self._segID)
+
+        posNode_id_after = self._logic.getPromptNodes(self._pNode)[0].GetID()
+        self.assertEqual(posNode_id_after, posNode_id_before,
+            "Spurious onSegmentChanged must not replace the positive prompt node; "
+            "doing so orphans all existing _onPointConfirmed VTK observers")
+
+    def test_first_point_on_empty_segmentation_deferred_signal_does_not_clear_history(self):
+        """When no segment exists, _ensure_seg_and_segment creates one inside
+        commit_point.  After blockSignals(False) qMRMLSegmentSelectorWidget
+        queues a deferred currentSegmentChanged.  The new segment ID has never
+        been acknowledged, so without a fix the deferred signal processes
+        normally and clearPrompts() wipes _history.
+
+        _ensure_seg_and_segment must pre-set widget._acknowledged_segment_id
+        so the deferred signal is treated as a duplicate.
+        """
+        from SegmentHumanBody import SegmentHumanBodyWidget
+
+        # Segmentation with NO segments.
+        seg_node_empty, _ = _make_seg(self._volNode, with_segment=False)
+        self._logic.setVolumeAndSegmentation(self._pNode, self._volNode, seg_node_empty)
+
+        w = _make_undo_test_widget(
+            self._volNode, seg_node_empty, '', self._pNode,
+            self._logic, modelFamily=self._spx_fam,
+        )
+        # Override side_effect to also update the mock's return_value so that
+        # commit_point can read the new segment ID after _ensure_seg_and_segment.
+        def _on_set_seg_dynamic(sid):
+            w.ui.segmentSelector.currentSegmentID.return_value = sid
+            SegmentHumanBodyWidget.onSegmentChanged(w, sid)
+        w.ui.segmentSelector.setCurrentSegmentID.side_effect = _on_set_seg_dynamic
+        w.ui.segmentSelector.currentNode.return_value = seg_node_empty
+        w.ui.segmentationNodeSelector.currentNode.return_value = seg_node_empty
+
+        # Place a positive point — triggers _ensure_seg_and_segment internally.
+        posNode, _ = self._logic.getPromptNodes(self._pNode)
+        ras_pt = _ijk_to_ras_pt(self._ijkToRAS, 4, 3, self._TARGET_K)
+        posNode.AddControlPoint(ras_pt)
+        SegmentHumanBodyWidget._onPointConfirmed(w, posNode)
+
+        self.assertEqual(len(w._history), 1,
+            "Placing a point when no segment exists must add one history entry")
+
+        # The segment ID that _ensure_seg_and_segment created.
+        new_seg_id = w.ui.segmentSelector.currentSegmentID()
+        self.assertTrue(new_seg_id,
+            "_ensure_seg_and_segment must have set a non-empty segment ID")
+
+        # Simulate the deferred QTimer signal from blockSignals(False).
+        SegmentHumanBodyWidget.onSegmentChanged(w, new_seg_id)
+
+        self.assertEqual(len(w._history), 1,
+            "Deferred currentSegmentChanged after auto-segment creation must not "
+            "clear history — _ensure_seg_and_segment must pre-acknowledge the ID")

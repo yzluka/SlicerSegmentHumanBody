@@ -1,11 +1,13 @@
 from .models.spx import SPX_Tester2D, SPX_SLIC2D, SPX_Felzenszwalb2D
+from .models.timed_annotator import TimedAnnotatorModel
 
 # Maps registry key → model class.
 # Add new models here; do not use globals() lookups.
 _MODEL_FACTORIES: dict = {
-    'SPX_Tester2D':       SPX_Tester2D,
-    'SPX_SLIC2D':         SPX_SLIC2D,
-    'SPX_Felzenszwalb2D': SPX_Felzenszwalb2D,
+    'SPX_Tester2D':         SPX_Tester2D,
+    'SPX_SLIC2D':           SPX_SLIC2D,
+    'SPX_Felzenszwalb2D':   SPX_Felzenszwalb2D,
+    'TimedAnnotatorModel':  TimedAnnotatorModel,
 }
 
 

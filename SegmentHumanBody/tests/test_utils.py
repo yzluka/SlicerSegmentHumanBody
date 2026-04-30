@@ -11,6 +11,7 @@ from core.utils import (
     labels_at_points,
     collect_confirmed_points,
     collect_preview_points,
+    ras_to_ijk_3d,
     POSITION_UNDEFINED,
     POSITION_PREVIEW,
     POSITION_DEFINED,
@@ -644,6 +645,35 @@ class TestNegativeAutoFocusPrevention(unittest.TestCase):
             confirmed, [click_pos],
             "After one user click there must be exactly one confirmed positive point."
         )
+
+
+class TestRasToIjk3d(unittest.TestCase):
+
+    def _identity_mat(self):
+        return np.eye(4)
+
+    def test_identity_matrix_returns_rounded_input(self):
+        mat = self._identity_mat()
+        self.assertEqual(ras_to_ijk_3d(mat, [1.0, 2.0, 3.0]), [1, 2, 3])
+
+    def test_fractional_coordinates_are_rounded(self):
+        mat = self._identity_mat()
+        self.assertEqual(ras_to_ijk_3d(mat, [1.4, 2.6, 3.5]), [1, 3, 4])
+
+    def test_negative_coordinates(self):
+        mat = self._identity_mat()
+        self.assertEqual(ras_to_ijk_3d(mat, [-1.0, -2.0, -3.0]), [-1, -2, -3])
+
+    def test_scaling_matrix(self):
+        mat = np.diag([2.0, 2.0, 2.0, 1.0])
+        self.assertEqual(ras_to_ijk_3d(mat, [1.0, 1.0, 1.0]), [2, 2, 2])
+
+    def test_returns_list_of_three_ints(self):
+        result = ras_to_ijk_3d(self._identity_mat(), [1.0, 2.0, 3.0])
+        self.assertIsInstance(result, list)
+        self.assertEqual(len(result), 3)
+        for v in result:
+            self.assertIsInstance(v, int)
 
 
 if __name__ == '__main__':

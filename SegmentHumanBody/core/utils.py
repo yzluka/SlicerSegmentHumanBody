@@ -35,6 +35,13 @@ AXIS_TO_IJK_COMPONENT = {0: 2, 1: 1, 2: 0}
 # RAS → IJK 2-D projection  (pure numpy — no VTK / Slicer dependency)
 # ---------------------------------------------------------------------------
 
+def ras_to_ijk_3d(mat_4x4: np.ndarray, ras) -> list:
+    """Convert a single RAS point to nearest-integer IJK voxel indices."""
+    pt_h = np.array([ras[0], ras[1], ras[2], 1.0], dtype=np.float64)
+    ijk_h = mat_4x4 @ pt_h
+    return [int(round(ijk_h[i])) for i in range(3)]
+
+
 def ras_to_ijk_2d(mat_4x4: np.ndarray, points, axis: int,
                   slice_index: int = None) -> list:
     """Convert RAS-space 3-D points to 2-D slice coordinates in IJK space.
