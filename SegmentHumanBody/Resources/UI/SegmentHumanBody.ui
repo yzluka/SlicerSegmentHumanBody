@@ -12,6 +12,61 @@
   </property>
   <layout class="QVBoxLayout">
    <item>
+    <widget class="QGroupBox" name="recordingGroupBox">
+     <property name="title">
+      <string>Recording</string>
+     </property>
+     <layout class="QVBoxLayout">
+      <item>
+       <layout class="QHBoxLayout">
+        <item>
+         <widget class="QPushButton" name="recordButton">
+          <property name="text"><string>Start Record</string></property>
+          <property name="toolTip"><string>Start recording mouse movements and actions</string></property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QPushButton" name="stopRecordButton">
+          <property name="text"><string>Stop Record</string></property>
+          <property name="visible"><bool>false</bool></property>
+          <property name="toolTip"><string>Stop the current recording</string></property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QPushButton" name="exportRecordButton">
+          <property name="text"><string>Export</string></property>
+          <property name="enabled"><bool>false</bool></property>
+          <property name="toolTip"><string>Save recording to a JSON file</string></property>
+         </widget>
+        </item>
+       </layout>
+      </item>
+      <item>
+       <layout class="QHBoxLayout">
+        <item>
+         <widget class="QPushButton" name="loadRecordButton">
+          <property name="text"><string>Load</string></property>
+          <property name="toolTip"><string>Load a previously saved recording JSON file</string></property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QPushButton" name="replayRecordButton">
+          <property name="text"><string>Replay</string></property>
+          <property name="enabled"><bool>false</bool></property>
+          <property name="toolTip"><string>Replay loaded recording onto a new segmentation (requires matching volume)</string></property>
+         </widget>
+        </item>
+       </layout>
+      </item>
+      <item>
+       <widget class="QLabel" name="recordStatusLabel">
+        <property name="text"><string></string></property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
     <widget class="QLabel" name="label_1">
      <property name="text">
       <string>Select the model:</string>
@@ -343,51 +398,37 @@
       </widget>
      </item>
      <item>
-      <widget class="QSlider" name="brushDiameterSlider">
-       <property name="orientation">
-        <enum>Qt::Horizontal</enum>
-       </property>
-       <property name="minimum">
-        <number>1</number>
-       </property>
-       <property name="maximum">
-        <number>100</number>
-       </property>
-       <property name="value">
-        <number>10</number>
-       </property>
-      </widget>
-     </item>
-     <item>
-      <widget class="QSpinBox" name="brushDiameterSpinBox">
-       <property name="minimum">
-        <number>1</number>
-       </property>
-       <property name="maximum">
-        <number>100</number>
-       </property>
-       <property name="value">
-        <number>10</number>
-       </property>
-       <property name="suffix">
-        <string> mm</string>
-       </property>
-       <property name="minimumWidth">
-        <number>55</number>
-       </property>
-      </widget>
-     </item>
-     <item>
-      <widget class="QCheckBox" name="brushSphereCheckBox">
-       <property name="text">
-        <string>3D</string>
-       </property>
+      <widget class="QComboBox" name="overwriteModeDropdown">
        <property name="toolTip">
-        <string>Ball (3D sphere) vs disk (2D circle) brush shape</string>
+        <string>Controls whether the brush/erase can paint over other segments</string>
        </property>
+       <item>
+        <property name="text"><string>Don't Overwrite</string></property>
+       </item>
+       <item>
+        <property name="text"><string>Overwrite Visible</string></property>
+       </item>
+       <item>
+        <property name="text"><string>Overwrite All</string></property>
+       </item>
       </widget>
      </item>
     </layout>
+   </item>
+   <item>
+    <widget class="QFrame" name="brushOptionsContainer">
+     <property name="frameShape">
+      <enum>QFrame::NoFrame</enum>
+     </property>
+     <property name="visible">
+      <bool>false</bool>
+     </property>
+     <layout class="QVBoxLayout">
+      <property name="contentsMargins">
+       <number>0</number><number>0</number><number>0</number><number>0</number>
+      </property>
+     </layout>
+    </widget>
    </item>
    <item>
     <widget class="QCheckBox" name="showCurrentSegmentCheckBox">

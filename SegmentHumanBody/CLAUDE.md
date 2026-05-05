@@ -2,6 +2,34 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Development Principles
+
+These rules override Claude's defaults and apply to every change in this repo.
+
+**Robustness and performance are the top priorities.**  Every code path that
+touches Slicer's MRML scene or VTK pipeline must be defensive (null-check
+nodes, catch VTK exceptions) and must not copy large arrays unnecessarily.
+
+**Delegate to 3D Slicer native tools first.**  Before writing custom logic,
+ask whether Slicer already provides it:
+- Brush / Erase / Paint effects → `qMRMLSegmentEditorWidget` effects
+- Undo / Redo → Segment Editor's built-in undo stack
+- Markup placement → `qSlicerSimpleMarkupsWidget` + `vtkMRMLMarkupsFiducialNode`
+- Volume display → `vtkMRMLScalarVolumeDisplayNode` (W/L, colormap)
+- Coordinate conversion → `vtkMRMLMarkupsNode`, `GetRASToIJKMatrix`
+- Rendering batching → `StartModify` / `EndModify` on any MRML node
+
+Only add custom code where Slicer has no equivalent or where the native path
+has a known performance problem (e.g. the MRML labelmap pipeline copies the
+full volume on every call — use the zero-copy VTK buffer path instead).
+
+**Logic has zero UI references.**  `SegmentHumanBodyLogic` must never import
+`qt` or reference `self.ui`.  The Widget reads UI state and calls Logic;
+Logic only touches MRML nodes and Slicer services.
+
+**No premature abstraction.**  Do not generalize a solution until the third
+concrete use-case appears.  Copy-paste is preferable to a leaky abstraction.
+
 ## Python Interpreter
 
 **Always use the Slicer-bundled Python** — there is no standard Python in PATH:

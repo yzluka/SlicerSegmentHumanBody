@@ -1,27 +1,28 @@
 import qt, vtk, slicer
 import logging
 import numpy as np
+import vtk.util.numpy_support as _vtk_ns
 from slicer.ScriptedLoadableModule import (
     ScriptedLoadableModule,
     ScriptedLoadableModuleWidget,
+    ScriptedLoadableModuleLogic,
     ScriptedLoadableModuleTest,
 )
 from slicer.util import VTKObservationMixin
 
-from core.modelFamilies import BaseModelFamily, SPXModelFamily, FAMILY_REGISTRY
-from core.utils import (
-    call_if_exists,
-    write_slice_to_volume,
-    next_segment_name,
-    parse_user_parameters,
-    ras_to_ijk_3d,
-)
-from core.modelRegistry import ModelRegistry
-from core._logic import SegmentHumanBodyLogic
-from core._state import WidgetState
+from core.utils import next_segment_name
+from core._mouse_recorder import get_recorder
 from core._input import StrokeHandler, BrushHandler, EraseHandler, PointHandler
 
 log = logging.getLogger(__name__)
+
+# MRML parameter-node reference keys
+_INPUT_VOLUME = 'InputVolume'
+_SEGMENTATION = 'Segmentation'
+
+# Segment tag keys — store the markup node IDs per segment natively
+_POS_TAG = 'SegmentHumanBody.posNodeID'
+_NEG_TAG = 'SegmentHumanBody.negNodeID'
 
 #
 # Module
@@ -36,9 +37,7 @@ class SegmentHumanBody(ScriptedLoadableModule):
             'Yixin Zhang (Duke University)',
             'Zafer Yildiz (Duke University)',
         ]
-        self.parent.acknowledgementText = (
-            'Developed at Duke University.'
-        )
+        self.parent.acknowledgementText = 'Developed at Duke University.'
 
 
 #
@@ -46,62 +45,48 @@ class SegmentHumanBody(ScriptedLoadableModule):
 #
 
 class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
+    """Pure wrapper around Slicer's native Segment Editor.
+
+    No model loading, no custom stroke tracking, no undo history.
+    Every tool delegates directly to the Segment Editor effect.
+    """
+
+    # Widgets that belong to model features.
+    # Hidden in this branch — layout preserved for future re-enabling.
+    _HIDDEN_WIDGETS = frozenset({
+        'modelFamilyDropdown', 'modelVariantDropdown',
+        'confirmModelSelection', 'paramTextEdit', 'docLinkLabel',
+        'assignLabel2D', 'assignLabel3D', 'runAutomaticSegmentation',
+        'expandSelectedLabelButton', 'showSPXBoundaryCheckBox',
+        'goToMarkupsButton', 'samMaskDropdown', 'sliceViewDropdown',
+        'exportAnnotationLogButton', 'importAnnotationLogButton',
+    })
 
     def __init__(self, parent=None):
-        super().__init__(parent)
+        ScriptedLoadableModuleWidget.__init__(self, parent)
         VTKObservationMixin.__init__(self)
+        self.logic = SegmentHumanBodyLogic()
+        self._parameterNode         = None
+        self._savedSegmentsVisible  = False
+        self._currentSegmentVisible = True
+        self.currentViewName        = 'Red'
+        self._recorder              = get_recorder()
+        self._loaded_record         = None
+        self._replay_engine         = None
+        self._eof_widget            = None   # borrowed EffectsOptionsFrame
+        self._eof_orig_parent       = None   # original parent to return it to
+        self._active_handler        = None   # current InputHandler subclass instance
+        self._active_prompt_widget  = None   # positivePrompts or negativePrompts last activated
+        self._suppressing_place_mode = False  # True while segment creation is in progress
+        self._observed_segmentation = None   # vtkMRMLSegmentationNode being tracked
+        self._observed_seg_obj      = None   # its vtkSegmentation (holds the event)
 
-        # Core state
-        self.logic           = SegmentHumanBodyLogic()
-        self.ctrl            = WidgetState(self)
-        self._parameterNode  = None
-        self.modelFamily     = None
-        self.currentViewName = None
-
-        # Undo history — each entry is a list:
-        #   ['brush',  change]                              — Paint stroke
-        #   ['erase',  change]                              — Erase stroke
-        #   ['expand', change]                              — Expand operation
-        #   ['point',  change, node, cp_id, ras, is_neg]   — confirmed prompt control point
-        # change is a MaskChange or None.
-        self._history    = []
-        self._redo_stack = []
-
-        # Currently active input handler (BrushHandler / EraseHandler /
-        # PointHandler), or None before setup completes.  Mutual exclusion is
-        # enforced by InputHandler._detach_current_tool_if_exists.
-        self._active_handler = None
-
-        # Keyboard shortcuts — assigned in setup(), parented to the UI widget.
-        self._undo_shortcut         = None
-        self._redo_shortcut         = None
-        self._expand_shortcut       = None
-        self._spx_boundary_shortcut = None
-        self._segments_shortcut     = None
-        self._tab_shortcut          = None
-
-        # SPX boundary overlay state
-        self._spx_boundary_node    = None   # vtkMRMLLabelMapVolumeNode
-        self._spx_boundary_visible = False
-        self._spx_boundary_view    = None   # view name the label is currently on
-
-        # Segment visibility toggle state
-        self._saved_segments_visible   = False  # other segments (checkbox)
-        self._current_segment_visible  = True   # segment being worked on (V)
-
-        # Last segment ID processed by onSegmentChanged.  Used to suppress the
-        # spurious deferred currentSegmentChanged emitted by
-        # qMRMLSegmentSelectorWidget after blockSignals(False).
-        self._acknowledged_segment_id  = None
-
-    # -------------------------
-    # Lifecycle
-    # -------------------------
+    # ------------------------------------------------------------------ #
+    # Lifecycle                                                            #
+    # ------------------------------------------------------------------ #
 
     def setup(self):
         super().setup()
-
-        self.currentViewName = "Red"
 
         uiWidget = slicer.util.loadUI(self.resourcePath('UI/SegmentHumanBody.ui'))
         uiWidget.setMRMLScene(slicer.mrmlScene)
@@ -112,1026 +97,947 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.segmentationNodeSelector.setMRMLScene(slicer.mrmlScene)
         self.ui.segmentSelector.setMRMLScene(slicer.mrmlScene)
         self.ui.segmentSelector.segmentationNodeSelectorVisible = False
-        self.ui.docLinkLabel.setOpenExternalLinks(True)
 
-        self.model_classes = FAMILY_REGISTRY
+        for name in self._HIDDEN_WIDGETS:
+            w = getattr(self.ui, name, None)
+            if w:
+                w.setVisible(False)
 
-        self.initializeUI()
-        self.connectSignals()
-
+        # Show the prompt widgets but hide the node-selector dropdowns inside
+        # them — the user places points via the place button, not via the selector.
         self.ui.positivePrompts.setNodeSelectorVisible(False)
         self.ui.negativePrompts.setNodeSelectorVisible(False)
+        self._set_prompt_nodes(None, None)  # configure placement mode; nodes wired later
 
-        # Keyboard shortcuts — parented to uiWidget so they are active only
-        # while this panel is visible.
-        self._undo_shortcut = qt.QShortcut(qt.QKeySequence("Ctrl+Z"), uiWidget)
-        self._undo_shortcut.connect('activated()', self.onUndo)
-
-        self._redo_shortcut = qt.QShortcut(qt.QKeySequence("Ctrl+Shift+Z"), uiWidget)
-        self._redo_shortcut.connect('activated()', self.onRedo)
-
-        self._expand_shortcut = qt.QShortcut(qt.QKeySequence("E"), uiWidget)
-        self._expand_shortcut.connect('activated()', self._onExpandShortcut)
-
-        self._spx_boundary_shortcut = qt.QShortcut(qt.QKeySequence("Q"), uiWidget)
-        self._spx_boundary_shortcut.connect('activated()', self.onToggleSPXBoundary)
-
-        self._segments_shortcut = qt.QShortcut(qt.QKeySequence("V"), uiWidget)
-        self._segments_shortcut.connect('activated()', lambda: self.onToggleCurrentSegment())
-
-        self._tab_shortcut = qt.QShortcut(qt.QKeySequence("A"), uiWidget)
-        self._tab_shortcut.connect('activated()', self.onAddSegment)
-
-        qt.QTimer.singleShot(0, self._initializeAfterSetup)
-        log.debug('[Setup complete]')
-
-    def cleanup(self):
-        """Called by Slicer when the module is unloaded."""
-        if self._active_handler:
-            self._active_handler.detach(self)
-        super().cleanup()
-
-    def _initializeAfterSetup(self):
-        if not slicer.mrmlScene:
-            return
-
-        nodes = slicer.mrmlScene.GetNodesByClass('vtkMRMLMarkupsFiducialNode')
-        log.debug('[Existing markups nodes]:')
-        for i in range(nodes.GetNumberOfItems()):
-            log.debug(f' - {nodes.GetItemAsObject(i).GetName()}')
-
+        self._connectSignals(uiWidget)
         self.initializeParameterNode()
-        self.setParameterNode(self._parameterNode)
-        self.onModelFamilyChanged()
-
-        qt.QTimer.singleShot(0, self.updateGUIFromParameterNode)
+        self._update_record_ui()
+        self._recorder.context_fn = self._recorder_context
         qt.QTimer.singleShot(0, self._preloadSegmentEditor)
 
+    def cleanup(self):
+        self._recorder.context_fn = None
+        self.removeObservers()
+        self._deactivateEffect()
+        self._returnEffectsOptionsFrame()
+
+    def enter(self):
+        self.initializeParameterNode()
+
+    def exit(self):
+        self._deactivateEffect()
+        self._returnEffectsOptionsFrame()
+
     def _preloadSegmentEditor(self):
-        # Switch to Segment Editor and back so its widget is fully initialised
-        # before the user clicks Brush — both calls happen in the same stack
-        # frame so the user sees no visible flash.
         if slicer.modules.segmenteditor.widgetRepresentation() is None:
             slicer.util.selectModule('SegmentEditor')
             slicer.util.selectModule(self.moduleName)
 
-    # -------------------------
-    # UI
-    # -------------------------
+    @staticmethod
+    def _configureUnlimitedPlacement(markups_widget):
+        """Put a qSlicerSimpleMarkupsWidget in persistent multi-point placement.
 
-    def initializeUI(self):
-        dropdowns = ['modelFamilyDropdown', 'samMaskDropdown', 'modelVariantDropdown']
-        for name in dropdowns:
-            if hasattr(self.ui, name):
-                getattr(self.ui, name).blockSignals(True)
+        Slicer 4.x used setMaximumNumberOfMarkups; 5.x exposes the inner
+        qMRMLMarkupsPlaceWidget directly.  We try both so the code is version-
+        agnostic.
+        """
+        # Slicer 4.x / some 5.x builds
+        if hasattr(markups_widget, 'setMaximumNumberOfMarkups'):
+            markups_widget.setMaximumNumberOfMarkups(-1)
+            return
+        # Slicer 5.x: find the internal qSlicerMarkupsPlaceWidget (may be nested).
+        # PlaceMultipleMarkupsType enum: ShowPlaceMultipleMarkupsOption=0,
+        # HidePlaceMultipleMarkupsOption=1, ForcePlaceSingleMarkup=2,
+        # ForcePlaceMultipleMarkups=3.
+        for child in markups_widget.findChildren(qt.QWidget):
+            if hasattr(child, 'setPlaceMultipleMarkups'):
+                force = getattr(child, 'ForcePlaceMultipleMarkups', 3)
+                child.setPlaceMultipleMarkups(force)
+                return
+        log.warning('[setup] Could not configure continuous markup placement on %s',
+                    markups_widget.objectName)
 
-        self.ui.modelFamilyDropdown.clear()
-        self.ui.modelFamilyDropdown.addItems(list(self.model_classes.keys()))
+    def _set_prompt_nodes(self, pos_node, neg_node):
+        """Wire both markup widgets to the given nodes and re-apply placement config.
 
-        self.ui.samMaskDropdown.clear()
-        self.ui.samMaskDropdown.addItems(['Mask-1', 'Mask-2', 'Mask-3'])
-        # Slice view is auto-detected from mouse position; hide the manual dropdown.
-        self.ui.sliceViewDropdown.setVisible(False)
+        Negative is configured first so that positive ends up as the last-touched
+        widget — Slicer makes the last setCurrentNode call the active placement target.
+        """
+        self.ui.negativePrompts.setCurrentNode(neg_node)
+        self._configureUnlimitedPlacement(self.ui.negativePrompts)
+        self.ui.positivePrompts.setCurrentNode(pos_node)
+        self._configureUnlimitedPlacement(self.ui.positivePrompts)
 
-        for name in dropdowns:
-            if hasattr(self.ui, name):
-                getattr(self.ui, name).blockSignals(False)
+    # ------------------------------------------------------------------ #
+    # Signal wiring                                                        #
+    # ------------------------------------------------------------------ #
 
-    def updateUIVisibility(self):
-        visible = self.modelFamily.VISIBLE_BUTTONS if self.modelFamily else frozenset()
-        ALL_BUTTONS = {
-            'assignLabel2D', 'assignLabel3D',
-            'expandSelectedLabelButton', 'showSPXBoundaryCheckBox',
-            'runAutomaticSegmentation', 'goToMarkupsButton', 'samMaskDropdown',
-            'exportAnnotationLogButton',
-            'importAnnotationLogButton',
-            'negativePrompts', 'negativePromptLabel',
-            'positivePrompts', 'positivePromptLabel',
-        }
-        for name in ALL_BUTTONS:
-            getattr(self.ui, name).setVisible(name in visible)
-
-    # -------------------------
-    # Signals & Observers
-    # -------------------------
-
-    def connectSignals(self):
+    def _connectSignals(self, uiWidget):
         ui = self.ui
-
-        for ui_name, method_name in [
-            ('assignLabel2D',            'on_assign_2d'),
-            ('assignLabel3D',            'on_assign_3d'),
-            ('runAutomaticSegmentation', 'on_automatic_segmentation'),
-        ]:
-            getattr(ui, ui_name).connect('clicked(bool)', self.bind(method_name, target="model"))
-
-        ui.expandSelectedLabelButton.connect('clicked(bool)', lambda _=None: self._onExpand())
-
-        for ui_name, method in [
-            ('goToMarkupsButton',      self.on_go_to_markups),
-            ('confirmModelSelection',  self.onConfirmClicked),
-            ('addSegmentButton',       self.onAddSegment),
-            ('removeSegmentButton',    self.onRemoveSegment),
-            ('applyWindowLevelButton', self.onApplyWindowLevel),
-        ]:
-            getattr(ui, ui_name).connect('clicked(bool)', method)
-
-        ui.exportAnnotationLogButton.connect(
-            'clicked(bool)',
-            lambda _=None: call_if_exists(self.modelFamily, 'on_export', self),
-        )
-        ui.importAnnotationLogButton.connect(
-            'clicked(bool)',
-            lambda _=None: call_if_exists(self.modelFamily, 'on_import', self),
-        )
-
-        ui.showSPXBoundaryCheckBox.connect('toggled(bool)', self.onToggleSPXBoundary)
-        ui.showCurrentSegmentCheckBox.connect('toggled(bool)', self.onToggleCurrentSegment)
-        ui.showSegmentsCheckBox.connect('toggled(bool)', self.onToggleSavedSegments)
-
-        ui.modelFamilyDropdown.connect('currentIndexChanged(int)', self.onModelFamilyChanged)
-        ui.modelVariantDropdown.connect('currentIndexChanged(int)', self.onVariantChanged)
-        ui.sourceVolumeSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.updateParameterNodeFromGUI)
-        ui.segmentationNodeSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.updateParameterNodeFromGUI)
-        ui.segmentSelector.connect("currentSegmentChanged(QString)", self.onSegmentChanged)
-
-        ui.windowSlider.connect('valueChanged(int)', self._onWindowSliderChanged)
+        ui.sourceVolumeSelector.connect('currentNodeChanged(vtkMRMLNode*)',
+                                        self._onNodeSelectorChanged)
+        ui.segmentationNodeSelector.connect('currentNodeChanged(vtkMRMLNode*)',
+                                            self._onNodeSelectorChanged)
+        ui.segmentSelector.connect('currentSegmentChanged(QString)',
+                                   self._onSegmentIDChanged)
+        ui.addSegmentButton.connect('clicked(bool)', self._onAddSegment)
+        ui.removeSegmentButton.connect('clicked(bool)', self._onRemoveSegment)
+        ui.brushToolButton.connect('toggled(bool)', self._onBrushToggled)
+        ui.eraseToolButton.connect('toggled(bool)', self._onEraseToggled)
+        ui.overwriteModeDropdown.connect('currentIndexChanged(int)', self._onOverwriteModeChanged)
+        ui.windowSlider.connect('valueChanged(int)',  self._onWindowSliderChanged)
         ui.windowSpinBox.connect('valueChanged(int)', self._onWindowSpinBoxChanged)
-        ui.levelSlider.connect('valueChanged(int)', self._onLevelSliderChanged)
-        ui.levelSpinBox.connect('valueChanged(int)', self._onLevelSpinBoxChanged)
+        ui.levelSlider.connect('valueChanged(int)',   self._onLevelSliderChanged)
+        ui.levelSpinBox.connect('valueChanged(int)',  self._onLevelSpinBoxChanged)
+        ui.applyWindowLevelButton.connect('clicked(bool)', self._onApplyWindowLevel)
+        ui.showCurrentSegmentCheckBox.connect('toggled(bool)', self._onToggleCurrentSegment)
+        ui.showSegmentsCheckBox.connect('toggled(bool)', self._onToggleSavedSegments)
 
-        ui.brushToolButton.connect('toggled(bool)', self.onBrushToggled)
-        ui.eraseToolButton.connect('toggled(bool)', self.onEraseToggled)
-        ui.brushDiameterSlider.connect('valueChanged(int)', self._onBrushDiameterSliderChanged)
-        ui.brushDiameterSpinBox.connect('valueChanged(int)', self._onBrushDiameterSpinBoxChanged)
-        ui.brushSphereCheckBox.connect('toggled(bool)', lambda _: self._applyBrushParams())
+        ui.recordButton.connect('clicked(bool)',       self.onRecord)
+        ui.stopRecordButton.connect('clicked(bool)',   self.onStopRecord)
+        ui.exportRecordButton.connect('clicked(bool)', self.onExportRecord)
+        ui.loadRecordButton.connect('clicked(bool)',   self.onLoadRecord)
+        ui.replayRecordButton.connect('clicked(bool)', self.onReplayRecord)
 
-        # Activating either place widget must deactivate the active stroke handler.
-        # Connected via Qt signal (not VTK observer) so it fires immediately.
-        ui.positivePrompts.activeMarkupsFiducialPlaceModeChanged.connect(self._onPlaceModeChanged)
-        ui.negativePrompts.activeMarkupsFiducialPlaceModeChanged.connect(self._onPlaceModeChanged)
+        # Record volume / seg changes when active.
+        ui.sourceVolumeSelector.connect(
+            'currentNodeChanged(vtkMRMLNode*)',
+            lambda node: (self._recorder.record_volume_changed(node.GetName() if node else None)
+                          if self._recorder.is_active else None),
+        )
+        ui.segmentationNodeSelector.connect(
+            'currentNodeChanged(vtkMRMLNode*)',
+            lambda node: (self._recorder.record_volume_changed(f'seg:{node.GetName()}' if node else None)
+                          if self._recorder.is_active else None),
+        )
 
-    def _observeMarkupsNodes(self):
-        # removeObservers() wipes ALL VTK observers added via addObserver,
-        # including the parameterNode → updateGUIFromParameterNode observer set
-        # in setParameterNode.  Re-add it immediately so GUI updates keep working.
-        self.removeObservers()
-        if self._parameterNode:
-            self.addObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent,
-                             self.updateGUIFromParameterNode)
+        # Connect point-placement mode changes so PointHandler runs the segment guard.
+        # Pass the source widget so _onPlaceModeChanged can track which list is active.
+        for markup_widget in (ui.positivePrompts, ui.negativePrompts):
+            for child in markup_widget.findChildren(qt.QWidget):
+                if hasattr(child, 'setPlaceMultipleMarkups'):
+                    child.connect(
+                        'activeMarkupsFiducialPlaceModeChanged(bool)',
+                        lambda active, w=markup_widget: self._onPlaceModeChanged(active, w),
+                    )
+                    break
 
-        posNode, negNode = self.logic.getPromptNodes(self._parameterNode)
-        for node in [posNode, negNode]:
-            if node:
-                self.addObserver(node, slicer.vtkMRMLMarkupsNode.PointPositionDefinedEvent,
-                                 self._onPointConfirmed)
-                self.addObserver(node, slicer.vtkMRMLMarkupsNode.PointRemovedEvent,
-                                 self._onPointRemoved)
+        sc = qt.QShortcut
+        sc(qt.QKeySequence('Ctrl+Z'),       uiWidget).connect('activated()', self._onUndo)
+        sc(qt.QKeySequence('Ctrl+Shift+Z'), uiWidget).connect('activated()', self._onRedo)
+        sc(qt.QKeySequence('V'), uiWidget).connect(
+            'activated()', lambda: ui.showCurrentSegmentCheckBox.toggle())
+        sc(qt.QKeySequence('A'), uiWidget).connect('activated()', self._onAddSegment)
 
-        self._connectSliceObservers()
-
-    def _connectSliceObservers(self):
-        # Re-registered here so it survives the removeObservers() call inside
-        # _observeMarkupsNodes.
-        interactionNode = slicer.app.applicationLogic().GetInteractionNode()
-        if interactionNode:
-            self.addObserver(interactionNode, vtk.vtkCommand.ModifiedEvent,
-                             self._onInteractionModeChanged)
-
-    # -------------------------
-    # Parameter Node
-    # -------------------------
+    # ------------------------------------------------------------------ #
+    # Parameter node                                                       #
+    # ------------------------------------------------------------------ #
 
     def initializeParameterNode(self):
-        self._parameterNode = self.logic.getParameterNode()
-        if not self._parameterNode:
-            self._parameterNode = slicer.mrmlScene.AddNewNodeByClass(
-                'vtkMRMLScriptedModuleNode'
-            )
-        self.logic.setDefaultParameters(self._parameterNode)
-        self.logic.ensurePromptNodesExist(self._parameterNode)
-
-    def setParameterNode(self, inputParameterNode):
+        pn = self.logic.getParameterNode()
+        if pn is None:
+            pn = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLScriptedModuleNode',
+                                                    self.moduleName)
+        if pn is self._parameterNode:
+            return
         if self._parameterNode:
             self.removeObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent,
-                                self.updateGUIFromParameterNode)
-        self._parameterNode = inputParameterNode
-        if self._parameterNode:
-            self.addObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent,
-                             self.updateGUIFromParameterNode)
-            self._observeMarkupsNodes()
-        qt.QTimer.singleShot(0, self.updateGUIFromParameterNode)
+                                self._onParameterNodeModified)
+        self._parameterNode = pn
+        self.addObserver(pn, vtk.vtkCommand.ModifiedEvent, self._onParameterNodeModified)
+        qt.QTimer.singleShot(0, self._onParameterNodeModified)
 
-    def updateGUIFromParameterNode(self, caller=None, event=None):
+    def _onParameterNodeModified(self, *_):
         if not self._parameterNode:
             return
-
-        posNode, negNode = self.logic.getPromptNodes(self._parameterNode)
-        volumeNode, segNode = self.logic.getVolumeAndSegmentation(self._parameterNode)
-
-        # Pause so programmatic setCurrentNode calls do not spuriously fire
-        # activeMarkupsFiducialPlaceModeChanged and activate PointHandler.
-        self.ctrl.pause()
-        try:
-            self.ui.positivePrompts.setCurrentNode(posNode)
-            self.ui.negativePrompts.setCurrentNode(negNode)
-        finally:
-            self.ctrl.resume()
-
-        self.ui.sourceVolumeSelector.setCurrentNode(volumeNode)
-        self.ui.segmentationNodeSelector.setCurrentNode(segNode)
-        self.ui.segmentSelector.setCurrentNode(segNode)
-        self.ui.addSegmentButton.setEnabled(segNode is not None)
-
-        # Apply visibility rules to the newly active segmentation.
-        currentID = self.ui.segmentSelector.currentSegmentID() if segNode else None
-        self._apply_saved_segments_visibility(exclude=currentID)
-        self._current_segment_visible = True
-        if segNode and currentID:
-            dn = segNode.GetDisplayNode()
-            if dn:
-                dn.SetSegmentVisibility(currentID, True)
-        self._sync_annotation_visibility()
+        vol = self._parameterNode.GetNodeReference(_INPUT_VOLUME)
+        seg = self._parameterNode.GetNodeReference(_SEGMENTATION)
+        self.ui.sourceVolumeSelector.setCurrentNode(vol)
+        self.ui.segmentationNodeSelector.setCurrentNode(seg)
+        if seg:
+            self.ui.segmentSelector.setCurrentNode(seg)
+        self.ui.addSegmentButton.setEnabled(vol is not None)
+        self._syncWLFromVolume(vol)
         self.ui.showCurrentSegmentCheckBox.blockSignals(True)
         self.ui.showCurrentSegmentCheckBox.setChecked(True)
         self.ui.showCurrentSegmentCheckBox.blockSignals(False)
         self.ui.showSegmentsCheckBox.blockSignals(True)
-        self.ui.showSegmentsCheckBox.setChecked(self._saved_segments_visible)
+        self.ui.showSegmentsCheckBox.setChecked(self._savedSegmentsVisible)
         self.ui.showSegmentsCheckBox.blockSignals(False)
+        segID = self.ui.segmentSelector.currentSegmentID() if seg else None
+        self.logic.set_saved_segments_visibility(seg, segID, self._savedSegmentsVisible)
+        if seg and segID:
+            pos_node, neg_node = self.logic.get_segment_prompt_nodes(seg, segID)
+        else:
+            pos_node, neg_node = None, None
+        self._set_prompt_nodes(pos_node, neg_node)
 
-    def updateParameterNodeFromGUI(self, caller=None, event=None):
+    def _onNodeSelectorChanged(self, *_):
         if not self._parameterNode:
             return
+        vol = self.ui.sourceVolumeSelector.currentNode()
+        seg = self.ui.segmentationNodeSelector.currentNode()
+        # Externally loaded segmentation nodes may have no display node, which
+        # causes qMRMLSegmentsModel to warn. Ensure one exists before the
+        # segment selector tries to render the segment list.
+        if seg and not seg.GetDisplayNode():
+            seg.CreateDefaultDisplayNodes()
+        self._parameterNode.SetNodeReferenceID(
+            _INPUT_VOLUME, vol.GetID() if vol else '')
+        self._parameterNode.SetNodeReferenceID(
+            _SEGMENTATION, seg.GetID() if seg else '')
+        self._parameterNode.Modified()
+        self._syncWLFromVolume(vol)
+        self._rewire_segmentation_observer(seg)
 
-        volumeNode = self.ui.sourceVolumeSelector.currentNode()
-        self._syncWLSlidersFromVolume(volumeNode)
-        segNode = self.ui.segmentationNodeSelector.currentNode()
+    # ------------------------------------------------------------------ #
+    # Segment-rename sync                                                  #
+    # ------------------------------------------------------------------ #
 
-        # Auto-create a segmentation node when a volume is selected but none
-        # exists yet — selecting a volume is the natural trigger for this.
-        if volumeNode and not segNode:
-            segNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode")
-            segNode.CreateDefaultDisplayNodes()
-            segNode.SetReferenceImageGeometryParameterFromVolumeNode(volumeNode)
-            segNode.CreateClosedSurfaceRepresentation()
+    def _rewire_segmentation_observer(self, seg):
+        """Keep exactly one SegmentModified observer on the active segmentation.
 
-        self.logic.setPromptNodes(
-            self._parameterNode,
-            self.ui.positivePrompts.currentNode(),
-            self.ui.negativePrompts.currentNode(),
-        )
-        self.logic.setVolumeAndSegmentation(self._parameterNode, volumeNode, segNode)
-        self._parameterNode.Modified()  # triggers updateGUIFromParameterNode via observer
-
-    # -------------------------
-    # Model selection
-    # -------------------------
-
-    def onModelFamilyChanged(self, *args):
-        self.setConfirmState(False)
-        ModelClass = self.model_classes.get(self.ui.modelFamilyDropdown.currentText,
-                                            BaseModelFamily)
-        self.modelFamily = ModelClass()
-        self.updateModelVariants()
-        if hasattr(self.modelFamily, "VARIANTS") and self.modelFamily.VARIANTS:
-            self.modelFamily.variant = self.modelFamily.VARIANTS[0]
-        self.updateUIVisibility()
-        self.updateParamPlaceholder()
-        if not isinstance(self.modelFamily, SPXModelFamily):
-            self._hideSPXBoundary()
-        # Auto-confirm families that declare no variants (e.g. TimedAnnotatorFamily).
-        if hasattr(self.modelFamily, 'VARIANTS') and not self.modelFamily.VARIANTS:
-            self.logic.on_confirm_model(self)
-            self.setConfirmState(True)
-
-    def updateModelVariants(self):
-        dropdown = self.ui.modelVariantDropdown
-        dropdown.blockSignals(True)
-        dropdown.clear()
-        variants = (self.modelFamily.VARIANTS
-                    if self.modelFamily and hasattr(self.modelFamily, "VARIANTS")
-                    else ["None"])
-        dropdown.addItems(variants)
-        if variants:
-            dropdown.setCurrentIndex(0)
-        dropdown.blockSignals(False)
-
-    def onVariantChanged(self, *args):
-        self.setConfirmState(False)
-        if not self.modelFamily:
+        The event lives on vtkSegmentation (the inner object), not on
+        vtkMRMLSegmentationNode, so we observe GetSegmentation() directly.
+        """
+        new_obj = seg.GetSegmentation() if seg is not None else None
+        old_obj = self._observed_seg_obj
+        if old_obj is new_obj:
             return
-        self.modelFamily.variant = self.ui.modelVariantDropdown.currentText
-        self.updateParamPlaceholder()
+        if old_obj is not None:
+            self.removeObserver(old_obj, old_obj.SegmentModified,
+                                self._onSegmentModified)
+        self._observed_segmentation = seg
+        self._observed_seg_obj      = new_obj
+        if new_obj is not None:
+            self.addObserver(new_obj, new_obj.SegmentModified,
+                             self._onSegmentModified)
 
-    def onConfirmClicked(self, *args):
-        if not self.modelFamily or not self.modelFamily.variant:
+    def _onSegmentModified(self, caller, event, callData=None):
+        """Rename markup nodes when their owning segment is renamed."""
+        seg_id = str(callData) if callData is not None else None
+        if not seg_id or self._observed_segmentation is None:
+            return
+        self.logic.sync_prompt_node_names(self._observed_segmentation, seg_id)
+
+    # ------------------------------------------------------------------ #
+    # Recording                                                            #
+    # ------------------------------------------------------------------ #
+
+    def onRecord(self, *_):
+        if self._recorder.is_active:
+            return
+        vol = self._parameterNode.GetNodeReference(_INPUT_VOLUME) if self._parameterNode else None
+        seg = self._parameterNode.GetNodeReference(_SEGMENTATION) if self._parameterNode else None
+        self._recorder.start(
+            volume_node       = vol,
+            segmentation_name = seg.GetName() if seg else None,
+        )
+        self._update_record_ui()
+
+    def onStopRecord(self, *_):
+        if not self._recorder.is_active:
+            return
+        self._recorder.stop()
+        self._update_record_ui()
+
+    def onExportRecord(self, *_):
+        if self._recorder.is_active:
+            self._recorder.stop()
+            self._update_record_ui()
+        path = qt.QFileDialog.getSaveFileName(None, 'Save Recording', '', 'JSON files (*.json)')
+        if not path:
+            return
+        if not path.endswith('.json'):
+            path += '.json'
+        try:
+            self._recorder.save_to_file(path)
+            slicer.util.infoDisplay(f'Recording saved to:\n{path}')
+        except Exception as exc:
+            slicer.util.errorDisplay(f'Failed to save recording:\n{exc}')
+
+    def onLoadRecord(self, *_):
+        from core._mouse_recorder import MouseEventRecorder
+        path = qt.QFileDialog.getOpenFileName(None, 'Load Recording', '', 'JSON files (*.json)')
+        if not path:
             return
         try:
-            self.logic.on_confirm_model(self)
-        except ValueError as exc:
-            slicer.util.warningDisplay(str(exc))
-            return
-        self.setConfirmState(True)
-        self.updateDocLink()
+            self._loaded_record = MouseEventRecorder.load_from_file(path)
+            slicer.util.infoDisplay(f'Loaded {len(self._loaded_record)} events from:\n{path}')
+        except Exception as exc:
+            slicer.util.errorDisplay(f'Failed to load recording:\n{exc}')
+        self._update_record_ui()
 
-    def setConfirmState(self, confirmed: bool):
-        button = self.ui.confirmModelSelection
-        if confirmed:
-            button.setEnabled(False)
-            button.setText("Model Confirmed")
+    def onReplayRecord(self, *_):
+        if self._loaded_record is None:
+            slicer.util.warningDisplay('No recording loaded. Use Load first.')
+            return
+        from core._replay import ReplayEngine
+        if self._replay_engine is not None and self._replay_engine.is_running:
+            self._replay_engine.stop()
+        self._replay_engine = ReplayEngine()
+        self._replay_engine.start(self._loaded_record, self, on_done=self._on_replay_done)
+
+    def _on_replay_done(self):
+        self._update_record_ui()
+        slicer.util.infoDisplay('Replay complete.')
+
+    def _update_record_ui(self):
+        ui        = self.ui
+        is_active = self._recorder.is_active
+        has_events = len(self._recorder) > 0
+
+        replay_ok     = False
+        replay_reason = ''
+        if self._loaded_record is not None and not is_active:
+            vol = (self._parameterNode.GetNodeReference(_INPUT_VOLUME)
+                   if self._parameterNode else None)
+            replay_ok, replay_reason = self._loaded_record.matches_volume(vol)
+
+        ui.recordButton.setVisible(not is_active)
+        ui.stopRecordButton.setVisible(is_active)
+        ui.exportRecordButton.setEnabled(is_active or has_events)
+        ui.replayRecordButton.setEnabled(replay_ok)
+
+        if is_active:
+            status = f'Recording... ({len(self._recorder)} events)'
+        elif self._loaded_record is not None:
+            n = len(self._loaded_record)
+            status = (f'Loaded: {n} events — ready to replay' if replay_ok
+                      else f'Loaded: {n} events — {replay_reason}')
+        elif has_events:
+            status = f'Recorded: {len(self._recorder)} events'
         else:
-            button.setEnabled(True)
-            button.setText("Confirm Model Selection")
+            status = ''
+        ui.recordStatusLabel.setText(status)
 
-    def getUserParameters(self):
-        return parse_user_parameters(self.ui.paramTextEdit.toPlainText())
-
-    def updateParamPlaceholder(self):
-        if not self.modelFamily or not self.modelFamily.variant:
-            self.ui.paramTextEdit.setPlaceholderText("Select a model variant.")
-            return
-        try:
-            key = (self.modelFamily._get_model_key()
-                   if hasattr(self.modelFamily, "_get_model_key")
-                   else self.modelFamily.variant)
-            placeholder = ModelRegistry.get_param_hint(key)
-        except Exception:
-            placeholder = "Model not available. Please select a different model."
-        self.ui.paramTextEdit.setPlaceholderText(placeholder)
-
-    def updateDocLink(self):
-        model = getattr(self.modelFamily, "model", None)
-        if not model:
-            self.ui.docLinkLabel.setText("")
-            return
-        url = getattr(model, "DOC_URL", None)
-        self.ui.docLinkLabel.setText(
-            f'<a href="{url}">View documentation</a>' if url else ""
-        )
-
-    def on_go_to_markups(self, *args):
-        slicer.util.selectModule('Markups')
-
-    def bind(self, method_name, target="logic"):
-        if target == "logic":
-            return lambda _=None: getattr(self.logic, method_name)(self)
-        elif target == "model":
-            return lambda _=None: call_if_exists(self.modelFamily, method_name)
+    def _recorder_context(self) -> dict:
+        seg_id = self.ui.segmentSelector.currentSegmentID()
+        if self.ui.brushToolButton.isChecked():
+            tool = 'brush'
+        elif self.ui.eraseToolButton.isChecked():
+            tool = 'erase'
         else:
-            return getattr(self, method_name)
+            tool = None
+        # Resolve active slice so replay can re-paint strokes on the right slice.
+        pn = self._parameterNode
+        vol = pn.GetNodeReference(_INPUT_VOLUME) if pn else None
+        axis, slice_idx = self.logic.active_slice_info(self.currentViewName, vol)
+        if tool in ('brush', 'erase'):
+            editor = self.logic.get_segment_editor()
+            pn_ed  = editor.mrmlSegmentEditorNode() if editor else None
+            try:
+                diam = float(pn_ed.GetAttribute('BrushAbsoluteDiameter') or 10)
+            except Exception:
+                diam = 10.0
+            brush_radius_mm = diam / 2.0
+        else:
+            brush_radius_mm = None
+        return {
+            'segment_id':      seg_id,
+            'tool':            tool,
+            'view_name':       self.currentViewName,
+            'axis':            axis,
+            'slice_idx':       slice_idx,
+            'brush_radius_mm': brush_radius_mm,
+        }
 
-    # -------------------------
-    # Segment management
-    # -------------------------
+    # ------------------------------------------------------------------ #
+    # Segment Editor effects                                               #
+    # ------------------------------------------------------------------ #
 
-    def getOrCreateSegmentationNode(self):
-        volumeNode = self.ui.sourceVolumeSelector.currentNode()
-        segNode    = self.ui.segmentationNodeSelector.currentNode()
-        if not segNode and self._parameterNode:
-            _, segNode = self.logic.getVolumeAndSegmentation(self._parameterNode)
-        if not segNode and volumeNode:
-            segNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode")
-            segNode.CreateDefaultDisplayNodes()
-            segNode.SetReferenceImageGeometryParameterFromVolumeNode(volumeNode)
-            segNode.CreateClosedSurfaceRepresentation()
-            self.logic.setVolumeAndSegmentation(self._parameterNode, volumeNode, segNode)
-            self._parameterNode.Modified()
-        return segNode
+    def _deactivateEffect(self):
+        handler = self._active_handler
+        if handler is not None:
+            handler.detach(self)
+        else:
+            # Fallback: no handler registered — clean up the editor directly.
+            self._returnEffectsOptionsFrame()
+            editor = self.logic.get_segment_editor()
+            if editor:
+                editor.setActiveEffectByName('')
+            for btn in (self.ui.brushToolButton, self.ui.eraseToolButton):
+                btn.blockSignals(True)
+                btn.setChecked(False)
+                btn.blockSignals(False)
 
-    def onAddSegment(self, *args):
-        # Cache and detach the active stroke handler before creating the segment.
-        # clearPrompts() (triggered via onSegmentChanged → setCurrentSegmentID)
-        # sets _active_handler = PointHandler() directly without going through
-        # the detach lifecycle.  We flush + detach first so the handler is
-        # cleanly removed, then restore it in the finally block after creation.
-        prior_handler_class = (
-            type(self._active_handler)
-            if isinstance(self._active_handler, StrokeHandler)
-            else None
-        )
+    # ------------------------------------------------------------------ #
+    # Segment management                                                   #
+    # ------------------------------------------------------------------ #
+
+    def _onAddSegment(self, *_):
+        pn = self._parameterNode
+        vol, seg = self.logic.getVolumeAndSegmentation(pn)
+        if not vol:
+            vol = self.ui.sourceVolumeSelector.currentNode()
+        if not seg:
+            seg = self.ui.segmentationNodeSelector.currentNode()
+        # Auto-create segmentation when a volume is present but none exists yet.
+        if vol and not seg:
+            seg = self.logic.create_segmentation_for_volume(vol)
+            self.ui.segmentationNodeSelector.blockSignals(True)
+            self.ui.segmentationNodeSelector.setCurrentNode(seg)
+            self.ui.segmentationNodeSelector.blockSignals(False)
+            self.ui.segmentSelector.setCurrentNode(seg)
+            self.ui.addSegmentButton.setEnabled(True)
+            if pn:
+                pn.SetNodeReferenceID(_SEGMENTATION, seg.GetID())
+        if not seg:
+            slicer.util.warningDisplay('Please select a volume first.')
+            return
+        # Cache the active handler before creation, detach cleanly, then restore.
+        # Suppress place-mode signals during creation so setCurrentNode calls inside
+        # _set_prompt_nodes don't spuriously re-activate the wrong widget.
+        prev_stroke_cls    = type(self._active_handler) if isinstance(self._active_handler, StrokeHandler) else None
+        prev_prompt_widget = self._active_prompt_widget  if isinstance(self._active_handler, PointHandler)  else None
         if self._active_handler is not None:
             self._active_handler.detach(self)
-
-        segment_created = False
-        self.ctrl.pause()
+        self._suppressing_place_mode = True
         try:
-            segNode = self.getOrCreateSegmentationNode()
-            if not segNode:
-                slicer.util.warningDisplay("Please select a volume first.")
-                return
-            segmentation = segNode.GetSegmentation()
-            existing = {
-                segmentation.GetNthSegment(i).GetName()
-                for i in range(segmentation.GetNumberOfSegments())
-            }
-            seg_name  = next_segment_name(existing)
-            segmentID = segmentation.AddEmptySegment(seg_name)
-            call_if_exists(self.modelFamily, 'on_segment_created', segmentID, seg_name,
-                           segmentation_node=segNode)
-            self.ui.segmentSelector.setCurrentSegmentID(segmentID)
-            segment_created = True
+            new_id = self.logic.add_segment(seg)
+            if new_id:
+                self.ui.segmentSelector.setCurrentSegmentID(new_id)
         finally:
-            self.ctrl.resume()
-            if prior_handler_class is not None:
-                prior_handler_class().attach(self)
+            self._suppressing_place_mode = False
+            if prev_stroke_cls is not None:
+                prev_stroke_cls().attach(self)
+            elif prev_prompt_widget is not None:
+                for child in prev_prompt_widget.findChildren(qt.QWidget):
+                    if hasattr(child, 'setPlaceModeEnabled'):
+                        child.setPlaceModeEnabled(True)
+                        break
 
-        if segment_created:
-            self._clear_history()
-
-    def onRemoveSegment(self, *args):
-        self.ctrl.pause()
-        try:
-            segNode   = self.ui.segmentationNodeSelector.currentNode()
-            segmentID = self.ui.segmentSelector.currentSegmentID()
-            if not segNode or not segmentID:
-                slicer.util.warningDisplay("No segment selected.")
-                return
-            segNode.GetSegmentation().RemoveSegment(segmentID)
-        finally:
-            self.ctrl.resume()
-        if segNode and segmentID:
-            self._clear_history()
-            if isinstance(self._active_handler, StrokeHandler):
-                self._active_handler.reset(self)
-
-    def onSegmentChanged(self, segmentID):
-        if not segmentID or self.ctrl.creating_segment:
+    def _onRemoveSegment(self, *_):
+        seg   = self.ui.segmentationNodeSelector.currentNode()
+        segID = self.ui.segmentSelector.currentSegmentID()
+        if not seg or not segID:
+            slicer.util.warningDisplay('No segment selected.')
             return
-        if segmentID == self._acknowledged_segment_id:
+        self.logic.delete_segment_prompt_nodes(seg, segID)
+        self.logic.remove_segment(seg, segID)
+
+    def _onSegmentIDChanged(self, segmentID):
+        seg = self.ui.segmentationNodeSelector.currentNode()
+        if not segmentID or not seg:
+            # No segment selected — clear the prompt widgets.
+            self._set_prompt_nodes(None, None)
             return
-        self._acknowledged_segment_id = segmentID
-        if self.ui.brushToolButton.isChecked() or self.ui.eraseToolButton.isChecked():
-            editor = self._segEditor()
-            if editor:
-                editor.setCurrentSegmentID(segmentID)
-                self.ctrl.brush_in_progress = False
-        self.ctrl.pause()
-        try:
-            self.clearPrompts()
-        finally:
-            self.ctrl.resume()
-        segNode = self.ui.segmentSelector.currentNode()
-        if segNode and segmentID:
-            self._clear_history()
-            if isinstance(self._active_handler, StrokeHandler):
-                self._active_handler.reset(self)
-            # Apply saved-segment rule to all others; always show the new current.
-            self._apply_saved_segments_visibility(exclude=segmentID)
-            self._current_segment_visible = True
-            dn = segNode.GetDisplayNode()
-            if dn:
-                dn.SetSegmentVisibility(segmentID, True)
-            self._sync_annotation_visibility()
-            self.ui.showCurrentSegmentCheckBox.blockSignals(True)
-            self.ui.showCurrentSegmentCheckBox.setChecked(True)
-            self.ui.showCurrentSegmentCheckBox.blockSignals(False)
+        pos_node, neg_node = self.logic.get_segment_prompt_nodes(seg, segmentID)
+        self._set_prompt_nodes(pos_node, neg_node)
 
-    def clearPrompts(self):
-        self._clear_history()
-        if isinstance(self._active_handler, StrokeHandler):
-            self._active_handler.reset(self)
+        editor = self.logic.get_segment_editor()
+        if editor and editor.currentSegmentID() != segmentID:
+            editor.setCurrentSegmentID(segmentID)
+        self.logic.set_saved_segments_visibility(seg, segmentID,
+                                                 self._savedSegmentsVisible)
+        self._currentSegmentVisible = True
+        self.logic.set_segment_visibility(seg, segmentID, True)
+        self.ui.showCurrentSegmentCheckBox.blockSignals(True)
+        self.ui.showCurrentSegmentCheckBox.setChecked(True)
+        self.ui.showCurrentSegmentCheckBox.blockSignals(False)
 
-        # Recreate fresh markup nodes (counter=0) so the placement cursor is
-        # always "Positive 1" / "Negative 1".  Reusing and clearing old nodes
-        # leaves the internal counter at N, causing the next cursor to show N+1.
-        self.logic.recreatePromptNodes(self._parameterNode)
-        self._observeMarkupsNodes()
+    # ------------------------------------------------------------------ #
+    # Brush / Erase tools                                                  #
+    # ------------------------------------------------------------------ #
 
-        posNode, negNode = self.logic.getPromptNodes(self._parameterNode)
-
-        # Switch to ViewTransform before wiring nodes.  setCurrentNode on an
-        # empty node inherits the widget's current placement state — calling it
-        # while Place mode is active would auto-create an unwanted cursor.
-        interactionNode = slicer.app.applicationLogic().GetInteractionNode()
-        interactionNode.SwitchToViewTransformMode()
-
-        self.ui.negativePrompts.setCurrentNode(negNode)
-        self.ui.positivePrompts.setCurrentNode(posNode)
-
-        # Start persistent placement on the POSITIVE node only so the
-        # "Positive 1" tracking cursor appears without touching the negative
-        # widget's placement state.
-        selectionNode = slicer.app.applicationLogic().GetSelectionNode()
-        selectionNode.SetActivePlaceNodeID(posNode.GetID())
-        selectionNode.SetActivePlaceNodeClassName(posNode.GetClassName())
-        interactionNode.SwitchToPersistentPlaceMode()
-        # Register PointHandler directly — calling attach() would re-enter the
-        # mode switch we just performed.
-        self._active_handler = PointHandler()
-
-    # -------------------------
-    # Interaction mode
-    # -------------------------
-
-    def _onPlaceModeChanged(self, active: bool):
-        """Qt slot: fires when the user clicks either markup place-widget button."""
-        if not active or self.ctrl.is_paused:
+    def _applyOverwriteMode(self):
+        pn_ed = slicer.mrmlScene.GetSingletonNode('SegmentEditor', 'vtkMRMLSegmentEditorNode')
+        if not pn_ed:
             return
-        if not isinstance(self._active_handler, PointHandler):
+        cls   = slicer.vtkMRMLSegmentEditorNode
+        modes = [cls.OverwriteNone, cls.OverwriteVisibleSegments, cls.OverwriteAllSegments]
+        idx   = self.ui.overwriteModeDropdown.currentIndex
+        mode  = modes[idx] if 0 <= idx < len(modes) else cls.OverwriteNone
+        pn_ed.SetOverwriteMode(mode)
+
+    def _onOverwriteModeChanged(self, _index):
+        self._applyOverwriteMode()
+
+    def _onPlaceModeChanged(self, active, src_widget):
+        if self._suppressing_place_mode:
+            return
+        if active:
+            self._active_prompt_widget = src_widget
             PointHandler().attach(self)
+        elif isinstance(self._active_handler, PointHandler):
+            self._active_handler.detach(self)
+            self._active_prompt_widget = None
 
-    def _onInteractionModeChanged(self, caller=None, event=None):
-        """VTK observer fallback: activate point mode when Slicer enters Place mode."""
-        if self.ctrl.is_paused:
-            return
-        interactionNode = caller
-        if interactionNode.GetCurrentInteractionMode() != interactionNode.Place:
-            return
-        selectionNode = slicer.app.applicationLogic().GetSelectionNode()
-        posNode, negNode = self.logic.getPromptNodes(self._parameterNode)
-        activePlaceID = selectionNode.GetActivePlaceNodeID()
-        if activePlaceID not in (
-            posNode.GetID() if posNode else None,
-            negNode.GetID() if negNode else None,
-        ):
-            return
-        if not isinstance(self._active_handler, PointHandler):
-            PointHandler().attach(self)
+    def _onStrokeToggled(self, handler_cls, checked):
+        if checked:
+            handler_cls().attach(self)
+            self._applyOverwriteMode()
+        elif isinstance(self._active_handler, handler_cls):
+            self._active_handler.detach(self)
 
-    # -------------------------
-    # Point events
-    # -------------------------
+    def _onBrushToggled(self, checked):
+        self._onStrokeToggled(BrushHandler, checked)
 
-    def _restore_prompt_placement(self):
-        """Re-sync persistent placement on the positive prompt node.
+    def _onEraseToggled(self, checked):
+        self._onStrokeToggled(EraseHandler, checked)
 
-        Called after on_point_confirmed so that family hooks which create new
-        markup nodes (e.g. TimedAnnotatorFamily._mirror_to_node) cannot steal
-        the active placement node away from the prompt node.
+    def _borrowEffectsOptionsFrame(self):
+        """Move the Segment Editor's EffectsOptionsFrame into our panel.
+
+        The frame already contains the native Paint/Erase options (Diameter
+        slider, Absolute, Sphere, Edit in 3D view, Color Smudge) and updates
+        live because it IS Slicer's own control.  We keep the original parent
+        so _returnEffectsOptionsFrame() can put it back when we exit.
         """
-        if not isinstance(self._active_handler, PointHandler):
+        editor = self.logic.get_segment_editor()
+        if not editor:
             return
-        posNode, _ = self.logic.getPromptNodes(self._parameterNode)
-        if not posNode:
-            return
-        interactionNode = slicer.app.applicationLogic().GetInteractionNode()
-        selectionNode   = slicer.app.applicationLogic().GetSelectionNode()
-        if (selectionNode.GetActivePlaceNodeID() != posNode.GetID() or
-                interactionNode.GetCurrentInteractionMode() != interactionNode.Place):
-            selectionNode.SetActivePlaceNodeID(posNode.GetID())
-            selectionNode.SetActivePlaceNodeClassName(posNode.GetClassName())
-            interactionNode.SwitchToPersistentPlaceMode()
-
-    def _onPointConfirmed(self, caller=None, event=None):
-        """PointPositionDefinedEvent — a placement was just confirmed by the user."""
-        if caller is None or self.ctrl.is_paused:
-            return
-        self._resolveActiveView()
-        n = caller.GetNumberOfControlPoints()
-        if n == 0:
-            return
-        cp_id = caller.GetNthControlPointID(n - 1)
-        idx   = caller.GetControlPointIndexByID(cp_id)
-        ras   = [0.0, 0.0, 0.0]
-        caller.GetNthControlPointPositionWorld(idx, ras)
-        _, negNode  = self.logic.getPromptNodes(self._parameterNode)
-        is_negative = (caller is negNode)
-        change = self.logic.commit_point(self, caller, cp_id)
-        self._redo_stack.clear()
-        self._history.append(['point', change, caller, cp_id, list(ras), is_negative])
-        seg_id = self.ui.segmentSelector.currentSegmentID()
-        vol    = self.ui.sourceVolumeSelector.currentNode()
-        seg_node = self.ui.segmentationNodeSelector.currentNode()
-        call_if_exists(self.modelFamily, 'on_point_confirmed', seg_id, ras, cp_id, is_negative,
-                       volume_node=vol, segmentation_node=seg_node)
-        self._restore_prompt_placement()
-        log.debug('[Widget] point confirmed — change=%s  history=%d',
-                  change is not None, len(self._history))
-
-    def _onPointRemoved(self, caller=None, event=None):
-        """PointRemovedEvent — a prompt point was manually deleted by the user."""
-        if self.ctrl.is_paused:
-            return
-        current_ids = {caller.GetNthControlPointID(i)
-                       for i in range(caller.GetNumberOfControlPoints())}
-        for i in range(len(self._history) - 1, -1, -1):
-            entry = self._history[i]
-            if entry[0] == 'point' and entry[2] is caller and entry[3] not in current_ids:
-                change = entry[1]
-                del self._history[i]
-                if change is not None:
-                    self.logic.reverse_change(self, change)
+        if self._eof_widget is None:
+            eof = editor.findChild(qt.QWidget, 'EffectsOptionsFrame')
+            if eof is None:
+                log.warning('[BrushOptions] EffectsOptionsFrame not found')
                 return
+            self._eof_widget      = eof
+            self._eof_orig_parent = eof.parentWidget()
+        container = self.ui.brushOptionsContainer
+        container.layout().addWidget(self._eof_widget)
+        self._eof_widget.setVisible(True)
+        container.setVisible(True)
 
-    # -------------------------
-    # Brush tool
-    # -------------------------
+    def _returnEffectsOptionsFrame(self):
+        """Return the EffectsOptionsFrame to the editor widget."""
+        if self._eof_widget is None:
+            return
+        self.ui.brushOptionsContainer.setVisible(False)
+        if self._eof_orig_parent is not None:
+            self._eof_orig_parent.layout().addWidget(self._eof_widget)
+        self._eof_widget      = None
+        self._eof_orig_parent = None
 
-    def _segEditor(self):
-        """Return the Segment Editor's qMRMLSegmentEditorWidget, or None."""
+    # ------------------------------------------------------------------ #
+    # Undo / Redo — delegated to the Segment Editor's built-in stack      #
+    # ------------------------------------------------------------------ #
+
+    def _onUndo(self):
+        editor = self.logic.get_segment_editor()
+        if editor:
+            editor.undo()
+
+    def _onRedo(self):
+        editor = self.logic.get_segment_editor()
+        if editor:
+            editor.redo()
+
+    # ------------------------------------------------------------------ #
+    # Window / Level                                                       #
+    # ------------------------------------------------------------------ #
+
+    def _syncPair(self, target, value):
+        target.blockSignals(True)
+        target.setValue(value)
+        target.blockSignals(False)
+
+    def _syncWLFromVolume(self, vol):
+        """Pre-fill W/L sliders from the volume's current display settings."""
+        window, level = self.logic.get_window_level(vol)
+        if window is None:
+            return
+        for widget, value in (
+            (self.ui.windowSlider,  window),
+            (self.ui.windowSpinBox, window),
+            (self.ui.levelSlider,   level),
+            (self.ui.levelSpinBox,  level),
+        ):
+            widget.blockSignals(True)
+            widget.setValue(max(widget.minimum, min(widget.maximum, value)))
+            widget.blockSignals(False)
+
+    def _onWindowSliderChanged(self, value):
+        self._syncPair(self.ui.windowSpinBox, value)
+        self._onApplyWindowLevel()
+
+    def _onWindowSpinBoxChanged(self, value):
+        self._syncPair(self.ui.windowSlider, value)
+        self._onApplyWindowLevel()
+
+    def _onLevelSliderChanged(self, value):
+        self._syncPair(self.ui.levelSpinBox, value)
+        self._onApplyWindowLevel()
+
+    def _onLevelSpinBoxChanged(self, value):
+        self._syncPair(self.ui.levelSlider, value)
+        self._onApplyWindowLevel()
+
+    def _onApplyWindowLevel(self, *_):
+        vol = self.ui.sourceVolumeSelector.currentNode()
+        self.logic.apply_window_level(vol,
+                                      self.ui.windowSpinBox.value,
+                                      self.ui.levelSpinBox.value)
+
+    # ------------------------------------------------------------------ #
+    # Segment visibility                                                   #
+    # ------------------------------------------------------------------ #
+
+    def _onToggleCurrentSegment(self, visible):
+        self._currentSegmentVisible = visible
+        seg   = self.ui.segmentationNodeSelector.currentNode()
+        segID = self.ui.segmentSelector.currentSegmentID()
+        self.logic.set_segment_visibility(seg, segID, visible)
+
+    def _onToggleSavedSegments(self, visible):
+        self._savedSegmentsVisible = visible
+        seg   = self.ui.segmentationNodeSelector.currentNode()
+        segID = self.ui.segmentSelector.currentSegmentID()
+        self.logic.set_saved_segments_visibility(seg, segID, visible)
+
+
+#
+# Logic
+#
+
+class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
+    """Business logic for the native-editor-wrapper.
+
+    Zero references to self.ui or Qt widget state — only MRML nodes and
+    Slicer services.  The Widget reads UI state and calls these methods.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    # ------------------------------------------------------------------ #
+    # Segment Editor access                                                #
+    # ------------------------------------------------------------------ #
+
+    def get_segment_editor(self):
+        """Return the shared qMRMLSegmentEditorWidget, or None."""
         try:
             return slicer.modules.segmenteditor.widgetRepresentation().self().editor
         except Exception:
             return None
 
-    def _applyBrushParams(self):
-        """Push diameter and shape to the currently active Paint or Erase effect."""
-        editor = self._segEditor()
-        if not editor:
+    def setup_editor_nodes(self, editor, vol, seg, segment_id=None):
+        """Point the Segment Editor at vol/seg/segment_id.
+
+        Only fires the heavyweight setters when the value actually changed so
+        that Slicer's slice-refitting pipeline is not re-queued on every click.
+        """
+        if not editor or not vol or not seg:
             return
-        effect = editor.activeEffect()
-        if effect and effect.name in ("Paint", "Erase"):
-            effect.setParameter("BrushAbsoluteDiameter",
-                                str(self.ui.brushDiameterSpinBox.value))
-            effect.setParameter("BrushDiameterIsAbsolute", "1")
-            effect.setParameter("BrushSphere",
-                                "1" if self.ui.brushSphereCheckBox.isChecked() else "0")
+        if editor.segmentationNode() is not seg:
+            editor.setSegmentationNode(seg)
+        if editor.sourceVolumeNode() is not vol:
+            editor.setSourceVolumeNode(vol)
+        editor.setUndoEnabled(True)
+        editor.setMaximumNumberOfUndoStates(50)
+        if segment_id and editor.currentSegmentID() != segment_id:
+            editor.setCurrentSegmentID(segment_id)
 
-    def onBrushToggled(self, checked: bool):
-        if checked:
-            BrushHandler().attach(self)
-        elif isinstance(self._active_handler, BrushHandler):
-            self._active_handler.detach(self)
+    # ------------------------------------------------------------------ #
+    # Node access                                                          #
+    # ------------------------------------------------------------------ #
 
-    def onEraseToggled(self, checked: bool):
-        if checked:
-            EraseHandler().attach(self)
-        elif isinstance(self._active_handler, EraseHandler):
-            self._active_handler.detach(self)
-            PointHandler().attach(self)
+    def getVolumeAndSegmentation(self, parameterNode):
+        """Return (volumeNode, segmentationNode) from *parameterNode*."""
+        if parameterNode is None:
+            return None, None
+        vol = parameterNode.GetNodeReference(_INPUT_VOLUME)
+        seg = parameterNode.GetNodeReference(_SEGMENTATION)
+        return vol, seg
 
-    def _onBrushDiameterSliderChanged(self, value):
-        self.ui.brushDiameterSpinBox.blockSignals(True)
-        self.ui.brushDiameterSpinBox.setValue(value)
-        self.ui.brushDiameterSpinBox.blockSignals(False)
-        self._applyBrushParams()
+    def create_segment_prompt_nodes(self, seg_node, segment_id):
+        """Create pos/neg markup nodes for *segment_id* and store IDs in segment tags.
 
-    def _onBrushDiameterSpinBoxChanged(self, value):
-        self.ui.brushDiameterSlider.blockSignals(True)
-        self.ui.brushDiameterSlider.setValue(value)
-        self.ui.brushDiameterSlider.blockSignals(False)
-        self._applyBrushParams()
+        Returns ``(pos_node, neg_node)``.  Idempotent: if tags already point to
+        valid scene nodes, those nodes are returned without creating new ones.
+        """
+        existing = self.get_segment_prompt_nodes(seg_node, segment_id)
+        if existing[0] is not None:
+            return existing
+        seg_obj = seg_node.GetSegmentation().GetSegment(segment_id)
+        if seg_obj is None:
+            return None, None
+        seg_name = seg_obj.GetName()
+        result = []
+        for color, suffix, tag in (
+            ((0.0, 1.0, 0.0), 'pos', _POS_TAG),
+            ((1.0, 0.0, 0.0), 'neg', _NEG_TAG),
+        ):
+            node = slicer.mrmlScene.AddNewNodeByClass(
+                'vtkMRMLMarkupsFiducialNode', f'{seg_name}-{suffix}')
+            node.CreateDefaultDisplayNodes()
+            dn = node.GetDisplayNode()
+            dn.SetSelectedColor(*color)
+            dn.SetColor(*color)
+            dn.SetActiveColor(*color)
+            node.SetMaximumNumberOfControlPoints(255)
+            seg_obj.SetTag(tag, node.GetID())
+            result.append(node)
+        return tuple(result)
 
-    # -------------------------
-    # Window / Level
-    # -------------------------
+    def get_segment_prompt_nodes(self, seg_node, segment_id):
+        """Return ``(pos_node, neg_node)`` for *segment_id*, or ``(None, None)``."""
+        if not seg_node or not segment_id:
+            return None, None
+        seg_obj = seg_node.GetSegmentation().GetSegment(segment_id)
+        if seg_obj is None:
+            return None, None
+        nodes = []
+        for tag in (_POS_TAG, _NEG_TAG):
+            value = vtk.reference('')
+            seg_obj.GetTag(tag, value)
+            node_id = str(value)
+            node = slicer.mrmlScene.GetNodeByID(node_id) if node_id else None
+            nodes.append(node)
+        return tuple(nodes)
 
-    def _syncWLSlidersFromVolume(self, volumeNode):
-        if not volumeNode:
+    def delete_segment_prompt_nodes(self, seg_node, segment_id):
+        """Remove the pos/neg markup nodes for *segment_id* from the scene."""
+        pos_node, neg_node = self.get_segment_prompt_nodes(seg_node, segment_id)
+        for node in (pos_node, neg_node):
+            if node is not None:
+                slicer.mrmlScene.RemoveNode(node)
+
+    def sync_prompt_node_names(self, seg_node, segment_id):
+        """Rename pos/neg markup nodes to match the current segment name."""
+        seg_obj = seg_node.GetSegmentation().GetSegment(segment_id)
+        if not seg_obj:
             return
-        displayNode = volumeNode.GetScalarVolumeDisplayNode()
-        if not displayNode:
-            return
-        w = max(1,     min(4000, int(displayNode.GetWindow())))
-        l = max(-1000, min(3000, int(displayNode.GetLevel())))
-        for widget, value in [
-            (self.ui.windowSlider,  w),
-            (self.ui.windowSpinBox, w),
-            (self.ui.levelSlider,   l),
-            (self.ui.levelSpinBox,  l),
-        ]:
-            widget.blockSignals(True)
-            widget.setValue(value)
-            widget.blockSignals(False)
-        self._resetWLButton()
-        self.logic.set_window_level(None, None)
+        seg_name = seg_obj.GetName()
+        pos_node, neg_node = self.get_segment_prompt_nodes(seg_node, segment_id)
+        for node, suffix in ((pos_node, 'pos'), (neg_node, 'neg')):
+            if node is not None:
+                new_name = f'{seg_name}-{suffix}'
+                if node.GetName() != new_name:
+                    node.SetName(new_name)
 
-    def _resetWLButton(self):
-        btn = self.ui.applyWindowLevelButton
-        btn.setText("Apply Window / Level")
-        btn.setEnabled(True)
+    # ------------------------------------------------------------------ #
+    # Segmentation / segment CRUD                                          #
+    # ------------------------------------------------------------------ #
 
-    def _updateDisplayNodeWL(self):
-        volumeNode = self.ui.sourceVolumeSelector.currentNode()
-        if not volumeNode:
-            return
-        displayNode = volumeNode.GetScalarVolumeDisplayNode()
-        if not displayNode:
-            return
-        # AutoWindowLevelOff is required — without it Slicer silently overrides
-        # any manually set W/L with its own computed range on the next render.
-        displayNode.AutoWindowLevelOff()
-        displayNode.SetWindow(self.ui.windowSlider.value)
-        displayNode.SetLevel(self.ui.levelSlider.value)
+    def create_segmentation_for_volume(self, vol):
+        """Create and return a new segmentation node linked to *vol*."""
+        seg = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLSegmentationNode')
+        seg.CreateDefaultDisplayNodes()
+        seg.SetReferenceImageGeometryParameterFromVolumeNode(vol)
+        return seg
 
-    def _onWLControlChanged(self, _=None):
-        self._updateDisplayNodeWL()
-        btn = self.ui.applyWindowLevelButton
-        if not btn.isEnabled():
-            self.logic.set_window_level(None, None)
-            self._resetWLButton()
-
-    def _sync_wl_widgets(self, peer, value):
-        peer.blockSignals(True)
-        peer.setValue(value)
-        peer.blockSignals(False)
-        self._onWLControlChanged()
-
-    def _onWindowSliderChanged(self, value):
-        self._sync_wl_widgets(self.ui.windowSpinBox, value)
-
-    def _onWindowSpinBoxChanged(self, value):
-        self._sync_wl_widgets(self.ui.windowSlider, value)
-
-    def _onLevelSliderChanged(self, value):
-        self._sync_wl_widgets(self.ui.levelSpinBox, value)
-
-    def _onLevelSpinBoxChanged(self, value):
-        self._sync_wl_widgets(self.ui.levelSlider, value)
-
-    def onApplyWindowLevel(self, _=None):
-        """Confirm W/L for model inference; volume scalar data is never modified."""
-        self.logic.set_window_level(
-            self.ui.windowSpinBox.value,
-            self.ui.levelSpinBox.value,
-        )
-        btn = self.ui.applyWindowLevelButton
-        btn.setText("W/L Applied")
-        btn.setEnabled(False)
-
-    # -------------------------
-    # Expand  (E)
-    # -------------------------
-
-    def _onExpand(self):
-        """Run expand and push the result to history."""
-        self._resolveActiveView()
-        change = self.logic.on_expand(self)
-        if change is not None:
-            self._redo_stack.clear()
-            self._history.append(['expand', change])
-
-    def _onExpandShortcut(self):
-        """E hotkey: flush any active stroke → expand → restore the tool."""
-        active = self._active_handler
-        prior_stroke_class = type(active) if isinstance(active, StrokeHandler) else None
-        if prior_stroke_class:
-            active.detach(self)
-        self._onExpand()
-        if prior_stroke_class:
-            prior_stroke_class().attach(self)
-
-    # -------------------------
-    # Undo  (Ctrl+Z)
-    # -------------------------
-
-    def _clear_history(self):
-        """Clear both undo and redo stacks (segment switch, add, remove)."""
-        self._history.clear()
-        self._redo_stack.clear()
-
-    def _add_history(self, entry):
-        """Append *entry* to the undo history (called by input handlers)."""
-        self._redo_stack.clear()
-        self._history.append(entry)
-
-    def _resolveActiveView(self):
-        """Update currentViewName to whichever slice view the cursor is over."""
-        lm = slicer.app.layoutManager()
-        for viewName in ("Red", "Green", "Yellow"):
-            sw = lm.sliceWidget(viewName)
-            if sw and sw.sliceView().underMouse():
-                self.currentViewName = viewName
-                return
-
-    def onUndo(self):
-        log.debug('[Widget] Undo pressed — history depth %d', len(self._history))
-        if isinstance(self._active_handler, StrokeHandler):
-            self._active_handler.flush(self)
-        if not self._history:
-            return
-
-        entry       = self._history.pop()
-        action_type = entry[0]
-
-        if action_type in ('brush', 'erase', 'expand'):
-            self.logic.reverse_change(self, entry[1])
-            self._redo_stack.append(entry)
-
-        elif action_type == 'point':
-            change      = entry[1]
-            node        = entry[2]
-            cp_id       = entry[3]
-            ras         = entry[4]
-            is_negative = entry[5]
-
-            self.ctrl.pause()
-            try:
-                idx = node.GetControlPointIndexByID(cp_id)
-                if idx >= 0:
-                    node.RemoveNthControlPoint(idx)
-                # Recreate the node when empty to reset the ID counter,
-                # otherwise the next placement cursor shows "N+1" instead of "1".
-                if node.GetNumberOfControlPoints() == 0:
-                    new_node = self.logic.recreate_prompt_node(
-                        self._parameterNode, is_negative
-                    )
-                    self._observeMarkupsNodes()
-                    interactionNode = slicer.app.applicationLogic().GetInteractionNode()
-                    interactionNode.SwitchToViewTransformMode()
-                    if is_negative:
-                        self.ui.negativePrompts.setCurrentNode(new_node)
-                    else:
-                        self.ui.positivePrompts.setCurrentNode(new_node)
-                        selectionNode = slicer.app.applicationLogic().GetSelectionNode()
-                        selectionNode.SetActivePlaceNodeID(new_node.GetID())
-                        selectionNode.SetActivePlaceNodeClassName(new_node.GetClassName())
-                        interactionNode.SwitchToPersistentPlaceMode()
-            finally:
-                self.ctrl.resume()
-
-            self.logic.reverse_change(self, change)
-            call_if_exists(self.modelFamily, 'on_point_undone', cp_id)
-            # Push to redo with the live node reference (the original may be
-            # stale if the node was just recreated above).
-            posNode, negNode = self.logic.getPromptNodes(self._parameterNode)
-            live_node = negNode if is_negative else posNode
-            self._redo_stack.append(['point', change, live_node, None, ras, is_negative])
-
-    def onRedo(self):
-        log.debug('[Widget] Redo pressed — redo stack depth %d', len(self._redo_stack))
-        if isinstance(self._active_handler, StrokeHandler):
-            self._active_handler.flush(self)
-        if not self._redo_stack:
-            return
-
-        entry       = self._redo_stack.pop()
-        action_type = entry[0]
-
-        if action_type in ('brush', 'erase', 'expand'):
-            self.logic.forward_change(self, entry[1])
-            self._history.append(entry)
-
-        elif action_type == 'point':
-            change      = entry[1]
-            ras         = entry[4]
-            is_negative = entry[5]
-
-            posNode, negNode = self.logic.getPromptNodes(self._parameterNode)
-            live_node = negNode if is_negative else posNode
-
-            self.ctrl.pause()
-            try:
-                new_idx   = live_node.AddControlPoint(vtk.vtkVector3d(ras[0], ras[1], ras[2]))
-                new_cp_id = live_node.GetNthControlPointID(new_idx)
-            finally:
-                self.ctrl.resume()
-
-            self.logic.forward_change(self, change)
-            seg_id = self.ui.segmentSelector.currentSegmentID()
-            vol      = self.ui.sourceVolumeSelector.currentNode()
-            seg_node = self.ui.segmentationNodeSelector.currentNode()
-            call_if_exists(self.modelFamily, 'on_point_confirmed', seg_id, ras, new_cp_id, is_negative,
-                           volume_node=vol, segmentation_node=seg_node)
-            self._history.append(['point', change, live_node, new_cp_id, ras, is_negative])
-
-    # -------------------------
-    # SPX Boundary Overlay  (Q)
-    # -------------------------
-
-    def _get_composite_node(self, view_name):
-        """Return the slice composite node for *view_name*, or None."""
-        sw = slicer.app.layoutManager().sliceWidget(view_name)
-        return sw.sliceLogic().GetSliceCompositeNode() if sw else None
-
-    def _hideSPXBoundary(self):
-        if not self._spx_boundary_visible:
-            return
-        if self._spx_boundary_view:
-            composite = self._get_composite_node(self._spx_boundary_view)
-            if composite:
-                composite.SetLabelVolumeID("")
-        self._spx_boundary_visible = False
-        self._spx_boundary_view    = None
-        self.ui.showSPXBoundaryCheckBox.blockSignals(True)
-        self.ui.showSPXBoundaryCheckBox.setChecked(False)
-        self.ui.showSPXBoundaryCheckBox.blockSignals(False)
-
-    def onToggleSPXBoundary(self, _checked=None):
-        """Q key / checkbox: show or hide the SPX superpixel boundary overlay."""
-        if not isinstance(self.modelFamily, SPXModelFamily):
-            return
-
-        if self._spx_boundary_visible:
-            self._hideSPXBoundary()
-            return
-
+    def add_segment(self, seg_node) -> str:
+        """Add a new empty segment, create its prompt nodes, and return its ID."""
+        segmentation = seg_node.GetSegmentation()
+        existing_ids = {
+            segmentation.GetNthSegmentID(i)
+            for i in range(segmentation.GetNumberOfSegments())
+        }
+        existing_names = {
+            segmentation.GetNthSegment(i).GetName()
+            for i in range(segmentation.GetNumberOfSegments())
+        }
+        # vtkMRMLSegmentationDisplayNode observes vtkSegmentation directly (VTK-level),
+        # so StartModify doesn't suppress the transient "0 connections" warning that fires
+        # when the 3D pipeline tries to render an empty segment during creation.
+        vtk.vtkObject.GlobalWarningDisplayOff()
+        mod = seg_node.StartModify()
         try:
-            boundary_2d, axis, sliceIndex = self.logic.compute_spx_boundary(self)
-        except ValueError as exc:
-            slicer.util.warningDisplay(f"SPX boundary: {exc}")
-            self.ui.showSPXBoundaryCheckBox.blockSignals(True)
-            self.ui.showSPXBoundaryCheckBox.setChecked(False)
-            self.ui.showSPXBoundaryCheckBox.blockSignals(False)
+            segmentation.AddEmptySegment(next_segment_name(existing_names))
+            # The new segment is the one whose ID wasn't in the pre-call set.
+            for i in range(segmentation.GetNumberOfSegments()):
+                sid = segmentation.GetNthSegmentID(i)
+                if sid not in existing_ids:
+                    self.create_segment_prompt_nodes(seg_node, sid)
+                    return sid
+            return ''
+        finally:
+            seg_node.EndModify(mod)
+            vtk.vtkObject.GlobalWarningDisplayOn()
+
+    def remove_segment(self, seg_node, segment_id):
+        """Remove *segment_id* from *seg_node*."""
+        seg_node.GetSegmentation().RemoveSegment(segment_id)
+
+    # ------------------------------------------------------------------ #
+    # Segment visibility                                                   #
+    # ------------------------------------------------------------------ #
+
+    def _set_triplet_visibility(self, seg_node, dn, segment_id, visible):
+        dn.SetSegmentVisibility(segment_id, visible)
+        for node in self.get_segment_prompt_nodes(seg_node, segment_id):
+            if node is not None:
+                node.SetDisplayVisibility(int(visible))
+
+    def set_saved_segments_visibility(self, seg_node, exclude_id, visible):
+        """Set visibility of every segment triplet except *exclude_id*."""
+        if not seg_node:
             return
-
-        volumeNode = self.ui.sourceVolumeSelector.currentNode()
-
-        if (self._spx_boundary_node is None
-                or not slicer.mrmlScene.IsNodePresent(self._spx_boundary_node)):
-            self._spx_boundary_node = slicer.mrmlScene.AddNewNodeByClass(
-                'vtkMRMLLabelMapVolumeNode', 'SPX Boundaries'
-            )
-            self._spx_boundary_node.CreateDefaultDisplayNodes()
-            sourceArray = slicer.util.arrayFromVolume(volumeNode)
-            if sourceArray is None:
-                slicer.util.warningDisplay("Cannot read volume data — SPX boundary not shown.")
-                return
-            slicer.util.updateVolumeFromArray(self._spx_boundary_node,
-                                              np.zeros(sourceArray.shape, dtype=np.uint8))
-            ijkToRAS = vtk.vtkMatrix4x4()
-            volumeNode.GetIJKToRASMatrix(ijkToRAS)
-            self._spx_boundary_node.SetIJKToRASMatrix(ijkToRAS)
-            # The default "Labels" color table is read-only; create a small
-            # User-type table so we can assign label 1 → yellow.
-            colorNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLColorTableNode')
-            colorNode.SetTypeToUser()
-            colorNode.SetNumberOfColors(2)
-            colorNode.SetColor(0, 0.0, 0.0, 0.0, 0.0)  # 0 → transparent
-            colorNode.SetColor(1, 1.0, 1.0, 0.0, 1.0)  # 1 → yellow, opaque
-            self._spx_boundary_node.GetDisplayNode().SetAndObserveColorNodeID(
-                colorNode.GetID()
-            )
-
-        boundaryArray = slicer.util.arrayFromVolume(self._spx_boundary_node)
-        boundaryArray[:] = 0
-        write_slice_to_volume(boundaryArray, boundary_2d, axis, sliceIndex)
-        self._spx_boundary_node.GetImageData().Modified()
-        self._spx_boundary_node.Modified()
-
-        viewName  = self.currentViewName
-        composite = self._get_composite_node(viewName)
-        if not composite:
-            slicer.util.warningDisplay("Cannot access slice view — SPX boundary not shown.")
-            return
-        composite.SetLabelVolumeID(self._spx_boundary_node.GetID())
-        composite.SetLabelOpacity(0.8)
-
-        self._spx_boundary_visible = True
-        self._spx_boundary_view    = viewName
-        self.ui.showSPXBoundaryCheckBox.blockSignals(True)
-        self.ui.showSPXBoundaryCheckBox.setChecked(True)
-        self.ui.showSPXBoundaryCheckBox.blockSignals(False)
-
-    # -------------------------
-    # Segment Visibility
-    # -------------------------
-
-    def _sync_annotation_visibility(self):
-        """Forward current/saved visibility states to the active family's mirror nodes."""
-        seg_id = self.ui.segmentSelector.currentSegmentID()
-        call_if_exists(
-            self.modelFamily, 'sync_visibility',
-            seg_id, self._current_segment_visible, self._saved_segments_visible,
-        )
-
-    def _apply_saved_segments_visibility(self, exclude=None):
-        """Set visibility of every segment except `exclude` to _saved_segments_visible."""
-        segNode = self.ui.segmentationNodeSelector.currentNode()
-        if not segNode:
-            return
-        dn = segNode.GetDisplayNode()
+        dn = seg_node.GetDisplayNode()
         if not dn:
             return
-        seg = segNode.GetSegmentation()
-        for i in range(seg.GetNumberOfSegments()):
-            sid = seg.GetNthSegmentID(i)
-            if sid != exclude:
-                dn.SetSegmentVisibility(sid, self._saved_segments_visible)
+        segmentation = seg_node.GetSegmentation()
+        for i in range(segmentation.GetNumberOfSegments()):
+            sid = segmentation.GetNthSegmentID(i)
+            if sid != exclude_id:
+                self._set_triplet_visibility(seg_node, dn, sid, visible)
 
-    def onToggleSavedSegments(self, visible=None):
-        """Checkbox toggled(bool) handler — show/hide all saved (non-current) segments."""
-        if visible is None:
-            visible = not self._saved_segments_visible
-        self._saved_segments_visible = visible
-        currentID = self.ui.segmentSelector.currentSegmentID()
-        self._apply_saved_segments_visibility(exclude=currentID)
-        self._sync_annotation_visibility()
-        self.ui.showSegmentsCheckBox.blockSignals(True)
-        self.ui.showSegmentsCheckBox.setChecked(visible)
-        self.ui.showSegmentsCheckBox.blockSignals(False)
+    def set_segment_visibility(self, seg_node, segment_id, visible):
+        """Set visibility of a single segment triplet."""
+        if not seg_node or not segment_id:
+            return
+        dn = seg_node.GetDisplayNode()
+        if dn:
+            self._set_triplet_visibility(seg_node, dn, segment_id, visible)
 
-    def onToggleCurrentSegment(self, visible=None):
-        """V hotkey or checkbox — toggle visibility of only the segment currently being worked on."""
-        if visible is None:
-            visible = not self._current_segment_visible
-        segNode = self.ui.segmentationNodeSelector.currentNode()
-        segmentID = self.ui.segmentSelector.currentSegmentID()
-        if segNode and segmentID:
-            dn = segNode.GetDisplayNode()
-            if dn:
-                dn.SetSegmentVisibility(segmentID, visible)
-            self._current_segment_visible = visible
-        else:
-            visible = self._current_segment_visible   # snap back
-        self._sync_annotation_visibility()
-        self.ui.showCurrentSegmentCheckBox.blockSignals(True)
-        self.ui.showCurrentSegmentCheckBox.setChecked(visible)
-        self.ui.showCurrentSegmentCheckBox.blockSignals(False)
+    # ------------------------------------------------------------------ #
+    # Window / Level                                                       #
+    # ------------------------------------------------------------------ #
+
+    def get_window_level(self, vol):
+        """Return ``(window, level)`` ints from *vol*'s display node, or ``(None, None)``."""
+        if not vol:
+            return None, None
+        dn = vol.GetDisplayNode()
+        if not dn:
+            return None, None
+        return int(dn.GetWindow()), int(dn.GetLevel())
+
+    def apply_window_level(self, vol, window, level):
+        """Write *window* / *level* to *vol*'s display node."""
+        if not vol:
+            return
+        dn = vol.GetDisplayNode()
+        if not dn:
+            return
+        dn.SetAutoWindowLevel(0)
+        dn.SetWindow(window)
+        dn.SetLevel(level)
+
+    # ------------------------------------------------------------------ #
+    # Slice-index resolution                                               #
+    # ------------------------------------------------------------------ #
+
+    def active_slice_info(self, view_name: str, volume_node) -> tuple:
+        """Return ``(axis, slice_idx)`` for *view_name* and *volume_node*.
+
+        Returns ``(axis, None)`` when the view or volume is unavailable.
+        """
+        from core.utils import VIEW_TO_AXIS, AXIS_TO_IJK_COMPONENT
+        axis = VIEW_TO_AXIS.get(view_name)
+        if axis is None or volume_node is None:
+            return axis, None
+        lm = slicer.app.layoutManager()
+        sw = lm.sliceWidget(view_name)
+        if not sw:
+            return axis, None
+
+        xy_to_ras = sw.mrmlSliceNode().GetXYToRAS()
+        ras = [xy_to_ras.GetElement(i, 3) for i in range(3)]
+
+        m = vtk.vtkMatrix4x4()
+        volume_node.GetRASToIJKMatrix(m)
+        ijk = [
+            sum(m.GetElement(r, c) * (ras[c] if c < 3 else 1.0)
+                for c in range(4))
+            for r in range(3)
+        ]
+
+        comp      = AXIS_TO_IJK_COMPONENT[axis]
+        slice_idx = int(round(ijk[comp]))
+        dims      = volume_node.GetImageData().GetDimensions()  # (I, J, K)
+        max_idx   = [dims[2], dims[1], dims[0]][axis]
+        slice_idx = max(0, min(slice_idx, max_idx - 1))
+        return axis, slice_idx
+
+    # ------------------------------------------------------------------ #
+    # Internal: zero-copy VTK buffer access                               #
+    # ------------------------------------------------------------------ #
+
+    def _vtk_view(self, seg_node, segment_id):
+        """Return ``(numpy_view, vtkImageData)`` for the segment's binary labelmap.
+
+        Shape is ``(K, J, I)`` — zero-copy writable view into Slicer's buffer.
+        Returns ``(None, None)`` on any failure.
+        """
+        try:
+            lm = seg_node.GetBinaryLabelmapInternalRepresentation(segment_id)
+            if lm is None:
+                return None, None
+            img  = lm.GetImageData()
+            ext  = img.GetExtent()
+            if ext[0] != 0 or ext[2] != 0 or ext[4] != 0:
+                return None, None
+            dims = img.GetDimensions()
+            if dims[0] <= 1 or dims[1] <= 1 or dims[2] <= 1:
+                return None, None
+            flat = _vtk_ns.vtk_to_numpy(img.GetPointData().GetScalars())
+            if flat.max() > 1:
+                return None, None
+            return flat.reshape(dims[2], dims[1], dims[0]), img
+        except Exception as exc:
+            log.debug('[Logic._vtk_view] %s', exc)
+            return None, None
+
+    # ------------------------------------------------------------------ #
+    # Public read API                                                      #
+    # ------------------------------------------------------------------ #
+
+    def segment_slice(self, seg_node, segment_id, volume_node,
+                      axis: int, slice_idx: int) -> 'np.ndarray | None':
+        """Return a 2-D ``uint8`` binary mask at *axis/slice_idx*.
+
+        Fast path: zero-copy VTK read + one ``ndarray.copy()``.
+        Slow fallback: ``arrayFromSegmentBinaryLabelmap``.
+        Returns ``None`` on failure.
+        """
+        from core.utils import get_slice_from_volume
+        view, _ = self._vtk_view(seg_node, segment_id)
+        if view is not None:
+            return get_slice_from_volume(view, axis, slice_idx).copy()
+        try:
+            raw = slicer.util.arrayFromSegmentBinaryLabelmap(
+                seg_node, segment_id, volume_node)
+            return get_slice_from_volume(raw, axis, slice_idx).copy()
+        except Exception as exc:
+            log.debug('[Logic.segment_slice] fallback failed: %s', exc)
+            return None
+
+    def segment_mask(self, seg_node, segment_id,
+                     volume_node) -> 'np.ndarray | None':
+        """Return a full 3-D ``uint8`` binary mask copy for the segment.
+
+        Prefer :meth:`segment_slice` for single-slice operations.
+        Returns ``None`` on failure.
+        """
+        view, _ = self._vtk_view(seg_node, segment_id)
+        if view is not None:
+            return view.copy()
+        try:
+            raw = slicer.util.arrayFromSegmentBinaryLabelmap(
+                seg_node, segment_id, volume_node)
+            return raw.copy()
+        except Exception as exc:
+            log.debug('[Logic.segment_mask] fallback failed: %s', exc)
+            return None
+
+    def current_segment_slice(self, pn, view_name: str,
+                               segment_id: str) -> 'tuple | None':
+        """Return ``(mask_2d, axis, slice_idx)`` for the given state, or ``None``.
+
+        Parameters
+        ----------
+        pn          : vtkMRMLScriptedModuleNode  (the widget's parameter node)
+        view_name   : str   e.g. 'Red'
+        segment_id  : str
+        """
+        vol, seg = self.getVolumeAndSegmentation(pn)
+        if vol is None or seg is None or not segment_id:
+            return None
+        axis, slice_idx = self.active_slice_info(view_name, vol)
+        if slice_idx is None:
+            return None
+        mask = self.segment_slice(seg, segment_id, vol, axis, slice_idx)
+        return (mask, axis, slice_idx) if mask is not None else None
 
 
 #
-# SegmentHumanBodyTest
+# Test
 #
 
 class SegmentHumanBodyTest(ScriptedLoadableModuleTest):
-    """Entry point for the 3D Slicer "Reload and Test" button.
-
-    The actual test cases live in Testing/Python/SegmentHumanBodyTest.py as a
-    standard unittest.TestCase so they can also be run via
-    slicer_add_python_unittest in CMake.  This class discovers and delegates
-    to them so that "Reload and Test" remains a meaningful action.
-    """
+    """Entry point for the 3D Slicer "Reload and Test" button."""
 
     def runTest(self):
         import importlib
@@ -1146,10 +1052,7 @@ class SegmentHumanBodyTest(ScriptedLoadableModuleTest):
         import SegmentHumanBodyTest as ext
         importlib.reload(ext)
 
-        # Discover all TestCase subclasses in the module automatically so that
-        # adding a new test class to SegmentHumanBodyTest.py is sufficient to
-        # include it in the "Reload and Test" run.
-        suite = unittest.TestLoader().loadTestsFromModule(ext)
+        suite  = unittest.TestLoader().loadTestsFromModule(ext)
         result = unittest.TextTestRunner(verbosity=2).run(suite)
         if not result.wasSuccessful():
             raise Exception(

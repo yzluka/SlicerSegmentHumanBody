@@ -1,328 +1,155 @@
-"""Input handlers for SegmentHumanBodyWidget.
+"""Input handlers for SegmentHumanBodyWidget (native-editor-wrapper branch).
 
-_SliceViewMouseFilter  — callback-based Qt event filter for stroke boundaries.
-InputHandler           — base class: attach / detach / flush lifecycle.
-StrokeHandler          — owns mouse filter + stroke state for Paint / Erase.
-BrushHandler           — Paint effect, tracks all strokes.
-EraseHandler           — Erase effect, skips no-op (non-removing) strokes.
+InputHandler   — base: volume check, mutual-exclusion, segment-existence guard,
+                 and active-handler registration.  Subclasses override _on_attach.
+StrokeHandler  — shared Brush/Erase logic (effect activation, UI sync).
+BrushHandler   — Paint effect.
+EraseHandler   — Erase effect.
+PointHandler   — prompt-point mode (no extra setup beyond the base guard).
+
+Design rules
+------------
+* attach() in the base class enforces: volume check → detach previous →
+  ensure segment → register self → call _on_attach().  No subclass repeats
+  any of these steps.
+* The segment-existence guard lives exclusively in _ensure_segment() —
+  no subclass needs its own null-segment check.
+* Handlers never import qt or reference widget.ui directly for business
+  logic; they only call widget.logic.* and widget.ui widget names for
+  button-state sync.
 """
 
 import logging
-import numpy as np
-import qt
 import slicer
 
 log = logging.getLogger(__name__)
 
 
-class _SliceViewMouseFilter(qt.QObject):
-    """Qt application-level event filter for stroke boundary detection.
-
-    Callback-based: takes on_press / on_release callables so the owner does
-    not need to implement a specific interface.  Returns False always so
-    events are never consumed.
-    """
-
-    def __init__(self, on_press, on_release):
-        super().__init__()
-        self._on_press   = on_press
-        self._on_release = on_release
-
-    def eventFilter(self, obj, event):
-        t = event.type()
-        try:
-            if t == qt.QEvent.MouseButtonPress and event.button() == qt.Qt.LeftButton:
-                self._on_press()
-            elif t == qt.QEvent.MouseButtonRelease and event.button() == qt.Qt.LeftButton:
-                self._on_release()
-        except Exception as exc:
-            log.error('[MouseFilter] %s', exc)
-        return False
-
-
 class InputHandler:
     """Base class for interactive input modes."""
 
-    def _detach_current_tool_if_exists(self, widget):
-        """Flush and detach whatever handler is currently active on *widget*,
-        then ensure at least one segment exists before any Slicer interaction
-        is installed.
+    # ------------------------------------------------------------------ #
+    # Guard helpers                                                        #
+    # ------------------------------------------------------------------ #
 
-        Called at the top of every ``attach()`` implementation so that
-        activating any tool automatically deactivates the previous one.
-        The segment-existence check is unified here so no handler needs its
-        own per-type logic.
-        """
+    def _detach_current(self, widget) -> None:
+        """Flush and detach the active handler."""
         current = getattr(widget, '_active_handler', None)
         if current is not None and current is not self:
             current.detach(widget)
-        # Unified pre-attach guard: if a volume is selected but no segment
-        # exists yet, create one now — before any Slicer element/observer is
-        # installed.  Applies to all handler types (PointHandler, BrushHandler,
-        # EraseHandler, and any future handlers).
+
+    def _ensure_segment(self, widget) -> str:
+        """Create segmentation/segment if missing; switch to the new segment.
+
+        Delegates to widget._onAddSegment so that creation, UI wiring, and
+        the auto-switch all live in one place.  Returns the active segment ID
+        after the guard completes (empty string when no volume is selected).
+        """
         pn = getattr(widget, '_parameterNode', None)
-        if pn is None:
-            return
-        volNode, segNode = widget.logic.getVolumeAndSegmentation(pn)
-        if volNode and (not segNode
-                        or segNode.GetSegmentation().GetNumberOfSegments() == 0):
-            widget.onAddSegment()
-
-    def attach(self, widget):
-        """Install this handler on *widget*."""
-
-    def detach(self, widget):
-        """Remove this handler and clean up any pending state."""
-
-    def flush(self, widget):
-        """Commit any pending state synchronously."""
-
-
-class StrokeHandler(InputHandler):
-    """Paint / Erase session handler.
-
-    Owns the Qt mouse filter and the per-stroke before-state snapshot.
-    Replaces the widget-level ``_brushMouseFilter``, ``_toolValidatorTimer``,
-    and ``_stroke_before`` fields.
-
-    Subclasses set EFFECT / SOURCE and may override ``_should_track``.
-    """
-
-    EFFECT: str = ''   # 'Paint' or 'Erase'
-    SOURCE: str = ''   # 'brush' or 'erase'
-
-    def __init__(self):
-        self._stroke_before = None   # (axis, idx, before) while stroke is live
-        self._mouse_filter  = None
-        self._effect_cb     = None
+        vol, seg = widget.logic.getVolumeAndSegmentation(pn)
+        if not vol:
+            vol = widget.ui.sourceVolumeSelector.currentNode()
+        if not vol:
+            return ''
+        if not seg:
+            seg = widget.ui.segmentationNodeSelector.currentNode()
+        if not seg or seg.GetSegmentation().GetNumberOfSegments() == 0:
+            widget._onAddSegment()
+        return widget.ui.segmentSelector.currentSegmentID()
 
     # ------------------------------------------------------------------ #
     # Lifecycle                                                            #
     # ------------------------------------------------------------------ #
 
-    def attach(self, widget):
-        """Deactivate the current tool, then activate this stroke handler."""
-        self._detach_current_tool_if_exists(widget)
-        widget._active_handler = self
-
-        self._activate_effect(widget)
-
-        # _detach_current_tool_if_exists may have called onAddSegment, which
-        # caches/detaches/recreates/restores — ending with a fresh handler
-        # already fully attached.  If _active_handler is no longer self we
-        # were superseded; bail out so we don't install a stale mouse filter.
-        if widget._active_handler is not self:
+    def attach(self, widget) -> None:
+        """Volume check → detach previous → ensure segment → register → _on_attach."""
+        if not widget.ui.sourceVolumeSelector.currentNode():
+            slicer.util.warningDisplay('Please select a volume first.')
+            self._on_attach_cancelled(widget)
             return
+        self._detach_current(widget)
+        self._ensure_segment(widget)
+        widget._active_handler = self
+        self._on_attach(widget)
 
-        self._mouse_filter = _SliceViewMouseFilter(
-            on_press   = lambda: self._on_stroke_start(widget),
-            on_release = lambda: self._on_stroke_end(widget),
-        )
-        slicer.app.installEventFilter(self._mouse_filter)
+    def _on_attach(self, widget) -> None:
+        """Override in subclasses to install tool-specific resources."""
 
-        editor = widget._segEditor()
-        if editor:
-            self._effect_cb = lambda: self._on_effect_changed(widget)
-            editor.connect('activeEffectChanged()', self._effect_cb)
+    def _on_attach_cancelled(self, widget) -> None:
+        """Override in subclasses to reset UI when attach is aborted."""
 
-    def detach(self, widget):
-        """Flush any pending stroke, deactivate the effect, remove listeners."""
-        self.flush(widget)
-
-        if self._mouse_filter:
-            slicer.app.removeEventFilter(self._mouse_filter)
-            self._mouse_filter = None
-
-        editor = widget._segEditor()
-        if editor and self._effect_cb:
-            editor.disconnect('activeEffectChanged()', self._effect_cb)
-        self._effect_cb = None
-
-        if editor:
-            editor.setActiveEffectByName("")
-
-        ui = widget.ui
-        for btn in (ui.brushToolButton, ui.eraseToolButton):
-            btn.blockSignals(True)
-            btn.setChecked(False)
-            btn.blockSignals(False)
-
+    def detach(self, widget) -> None:
+        """_on_detach → unregister.  Subclasses override _on_detach, not detach."""
+        self._on_detach(widget)
         if getattr(widget, '_active_handler', None) is self:
             widget._active_handler = None
 
-    def reset(self, widget):
-        """Discard any pending before-state without committing."""
-        self._stroke_before = None
-        widget.ctrl.brush_in_progress = False
+    def _on_detach(self, widget) -> None:
+        """Override in subclasses for tool-specific teardown."""
 
-    def flush(self, widget):
-        """Force-apply and commit any in-progress or pending stroke."""
-        if widget.ctrl.brush_in_progress:
-            editor = widget._segEditor()
-            if editor:
-                effect = editor.activeEffect()
-                if effect:
-                    try:
-                        effect.self().apply()
-                    except Exception as exc:
-                        log.warning('[StrokeHandler] apply() failed: %s', exc)
-            widget.ctrl.brush_in_progress = False
 
-        self._do_commit(widget)
+class StrokeHandler(InputHandler):
+    """Shared logic for Paint and Erase handlers.
 
-    # ------------------------------------------------------------------ #
-    # Event callbacks                                                      #
-    # ------------------------------------------------------------------ #
+    Subclasses set EFFECT ('Paint' or 'Erase') and BUTTON_NAME (the name
+    of the checkable QPushButton in widget.ui that controls this handler).
+    """
 
-    def _on_stroke_start(self, widget):
-        if not (widget.ui.brushToolButton.isChecked()
-                or widget.ui.eraseToolButton.isChecked()):
-            return
-        if widget.ctrl.brush_in_progress:
-            return
+    EFFECT: str = ''
+    BUTTON_NAME: str = ''
 
-        # Resolve the active view NOW — the cursor is over a slice view at
-        # the moment of the click, so underMouse() is reliable here.
-        widget._resolveActiveView()
-
-        # Rapid double-click: flush any uncommitted before-state first.
-        if self._stroke_before is not None:
-            self._do_commit(widget)
-
-        axis, idx, before = widget.logic.capture_current_slice(widget)
-        if before is not None:
-            self._stroke_before = (axis, idx, before)
-        widget.ctrl.brush_in_progress = True
-        log.debug('[%s] stroke start — history %d', self.SOURCE, len(widget._history))
-
-    def _on_stroke_end(self, widget):
-        if not widget.ctrl.brush_in_progress:
-            return
-        widget.ctrl.brush_in_progress = False
-        if self._stroke_before is not None:
-            # 0-ms timer fires after VTK's Paint effect apply() commits the stroke.
-            qt.QTimer.singleShot(0, lambda: self._do_commit(widget))
-
-    def _do_commit(self, widget):
-        if self._stroke_before is None:
-            return
-        axis, idx, before = self._stroke_before
-        self._stroke_before = None
-        change = widget.logic.commit_stroke(widget, axis, idx, before, self.SOURCE)
-        if change is not None and self._should_track(change):
-            widget._add_history([self.SOURCE, change])
-        log.debug('[%s] committed — change=%s  history=%d',
-                  self.SOURCE, change is not None, len(widget._history))
-
-    def _on_effect_changed(self, widget):
-        """Detach when the Segment Editor effect is changed externally."""
-        if widget.ctrl.activating_brush:
-            return
-        editor = widget._segEditor()
-        effect = editor.activeEffect() if editor else None
-        if (effect.name if effect else None) != self.EFFECT:
-            self.detach(widget)
-
-    # ------------------------------------------------------------------ #
-    # Helpers                                                              #
-    # ------------------------------------------------------------------ #
-
-    def _should_track(self, change) -> bool:
-        """Return True when this stroke should be pushed to history."""
-        return True
-
-    def _activate_effect(self, widget):
-        """Configure Segment Editor and activate EFFECT; sync UI buttons."""
-        editor = widget._segEditor()
-        if editor is None:
-            return
-
-        volNode, segNode = widget.logic.getVolumeAndSegmentation(widget._parameterNode)
-
-        if not volNode or not segNode:
-            return
-
-        widget.ctrl.activating_brush = True
-        try:
-            editor.setSegmentationNode(segNode)
-            widget.ctrl.brush_in_progress = False
-            editor.setSourceVolumeNode(volNode)
-            editor.setUndoEnabled(True)
-            editor.setMaximumNumberOfUndoStates(50)
-            segID = widget.ui.segmentSelector.currentSegmentID()
-            if segID:
-                editor.setCurrentSegmentID(segID)
+    def _on_attach(self, widget) -> None:
+        vol    = widget.ui.sourceVolumeSelector.currentNode()
+        seg    = widget.ui.segmentationNodeSelector.currentNode()
+        seg_id = widget.ui.segmentSelector.currentSegmentID()
+        editor = widget.logic.get_segment_editor()
+        widget.logic.setup_editor_nodes(editor, vol, seg, seg_id)
+        if editor:
             editor.setActiveEffectByName(self.EFFECT)
-            widget._applyBrushParams()
-        finally:
-            widget.ctrl.activating_brush = False
+            widget._borrowEffectsOptionsFrame()
+            slicer.app.applicationLogic().GetInteractionNode().SwitchToViewTransformMode()
+        self._sync_buttons(widget, active=True)
 
-        # Restore SPX overlay if editor node setup displaced it.
-        if widget._spx_boundary_visible and widget._spx_boundary_node:
-            composite = widget._get_composite_node(widget._spx_boundary_view)
-            if composite:
-                composite.SetLabelVolumeID(widget._spx_boundary_node.GetID())
-                composite.SetLabelOpacity(0.8)
+    def _on_attach_cancelled(self, widget) -> None:
+        self._sync_buttons(widget, active=False)
 
-        # Switch interaction to view-transform so clicks paint, not place markups.
-        slicer.app.applicationLogic().GetInteractionNode().SwitchToViewTransformMode()
+    def _on_detach(self, widget) -> None:
+        widget._returnEffectsOptionsFrame()
+        editor = widget.logic.get_segment_editor()
+        if editor:
+            cur = editor.activeEffect()
+            if cur and cur.name == self.EFFECT:
+                editor.setActiveEffectByName('')
+        self._sync_buttons(widget, active=False)
 
-        # Reflect the active tool in the UI buttons.
-        ui = widget.ui
-        for btn, active in ((ui.brushToolButton, self.SOURCE == 'brush'),
-                            (ui.eraseToolButton, self.SOURCE == 'erase')):
-            btn.blockSignals(True)
-            btn.setChecked(active)
-            btn.blockSignals(False)
+    def _sync_buttons(self, widget, active: bool) -> None:
+        """Set the brush/erase toggle buttons to reflect current handler state."""
+        for name in ('brushToolButton', 'eraseToolButton'):
+            btn = getattr(widget.ui, name, None)
+            if btn:
+                btn.blockSignals(True)
+                btn.setChecked(active and name == self.BUTTON_NAME)
+                btn.blockSignals(False)
 
 
 class BrushHandler(StrokeHandler):
-    """Paint (additive) stroke handler."""
+    """Activates the Segment Editor Paint effect."""
     EFFECT = 'Paint'
-    SOURCE = 'brush'
+    BUTTON_NAME = 'brushToolButton'
 
 
 class EraseHandler(StrokeHandler):
-    """Erase stroke handler — skips strokes that removed no positive pixels."""
+    """Activates the Segment Editor Erase effect."""
     EFFECT = 'Erase'
-    SOURCE = 'erase'
-
-    def _should_track(self, change) -> bool:
-        return bool(np.any(change.delta < 0))
+    BUTTON_NAME = 'eraseToolButton'
 
 
 class PointHandler(InputHandler):
-    """Treats each confirmed control point as a superpixel brush/erase stroke.
+    """Segment guard for prompt-point placement mode.
 
-    Finds the SPX label at the point's 2-D position on the current slice,
-    then writes current | label_pixels (positive point) or
-    current & ~label_pixels (negative point) through
-    SegmentTracker.write_slice() — the same single write path used by
-    BrushHandler and EraseHandler.
+    Actual placement is managed by qSlicerSimpleMarkupsWidget.  This handler
+    exists so that entering point-placement mode runs the same unified
+    segment-existence guard as brush and erase, ensuring every placed point
+    is immediately associated with a valid segment.  No extra setup is needed
+    beyond what the base class already provides.
     """
-
-    def attach(self, widget):
-        """Deactivate the current tool, then switch to persistent placement mode."""
-        self._detach_current_tool_if_exists(widget)
-        posNode, _ = widget.logic.getPromptNodes(widget._parameterNode)
-        if not posNode:
-            return
-        widget._active_handler = self
-        interactionNode = slicer.app.applicationLogic().GetInteractionNode()
-        # Already in placement mode (e.g. _onInteractionModeChanged called us while
-        # Place mode is already active) — registration done, no mode switch needed.
-        if interactionNode.GetCurrentInteractionMode() == interactionNode.Place:
-            return
-        selectionNode = slicer.app.applicationLogic().GetSelectionNode()
-        selectionNode.SetActivePlaceNodeID(posNode.GetID())
-        selectionNode.SetActivePlaceNodeClassName(posNode.GetClassName())
-        interactionNode.SwitchToPersistentPlaceMode()
-
-    def detach(self, widget):
-        """Return Slicer to view-transform mode and unregister."""
-        if getattr(widget, '_active_handler', None) is self:
-            widget._active_handler = None
-        interactionNode = slicer.app.applicationLogic().GetInteractionNode()
-        if interactionNode.GetCurrentInteractionMode() == interactionNode.Place:
-            interactionNode.SwitchToViewTransformMode()
-

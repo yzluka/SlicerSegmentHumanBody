@@ -119,11 +119,10 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         return self._get_tracker(segNode, segmentID, volumeNode).get_mask()
 
     def capture_current_slice(self, widget):
-        """Force-reload the tracker and return the current slice as a before-state.
+        """Return the current slice as a before-state snapshot for stroke undo.
 
-        Called at brush-stroke start so the widget can hold the pre-paint
-        snapshot.  Drops the tracker cache first so the snapshot always
-        reflects the latest MRML-committed state.
+        ``tracker.get_slice()`` reads directly from the segment's VTK buffer
+        (zero-copy view → 2-D slice copy) — O(H×W), not O(H×W×D).
 
         Returns
         -------
@@ -135,59 +134,76 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
             return None, None, None
         axis, idx = self.getAxisAndSlice(widget, vol)
         tracker = self._get_tracker(seg, seg_id, vol)
-        tracker.sync()                                  # force fresh reload
-        before_slice = tracker.get_slice(axis, idx).copy()
+        before_slice = tracker.get_slice(axis, idx)   # already returns a copy
         return axis, idx, before_slice
 
     def commit_stroke(self, widget, axis, idx, before_slice, source='brush') -> 'MaskChange | None':
-        """Record a brush stroke as a tracked delta via the single write path.
+        """Record a brush stroke as a tracked delta.
 
-        Reads the after-state directly from Slicer (bypassing the cached
-        ``_mask``), temporarily restores ``before_slice`` into ``_mask`` so
-        that ``write_slice`` computes ``delta = after − before``, then calls
-        ``write_slice`` which updates ``_mask`` to the after-state and pushes
-        to Slicer.
+        Reads the after-state from the segment's VTK buffer (zero-copy via
+        tracker._vtk_view), computes delta = after − before, and returns the
+        MaskChange.  Does NOT write back to Slicer — the Paint/Erase effect
+        already applied the stroke.
 
-        Returns the ``MaskChange`` to be stored in the widget's ``_history``,
-        or ``None`` when the stroke produced no net change.
+        Falls back to arrayFromSegmentBinaryLabelmap if the VTK path is
+        unavailable.
+
+        Returns None when the stroke produced no net change.
         """
         vol, seg, seg_id = self._get_context(widget)
         if not vol or not seg or not seg_id:
             return None
         tracker = self._get_tracker(seg, seg_id, vol)
 
-        # Read the committed after-state from Slicer without touching _mask.
+        # Fast path: tracker._vtk_view() is a zero-copy numpy view into the
+        # VTK buffer — no temp MRML nodes, no full-volume copies.
+        view, _ = tracker._vtk_view()
+        if view is not None:
+            after_slice = get_slice_from_volume(view, axis, idx).copy()
+            return tracker.make_change(axis, idx, before_slice, after_slice, source)
+
+        # Slow fallback — ExportSegmentsToLabelmapNode through a temp MRML node.
         raw = slicer.util.arrayFromSegmentBinaryLabelmap(seg, seg_id, vol)
         if raw is None:
             log.warning('[Logic] commit_stroke: labelmap read returned None — stroke lost')
             return None
         after_slice = get_slice_from_volume(raw, axis, idx).copy()
+        return tracker.make_change(axis, idx, before_slice, after_slice, source)
 
-        # Restore before-state in _mask so write_slice sees the right baseline.
-        write_slice_to_volume(tracker.get_mask(), before_slice, axis, idx)
+    def warmup_tracker(self, widget) -> None:
+        """Prepare the tracker for the active segment before the first stroke.
 
-        # Single write path: delta = after − before, updates _mask, pushes.
-        return tracker.write_slice(axis, idx, after_slice, source=source)
+        Called during brush/erase activation.  Ensures the segment occupies
+        its own binary labelmap layer (SeparateSegment) and that
+        GetBinaryLabelmapInternalRepresentation has been called at least once.
+        Any slow one-time work (representation conversion, layer separation,
+        buffer reallocation) happens here — at button-click time — rather than
+        during the first _on_stroke_start, which would block the UI thread and
+        cause the first stroke to appear as a straight line.
+        """
+        vol, seg, seg_id = self._get_context(widget)
+        if not (vol and seg and seg_id):
+            return
+        tracker = self._get_tracker(seg, seg_id, vol)
+        tracker.ensure_own_layer()          # separate from any shared layer
+        axis, idx = self.getAxisAndSlice(widget, vol)
+        tracker.get_slice(axis, idx)        # prime _vtk_view() / fall back once
+
+    def _apply_delta(self, widget, change, method):
+        if change is None:
+            return
+        vol, seg, seg_id = self._get_context(widget)
+        if not vol or not seg or not seg_id:
+            return
+        getattr(self._get_tracker(seg, seg_id, vol), method)(change)
 
     def reverse_change(self, widget, change) -> None:
         """Apply the inverse of *change* to the tracker and push to Slicer."""
-        if change is None:
-            return
-        vol, seg, seg_id = self._get_context(widget)
-        if not vol or not seg or not seg_id:
-            return
-        tracker = self._get_tracker(seg, seg_id, vol)
-        tracker.reverse_delta(change)
+        self._apply_delta(widget, change, 'reverse_delta')
 
     def forward_change(self, widget, change) -> None:
         """Re-apply *change* to the tracker and push to Slicer (redo path)."""
-        if change is None:
-            return
-        vol, seg, seg_id = self._get_context(widget)
-        if not vol or not seg or not seg_id:
-            return
-        tracker = self._get_tracker(seg, seg_id, vol)
-        tracker.forward_delta(change)
+        self._apply_delta(widget, change, 'forward_delta')
 
     # -------------------------
     # Window / Level
