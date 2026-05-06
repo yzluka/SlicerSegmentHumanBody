@@ -1,308 +1,200 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for AI assistants and future maintainers working on this repository.
+
+## Current Branch Direction
+
+This branch (`feature/native-editor-wrapper`) keeps the current UI layout and
+uses Slicer's native Segment Editor for editing. Do not reimplement brush,
+erase, undo, redo, or markup placement unless there is a clear Slicer limitation.
+
+The main development focus is the mouse-centered record/export
+system for annotation-process analysis.
 
 ## Development Principles
 
-These rules override Claude's defaults and apply to every change in this repo.
+1. Prefer Slicer native tools.
 
-**Robustness and performance are the top priorities.**  Every code path that
-touches Slicer's MRML scene or VTK pipeline must be defensive (null-check
-nodes, catch VTK exceptions) and must not copy large arrays unnecessarily.
+   - Brush/erase: Segment Editor `Paint` / `Erase`.
+   - Undo/redo: Segment Editor undo stack.
+   - Prompt points: `qSlicerSimpleMarkupsWidget` and
+     `vtkMRMLMarkupsFiducialNode`.
+   - Coordinates: Slicer RAS/IJK matrices.
 
-**Delegate to 3D Slicer native tools first.**  Before writing custom logic,
-ask whether Slicer already provides it:
-- Brush / Erase / Paint effects → `qMRMLSegmentEditorWidget` effects
-- Undo / Redo → Segment Editor's built-in undo stack
-- Markup placement → `qSlicerSimpleMarkupsWidget` + `vtkMRMLMarkupsFiducialNode`
-- Volume display → `vtkMRMLScalarVolumeDisplayNode` (W/L, colormap)
-- Coordinate conversion → `vtkMRMLMarkupsNode`, `GetRASToIJKMatrix`
-- Rendering batching → `StartModify` / `EndModify` on any MRML node
+2. Handlers are wrappers.
 
-Only add custom code where Slicer has no equivalent or where the native path
-has a known performance problem (e.g. the MRML labelmap pipeline copies the
-full volume on every call — use the zero-copy VTK buffer path instead).
+   `BrushHandler`, `EraseHandler`, and `PointHandler` wrap Slicer tools. If a
+   handler detaches, it must also disable the wrapped Slicer tool. Mutual
+   exclusion means only one wrapper and one wrapped Slicer tool are active.
 
-**Logic has zero UI references.**  `SegmentHumanBodyLogic` must never import
-`qt` or reference `self.ui`.  The Widget reads UI state and calls Logic;
-Logic only touches MRML nodes and Slicer services.
+3. Recording is mouse-centered, not UI-macro-centered.
 
-**No premature abstraction.**  Do not generalize a solution until the third
-concrete use-case appears.  Copy-paste is preferable to a leaky abstraction.
+   Record:
+
+   - Mouse trajectory in 3D relative to the active volume.
+   - Trajectory kind: `annotation_move` for mouse-held edits and
+     `non_annotation_move` for released-button hover and point-relocation
+     movement that does not directly modify masks.
+   - Trajectory role: `annotation_trajectory` for edit paths and
+     `visualization_trajectory` for hover/view-only movement.
+   - Active handler/tool and handler params.
+   - Mouse status (`move`, `press`, `release`, `view`).
+   - Visualization state.
+   - Mouse-triggered semantic operations.
+   - Hotkeys/actions that modify segmentation masks or segment state.
+
+   Do not record general UI-panel motion as annotation process data.
+
+4. Logic remains UI-light.
+
+   Widget code may read UI state and wire Slicer widgets. Logic helpers should
+   avoid depending on Qt widgets unless the active branch has already placed the
+   behavior in `SegmentHumanBodyWidget`.
+
+## Recording Contract
+
+`core/_mouse_recorder.py` records only events that occur in Red/Green/Yellow
+slice views and map inside the active volume.
+
+Current schema is intentionally strict while this branch is under test:
+
+- Saved recordings are compact process logs with top-level `type`, `metadata`,
+  and `events`.
+- `xy_global` / screen-space coordinates are not exported.
+- RAS is the canonical coordinate. 3D IJK can be derived later from each event
+  RAS plus recorded volume metadata; do not duplicate IJK into every event.
+
+The recorder is an event-listener-style component. It should first produce a
+correct in-volume event stream, then annotate events with
+annotative/non-annotative classification. Do not let policy decisions drop raw
+press/release/move events inside volume views.
+
+Exactly one `metadata` record is created when recording starts. It caches volume
+metadata, the 30 Hz sample rate, the initial Red/Green/Yellow visual state, and
+whether recording began with the left mouse button already down.
+
+Metadata is not an exported event. The compact export stores:
+
+- `metadata.start_time`: absolute time for the recording.
+- `events[].id`: sequential event reference starting at 1 for process events
+  only.
+- `events[].t_ms`: event time relative to `metadata.start_time`.
+- `events[].ras`: 3D Slicer RAS coordinate when the event has an in-volume
+  position.
+- `events[].mouse`: `move`, `press`, `release`, or `view`.
+- `events[].pressed`: `1` when the left mouse button is down, `0` when
+  released.
+- `events[].kind`: `annotation_move`, `non_annotation_move`, or `view_change`.
+- `events[].role`: `annotation_trajectory` or `visualization_trajectory`.
+- `events[].tool`: `brush`, `erase`, `point`, or `None`.
+- `events[].brush_mm`: brush/erase radius when relevant.
+- Point fields (`point`, `point_index`, `point_action`, `negative`) only when
+  relevant.
+- View fields (`view_event`, `wheel_delta`, `visual_state`) only for explicit
+  view-change events. Initial Red/Green/Yellow state lives in metadata.
+  Visual-state snapshots omit repeated slice-view dimensions.
+
+Movement samples the latest in-volume cursor position at 30 records/sec and
+skips unchanged positions.
+
+Slice-view capture uses both Qt event filters and high-priority, non-consuming
+VTK interactor observers because native Segment Editor Paint/Erase may bypass
+one path or abort propagation after handling the event. Avoid doing
+unnecessary work in raw mouse callbacks, but do not defer active-volume
+membership until the timer: each raw move should resolve XY to RAS immediately
+and cache the latest valid in-volume sample with its original timestamp. The
+timer only appends the latest cached valid sample. Boundary events should flush
+pending movement before appending themselves so event order remains meaningful.
+When VTK move capture is available, Qt `MouseMove` capture is disabled to avoid
+duplicate high-frequency callbacks.
+
+Brush/erase press is a required boundary event. If Slicer drops the initial
+press but a brush/erase drag sample or release is observed, infer a `press`
+boundary before the first sampled move/release and set
+`payload.boundary_source`.
+Brush/erase movement is classified from the mouse button state: held-button
+movement is `annotation_move`; released-button movement is
+`non_annotation_move`. Both are listener-recordable in volume views.
+
+Point placement is recorded semantically via markups-node events as one
+`point_placed` boundary, not as raw press plus release mouse boundaries. A new
+point records its `point_placed` verdict on `PointPositionDefinedEvent`, using
+the defined control-point location. The later interaction end is used only to
+refresh cached metadata and must not duplicate the verdict. Include point ID
+and point name/label when available. Minor drift between press and release is
+`non_annotation_move` trajectory.
+
+Point relocation is also semantic annotation process data. Record markups
+`PointStartInteractionEvent` as `point_drag_start` with `point_action: grab`;
+record `PointEndInteractionEvent` as `point_placed` with
+`point_action: replace` at the final RAS. Sample `PointModifiedEvent` movement
+as `non_annotation_move` instead of creating a new point.
+During compact export, suppress raw point-tool mouse press/move/release
+companions for an accepted point relocation; those raw mouse RAS values are a
+different coordinate stream and are redundant with the markups point stream.
+Only start point-drag recording for previously defined control points, not
+preview/not-yet-assigned placement points.
+Point-drag move/end events must be ignored unless a valid point-drag start was
+accepted first; this prevents pre-assignment hover/preview movement from being
+misclassified as relocation trajectory.
+Point-drag move sampling should be checked before node lookup/RAS extraction so
+high-frequency markups `PointModifiedEvent` callbacks stay cheap.
+Point deletion records `point_removed` using the last cached point metadata so
+the event can still include RAS after Slicer removes the control point.
+
+Segment creation is not recorded as a standalone process event. Segment removal
+and segment rename are recorded from active `vtkSegmentation` events:
+`segment_removed` carries the last known name, and `segment_renamed` carries
+old/new names.
+
+Segment selection changes are not standalone records. The active segment ID is
+carried on boundary, trajectory, and semantic payloads.
+
+Guard signal loops explicitly. In particular, parameter-node-to-UI sync uses
+`_syncing_parameter_node_to_ui` so selector changes caused by sync do not write
+straight back into the parameter node.
+
+## Model Family Template
+
+The current placeholder is:
+
+- Family: `Default`
+- Variant: `Identity`
+- Model: `IdentityModel`
+
+This is the template for future families. Add new models through
+`core/modelRegistry.py`, then expose them through a family in
+`core/modelFamilies.py`.
 
 ## Python Interpreter
 
-**Always use the Slicer-bundled Python** — there is no standard Python in PATH:
+Use Slicer's Python:
 
-```
-C:\Users\82755\AppData\Local\slicer.org\3D Slicer 5.10.0\bin\PythonSlicer.exe
-```
-
-## Running Tests
-
-There are two test layers with different runners.
-
-### Pure-Python unit tests (`tests/`)
-
-Run entirely outside 3D Slicer — no Slicer imports needed. `conftest.py` adds the package root to `sys.path` automatically.
-
-```bash
-cd SegmentHumanBody
-
-# All
-"C:\Users\82755\AppData\Local\slicer.org\3D Slicer 5.10.0\bin\PythonSlicer.exe" -m pytest tests/ -v
-
-# Single file
-"..." -m pytest tests/test_families.py -v
-
-# Single test
-"..." -m pytest tests/test_families.py::TestSPXModelFamily::test_cache_hit_skips_forward -v
-
-# With coverage
-"..." -m pytest tests/ --cov=core --cov-report=term-missing
+```powershell
+PythonSlicer.exe
 ```
 
-Test files:
-- `test_families.py` — SPX label cache hit/miss, `on_expand` behaviour, registry lookup
-- `test_undo_widget.py` — unified undo stack entry format, LIFO ordering, clear semantics, snapshot integrity
-- `test_registry.py` — model registry caching and factory lookup
-- `test_spx_models.py` — individual SPX model algorithms
-- `test_utils.py` — slice read/write helpers, coordinate helpers
-- `test_deps.py` — `DependencyCheck` package/file probing, caching, version comparison
+Known local Slicer executable:
 
-### Slicer-native integration tests (`SegmentHumanBodyTest`)
-
-Defined as `class SegmentHumanBodyTest(ScriptedLoadableModuleTest)` at the bottom of `SegmentHumanBody.py`. These run **inside** a Slicer process and exercise MRML scene interactions (`arrayFromSegmentBinaryLabelmap`, `updateSegmentBinaryLabelmapFromArray`, segmentation node lifecycle, coordinate conversion, and undo).
-
-```bash
-# Headless (no window, 24 layout-dependent tests skipped):
-Slicer.exe --no-main-window --python-script D:/SlicerSegmentHumanBody/run_slicer_tests.py
-
-# Full GUI (all 89 tests run):
-Slicer.exe --python-script D:/SlicerSegmentHumanBody/run_slicer_tests.py
+```powershell
+C:\Users\82755\AppData\Local\slicer.org\3D Slicer 5.10.0\Slicer.exe
 ```
 
-Or from inside Slicer: **Developer Tools ▸ Run Unittests**, select `SegmentHumanBodyTest`.
+## Tests
 
-Covered by the integration tests:
-- `expandSegWithSPX` selects matched SPX labels and leaves other slices untouched
-- `expandSegWithSPX` with `neg_points` subtracts the corresponding SPX labels
-- `undo()` restores the pre-expand slice state
-- `commit_point` writes pos/neg superpixel selections through the tracker
-- `_ras_to_ijk` maps the RAS centre of a volume to the middle voxel
-- `onAddSegment` cache/detach/create/restore handler lifecycle
-- `StrokeHandler.attach()` supersession guard (defensive: fires if `_active_handler` changes during `_activate_effect`)
-- Full regression: brush active → Add Segment → click place deactivates brush
-- Unified pre-attach guard: `PointHandler`, `BrushHandler`, and `EraseHandler` each auto-create a segment when attaching to an empty segmentation (via `_detach_current_tool_if_exists`)
-- `commit_stroke` records a MaskChange; `onUndo` restores the pre-stroke slice
-- Brush LIFO: two strokes on different slices undo in reverse order
-- `EraseHandler._should_track`: no-op erase returns None; pixel-removing erase is tracked
-- `_onPointConfirmed` with a synthetic SPX family paints the correct superpixel region
-- Positive / negative point placement maps the correct label to union / subtract
-- Point undo removes the control point from the markup node AND reverses the mask
-- Point on a different slice than the current view is silently ignored
-- `_onPointRemoved` (manual deletion) reverses the mask without `Ctrl+Z`
-- `_onPointRemoved` is suppressed while `ctrl.is_paused`
-- Mixed LIFO: brush + point session; each Ctrl+Z pops exactly its own action type
+Pure-Python tests:
 
-## Architecture
-
-This is a **3D Slicer scripted module**. The entry point (`SegmentHumanBody.py`) is loaded by Slicer and must not be run standalone — it imports `qt`, `vtk`, and `slicer` which only exist inside Slicer's Python.
-
-### Key Layers
-
-```
-SegmentHumanBody.py          ← Slicer module entry point: SegmentHumanBodyWidget + Test runner
-core/
-  _logic.py                  ← SegmentHumanBodyLogic: commit_point, commit_stroke, SPX expansion, prompt nodes, W/L
-  _state.py                  ← WidgetState: pause/resume, tool-mode flags
-  _input.py                  ← InputHandler hierarchy: StrokeHandler, BrushHandler, EraseHandler, PointHandler
-  _tracker.py                ← SegmentTracker: write_slice, reverse_delta, forward_delta, MaskChange
-  _deps.py                   ← DependencyCheck: lazy, cached package/file probing (process-scoped)
-  modelFamilies.py           ← BaseModelFamily, SPXModelFamily, TimedAnnotatorFamily, FAMILY_REGISTRY
-  modelRegistry.py           ← Lazy-instantiating session cache (ModelRegistry)
-  models/spx.py              ← Concrete SPX algorithms (SPX_Tester2D, SPX_SLIC2D, SPX_Felzenszwalb2D)
-  models/timed_annotator.py  ← TimedAnnotatorModel: per-segment timestamped log + mirror markup nodes
-  utils.py                   ← slice helpers, coordinate helpers, apply_window_level, spx_boundary_mask
+```powershell
+cd D:\SlicerSegmentHumanBody\SegmentHumanBody
+PythonSlicer.exe -m pytest tests/ -q
 ```
 
-### Single Write Path (Abstract Factory)
+Slicer-native tests:
 
-All three interactive tools write to the mask through the same `SegmentTracker.write_slice()` path via the `InputHandler` hierarchy:
-
-```
-InputHandler
-└── StrokeHandler
-    ├── BrushHandler   → commit_stroke() → tracker.write_slice()   source='brush'
-    └── EraseHandler   → commit_stroke() → tracker.write_slice()   source='erase'
-PointHandler           (lifecycle only — no business logic)
+```powershell
+cd D:\SlicerSegmentHumanBody
+& 'C:\Users\82755\AppData\Local\slicer.org\3D Slicer 5.10.0\Slicer.exe' --no-main-window --python-script D:/SlicerSegmentHumanBody/run_slicer_tests.py
 ```
 
-`_onPointConfirmed` calls `logic.commit_point()` directly: it runs the SPX model via `modelFamily.on_expand()` (using its label cache), finds the superpixel at the click position, and unions (positive) or subtracts (negative) those pixels from the current slice through `tracker.write_slice()`. The resulting `MaskChange` is stored in `_history` synchronously — no async timer needed.
-
-### Mutual Exclusion
-
-Only one handler is active at a time, tracked by `widget._active_handler`. Every `attach()` calls `_detach_current_tool_if_exists(widget)` first, which:
-
-1. Flushes and detaches the previous handler before the new one activates.
-2. **Unified pre-attach guard**: if a volume is selected but no segment exists yet, calls `widget.onAddSegment()` — before any Slicer element (placement node, Paint/Erase effect, mouse filter) is installed.  This single check in the base class applies to all handler types (PointHandler, BrushHandler, EraseHandler, and any future handlers).
-
-Two triggers switch to `PointHandler`:
-- `_onPlaceModeChanged(active=True)` — Qt signal from the place widgets (direct path)
-- `_onInteractionModeChanged` — VTK observer fallback for Slicer's global toolbar
-
-Both triggers are guarded by `ctrl.is_paused` and return immediately when paused, so programmatic `setCurrentNode` calls inside `updateGUIFromParameterNode` (only the markup-node `setCurrentNode` calls are wrapped in `ctrl.pause()`) never spuriously activate `PointHandler`.
-
-#### `onSegmentChanged` deferred-signal guard
-
-`qMRMLSegmentSelectorWidget` fires a deferred `currentSegmentChanged` via an internal QTimer after `blockSignals(False)` — by then `creating_segment` is already False. To prevent this spurious second call from wiping `_history` and replacing prompt nodes via `clearPrompts()`, `onSegmentChanged` stores the last processed segment ID in `_acknowledged_segment_id` and returns immediately if the incoming ID matches.
-
-#### Segment creation lifecycle (`onAddSegment`)
-
-`clearPrompts()` (called via `onSegmentChanged` → `setCurrentSegmentID`) assigns `_active_handler = PointHandler()` directly without going through the detach lifecycle. To prevent it from orphaning an active stroke handler, `onAddSegment` follows a cache/detach/create/restore sequence:
-
-1. **Cache** — remember the active `StrokeHandler` class (Brush/Erase), if any
-2. **Detach** — call `.detach()` on the current handler so it is cleanly removed before creation
-3. **Create** — add the empty segment; `onSegmentChanged` → `clearPrompts()` sets `_active_handler = PointHandler()`
-4. **Restore** (in `finally`) — if a stroke handler was cached, instantiate and `attach()` it fresh
-
-The restore runs in `finally` so it also executes on early return (e.g. no volume selected), ensuring the handler is always left in a consistent state.
-
-#### `StrokeHandler.attach()` supersession guard
-
-After `_activate_effect()` returns, `StrokeHandler.attach()` checks:
-
-```python
-if widget._active_handler is not self:
-    return
-```
-
-This is defensive code: if anything inside `_activate_effect()` were to change `_active_handler` (e.g. a signal handler re-entering `onAddSegment`), the stale original `attach()` bails out instead of installing a duplicate mouse filter and effect callback.  In normal operation `_detach_current_tool_if_exists` has already created the segment before `_activate_effect` is called, so `_activate_effect` itself no longer triggers `onAddSegment`.
-
-### SPX Label Cache
-
-`SPXModelFamily` caches the superpixel label map inside `on_expand()` using `img.ctypes.data` (the buffer pointer into the VTK volume array) as part of the key — O(1) lookup with no data copy. The cache is invalidated when params change, the image buffer changes, or `confirm_model()` is called.  Both `commit_point()` and the Expand action use this cache.
-
-### Model Family Pattern
-
-UI button visibility is driven entirely by `VISIBLE_BUTTONS` on the active family:
-
-```python
-# In Widget.updateUIVisibility():
-for name in _BUTTON_NAMES:
-    widget.setVisible(name in self.modelFamily.VISIBLE_BUTTONS)
-```
-
-Adding a button to a family = add its widget name to `VISIBLE_BUTTONS`.
-
-Families currently in `FAMILY_REGISTRY`:
-
-| Key | Class | Purpose |
-|---|---|---|
-| `'None'` | `BaseModelFamily` | No-op placeholder |
-| `'SAM-Style'` | `SAMFamily` | SAM v1/v2 interactive (stub) |
-| `'SPX-Assisted Annotation'` | `SPXModelFamily` | Superpixel-guided annotation |
-| `'Auto'` | `AutoModelFamily` | Non-interactive automated models |
-| `'TimedMarker'` | `TimedAnnotatorFamily` | Timestamped annotation log |
-
-`TimedAnnotatorFamily` has no model weights — it auto-confirms on family switch. All logic lives in `TimedAnnotatorModel` (loaded once via `ModelRegistry`, cached for the session so switching away and back preserves the accumulated log). It exposes `on_segment_created`, `on_point_confirmed`, `on_point_undone`, `sync_visibility`, `on_export`, and `on_import` hooks.
-
-### Segment Visibility
-
-Two independent visibility controls, each with their own checkbox and state variable:
-
-| Widget | Hotkey | State var | Default | Controls |
-|---|---|---|---|---|
-| `showCurrentSegmentCheckBox` | `V` | `_current_segment_visible` | `True` | The segment currently being edited |
-| `showSegmentsCheckBox` | — | `_saved_segments_visible` | `False` | All other (saved) segments |
-
-`_apply_saved_segments_visibility(exclude=segmentID)` iterates every segment in the segmentation node and calls `dn.SetSegmentVisibility(sid, _saved_segments_visible)` for all except `exclude`. It is called from:
-- `onToggleSavedSegments` (checkbox / direct call)
-- `onSegmentChanged` (segment switch — hides the previous segment if saved-segments are off)
-- `updateGUIFromParameterNode` (segmentation node switch)
-
-On segment switch (`onSegmentChanged`) and on segmentation node change (`updateGUIFromParameterNode`), the incoming current segment is always made visible and `_current_segment_visible` is reset to `True`, so `showCurrentSegmentCheckBox` snaps back to checked.
-
-### Coordinate System
-
-- Prompt points come from Slicer in **RAS** space
-- They are converted to **IJK** (voxel) space via `ras_to_ijk()` before passing to models
-- Slice extraction: `axis=0` → Red (axial), `axis=1` → Green (coronal), `axis=2` → Yellow (sagittal)
-- SPX 2-D point convention: `[x, y]` maps to `labels[y, x]` (row = y, col = x)
-
-### Widget `__init__` attribute groups
-
-```python
-# Core state
-self.logic           = SegmentHumanBodyLogic()
-self.ctrl            = WidgetState(self)
-self._parameterNode  = None
-self.modelFamily     = None
-self.currentViewName = None
-
-# Undo/redo history — each entry is a list:
-#   ['brush',  change]                              — Paint stroke
-#   ['erase',  change]                              — Erase stroke
-#   ['expand', change]                              — Expand operation
-#   ['point',  change, node, cp_id, ras, is_neg]   — confirmed prompt control point
-# change is a MaskChange or None.
-self._history    = []
-self._redo_stack = []   # populated by onUndo; cleared by any new action
-
-# Active input handler
-self._active_handler = None
-
-# Keyboard shortcuts (assigned in setup())
-self._undo_shortcut         = None   # Ctrl+Z
-self._redo_shortcut         = None   # Ctrl+Shift+Z
-self._expand_shortcut       = None   # E
-self._spx_boundary_shortcut = None   # Q
-self._segments_shortcut     = None   # V
-self._tab_shortcut          = None   # A  (add segment)
-
-# SPX boundary overlay
-self._spx_boundary_node    = None
-self._spx_boundary_visible = False
-self._spx_boundary_view    = None
-
-# Segment visibility
-self._saved_segments_visible   = False   # saved segments checkbox
-self._current_segment_visible  = True    # current segment / V hotkey
-
-# Deferred-signal guard: last segment ID processed by onSegmentChanged.
-# Suppresses the duplicate currentSegmentChanged emitted by
-# qMRMLSegmentSelectorWidget after blockSignals(False).
-self._acknowledged_segment_id  = None
-```
-
-### Widget method sections (in order)
-
-`# Lifecycle` → `# UI` → `# Signals & Observers` → `# Parameter Node` → `# Model selection` → `# Segment management` → `# Interaction mode` → `# Point events` → `# Brush tool` → `# Window / Level` → `# Expand (E)` → `# Undo (Ctrl+Z)` → `# Redo (Ctrl+Shift+Z)` → `# SPX Boundary Overlay (Q)` → `# Segment Visibility`
-
-### Undo System
-
-All undo actions follow one path: pop a `['type', MaskChange, ...]` entry from `_history`, call `logic.reverse_change()` which calls `tracker.reverse_delta()`, then push the entry onto `_redo_stack`.
-
-| Entry type | Extra fields | What undo does |
-|---|---|---|
-| `'brush'` | change | reverse delta → push to redo stack |
-| `'erase'` | change | reverse delta → push to redo stack |
-| `'expand'` | change | reverse delta → push to redo stack |
-| `'point'` | change, node, cp_id, ras, is_neg | remove control point + reverse delta; recreate node if now empty; push to redo stack |
-
-**Redo** (`Ctrl+Shift+Z`) pops from `_redo_stack`, calls `logic.forward_change()` which calls `tracker.forward_delta()`, then pushes back onto `_history`. Any new action (brush, point, expand) calls `_redo_stack.clear()`.
-
-Manual point deletion (not via Ctrl+Z) is handled by `_onPointRemoved`, which scans `_history` for the matching cp_id and calls `reverse_change()` (no redo entry is created for manual deletes).
-
-### Adding a New SPX Model
-
-1. Implement the class in `core/models/spx.py` with `PARAM_HINT`, optional `DOC_URL`, and `forward(**kwargs)` that pops `img` and returns an integer label map.
-2. Register it in `core/modelRegistry.py` `_MODEL_FACTORIES` dict.
-3. Add the display name → registry key mapping to `SPXModelFamily.MODEL_MAP` in `core/modelFamilies.py`.
-4. `core/models/spx.py` is already in `CMakeLists.txt`; new files must be added there.
-
-### Adding a New Model Family
-
-1. Subclass `BaseModelFamily` in `core/modelFamilies.py`.
-2. Populate `VISIBLE_BUTTONS` with the widget names that should appear for this family.
-3. Add the display name → class mapping to `FAMILY_REGISTRY` at the bottom of `modelFamilies.py`.
+Some handler/markups tests require a live Slicer Qt runtime and are skipped by
+plain `PythonSlicer.exe` when the full Qt/Slicer application is not available.

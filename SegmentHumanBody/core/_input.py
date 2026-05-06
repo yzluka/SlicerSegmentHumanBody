@@ -55,6 +55,8 @@ class InputHandler:
             seg = widget.ui.segmentationNodeSelector.currentNode()
         if not seg or seg.GetSegmentation().GetNumberOfSegments() == 0:
             widget._onAddSegment()
+        elif hasattr(widget, '_ensure_current_prompt_nodes'):
+            widget._ensure_current_prompt_nodes()
         return widget.ui.segmentSelector.currentSegmentID()
 
     # ------------------------------------------------------------------ #
@@ -153,3 +155,17 @@ class PointHandler(InputHandler):
     is immediately associated with a valid segment.  No extra setup is needed
     beyond what the base class already provides.
     """
+
+    def _on_attach(self, widget) -> None:
+        if hasattr(widget, '_ensure_current_prompt_nodes'):
+            widget._ensure_current_prompt_nodes()
+        if hasattr(widget, '_set_prompt_widget_place_mode'):
+            widget._set_prompt_widget_place_mode(
+                getattr(widget, '_active_prompt_widget', None), True)
+
+    def _on_detach(self, widget) -> None:
+        if hasattr(widget, '_set_prompt_widget_place_mode'):
+            widget._set_prompt_widget_place_mode(
+                getattr(widget, '_active_prompt_widget', None), False)
+        if hasattr(widget, '_deactivate_prompt_place_mode'):
+            widget._deactivate_prompt_place_mode()

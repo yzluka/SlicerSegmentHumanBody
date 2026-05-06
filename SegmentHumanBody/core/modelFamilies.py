@@ -55,6 +55,38 @@ class BaseModelFamily:
 
 
 # ---------------------------------------------------------------------------
+# Default family
+# ---------------------------------------------------------------------------
+
+class DefaultFamily(BaseModelFamily):
+    """No-op family used as the template for future model integrations."""
+
+    VARIANTS = ['Identity']
+    MODEL_MAP = {'Identity': 'Identity'}
+    VISIBLE_BUTTONS = frozenset()
+
+    def _get_model_key(self):
+        if not self.variant:
+            raise ValueError("No variant selected")
+        if self.variant not in self.MODEL_MAP:
+            raise ValueError(f"Unknown variant: {self.variant}")
+        return self.MODEL_MAP[self.variant]
+
+    def confirm_model(self):
+        self.model = ModelRegistry.get_model(self._get_model_key())
+
+    def onRender(self, **kwargs):
+        if not self.model:
+            raise RuntimeError("Model not confirmed")
+        return self.model.forward(**kwargs)
+
+    def on_expand(self, **kwargs):
+        if not self.model:
+            raise RuntimeError("Model not confirmed")
+        return self.model.forward(**kwargs)
+
+
+# ---------------------------------------------------------------------------
 # SAM family
 # ---------------------------------------------------------------------------
 
@@ -243,6 +275,7 @@ class TimedAnnotatorFamily(BaseModelFamily):
 # Keys are the display names shown in the UI; values are family classes.
 # Add a new family by adding one entry here — no widget edits required.
 FAMILY_REGISTRY: dict = {
+    'Default':                   DefaultFamily,
     'None':                      BaseModelFamily,
     'SAM-Style':                 SAMFamily,
     'SPX-Assisted Annotation':   SPXModelFamily,

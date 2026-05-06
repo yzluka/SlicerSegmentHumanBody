@@ -2,7 +2,8 @@ import unittest
 import numpy as np
 
 from core.modelFamilies import (
-    BaseModelFamily, SAMFamily, SPXModelFamily, AutoModelFamily, TimedAnnotatorFamily,
+    BaseModelFamily, DefaultFamily, SAMFamily, SPXModelFamily, AutoModelFamily,
+    TimedAnnotatorFamily, FAMILY_REGISTRY,
 )
 from core.modelRegistry import ModelRegistry
 
@@ -39,6 +40,38 @@ class TestBaseModelFamily(unittest.TestCase):
         fam = BaseModelFamily(variant='SPX_Tester2D')
         fam.confirm_model()
         self.assertIsNotNone(fam.model)
+
+
+class TestDefaultFamily(unittest.TestCase):
+
+    def setUp(self):
+        ModelRegistry.model_cache.clear()
+
+    def tearDown(self):
+        ModelRegistry.model_cache.clear()
+
+    def test_registry_exposes_default_family(self):
+        self.assertIs(FAMILY_REGISTRY['Default'], DefaultFamily)
+
+    def test_default_family_declares_identity_variant(self):
+        self.assertEqual(DefaultFamily.VARIANTS, ['Identity'])
+
+    def test_confirm_model_loads_identity_model(self):
+        fam = DefaultFamily(variant='Identity')
+        fam.confirm_model()
+        self.assertIsNotNone(fam.model)
+
+    def test_identity_on_render_returns_input_image(self):
+        fam = DefaultFamily(variant='Identity')
+        fam.confirm_model()
+        img = np.arange(9, dtype=np.uint8).reshape(3, 3)
+        self.assertIs(fam.onRender(img=img), img)
+
+    def test_identity_on_expand_returns_input_image(self):
+        fam = DefaultFamily(variant='Identity')
+        fam.confirm_model()
+        img = np.arange(4, dtype=np.uint8).reshape(2, 2)
+        self.assertIs(fam.on_expand(img=img), img)
 
 
 class TestSAMFamily(unittest.TestCase):

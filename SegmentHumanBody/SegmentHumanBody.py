@@ -11,6 +11,7 @@ from slicer.ScriptedLoadableModule import (
 from slicer.util import VTKObservationMixin
 
 from core.utils import next_segment_name
+from core.modelFamilies import FAMILY_REGISTRY
 from core._mouse_recorder import get_recorder
 from core._input import StrokeHandler, BrushHandler, EraseHandler, PointHandler
 
@@ -66,13 +67,13 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         ScriptedLoadableModuleWidget.__init__(self, parent)
         VTKObservationMixin.__init__(self)
         self.logic = SegmentHumanBodyLogic()
+        self.modelFamily = FAMILY_REGISTRY['Default']('Identity')
+        self.modelFamily.confirm_model()
         self._parameterNode         = None
         self._savedSegmentsVisible  = False
         self._currentSegmentVisible = True
         self.currentViewName        = 'Red'
         self._recorder              = get_recorder()
-        self._loaded_record         = None
-        self._replay_engine         = None
         self._eof_widget            = None   # borrowed EffectsOptionsFrame
         self._eof_orig_parent       = None   # original parent to return it to
         self._active_handler        = None   # current InputHandler subclass instance
@@ -80,6 +81,13 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._suppressing_place_mode = False  # True while segment creation is in progress
         self._observed_segmentation = None   # vtkMRMLSegmentationNode being tracked
         self._observed_seg_obj      = None   # its vtkSegmentation (holds the event)
+        self._observed_segment_ids  = set()  # current IDs for lifecycle recording
+        self._observed_segment_names = {}    # last known names for removal events
+        self._recorded_prompt_node_ids = set()
+        self._active_point_drags = {}
+        self._pending_point_confirmations = {}
+        self._recorded_prompt_point_cache = {}
+        self._syncing_parameter_node_to_ui = False
 
     # ------------------------------------------------------------------ #
     # Lifecycle                                                            #
@@ -113,10 +121,12 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.initializeParameterNode()
         self._update_record_ui()
         self._recorder.context_fn = self._recorder_context
+        self._recorder.on_record_appended = self._update_record_ui
         qt.QTimer.singleShot(0, self._preloadSegmentEditor)
 
     def cleanup(self):
         self._recorder.context_fn = None
+        self._recorder.on_record_appended = None
         self.removeObservers()
         self._deactivateEffect()
         self._returnEffectsOptionsFrame()
@@ -163,10 +173,82 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         Negative is configured first so that positive ends up as the last-touched
         widget — Slicer makes the last setCurrentNode call the active placement target.
         """
-        self.ui.negativePrompts.setCurrentNode(neg_node)
-        self._configureUnlimitedPlacement(self.ui.negativePrompts)
-        self.ui.positivePrompts.setCurrentNode(pos_node)
-        self._configureUnlimitedPlacement(self.ui.positivePrompts)
+        self._set_prompt_nodes_preserving_place_mode(pos_node, neg_node)
+
+    def _markup_place_widgets(self):
+        """Return the inner place widgets for positive/negative prompt widgets."""
+        result = []
+        for markup_widget in (self.ui.positivePrompts, self.ui.negativePrompts):
+            place = None
+            for child in markup_widget.findChildren(qt.QWidget):
+                if hasattr(child, 'setPlaceModeEnabled'):
+                    place = child
+                    break
+            result.append((markup_widget, place))
+        return result
+
+    def _prompt_place_states(self):
+        states = []
+        for _, place in self._markup_place_widgets():
+            active = False
+            if place is not None and hasattr(place, 'placeModeEnabled'):
+                try:
+                    value = place.placeModeEnabled
+                    active = bool(value() if callable(value) else value)
+                except Exception:
+                    active = False
+            states.append(active)
+        return states
+
+    def _set_prompt_place_states(self, states):
+        for (_, place), active in zip(self._markup_place_widgets(), states):
+            if place is not None:
+                place.setPlaceModeEnabled(bool(active))
+
+    def _set_prompt_widget_place_mode(self, markup_widget, active):
+        if markup_widget is None:
+            return
+        old = self._suppressing_place_mode
+        self._suppressing_place_mode = True
+        try:
+            for child in markup_widget.findChildren(qt.QWidget):
+                if hasattr(child, 'setPlaceModeEnabled'):
+                    child.setPlaceModeEnabled(bool(active))
+                    break
+        finally:
+            self._suppressing_place_mode = old
+
+    def _deactivate_prompt_place_mode(self):
+        old = self._suppressing_place_mode
+        self._suppressing_place_mode = True
+        try:
+            self._set_prompt_place_states([False, False])
+        finally:
+            self._suppressing_place_mode = old
+
+    def _set_prompt_nodes_preserving_place_mode(self, pos_node, neg_node):
+        states = self._prompt_place_states()
+        old = self._suppressing_place_mode
+        self._suppressing_place_mode = True
+        try:
+            self.ui.negativePrompts.setCurrentNode(neg_node)
+            self._configureUnlimitedPlacement(self.ui.negativePrompts)
+            self.ui.positivePrompts.setCurrentNode(pos_node)
+            self._configureUnlimitedPlacement(self.ui.positivePrompts)
+        finally:
+            self._suppressing_place_mode = old
+        self._set_prompt_place_states(states)
+        self._observe_prompt_node_for_recording(pos_node, is_negative=False)
+        self._observe_prompt_node_for_recording(neg_node, is_negative=True)
+
+    def _ensure_current_prompt_nodes(self):
+        seg = self.ui.segmentationNodeSelector.currentNode()
+        segID = self.ui.segmentSelector.currentSegmentID()
+        if not seg or not segID:
+            return None, None
+        pos_node, neg_node = self.logic.create_segment_prompt_nodes(seg, segID)
+        self._set_prompt_nodes(pos_node, neg_node)
+        return pos_node, neg_node
 
     # ------------------------------------------------------------------ #
     # Signal wiring                                                        #
@@ -196,14 +278,11 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         ui.recordButton.connect('clicked(bool)',       self.onRecord)
         ui.stopRecordButton.connect('clicked(bool)',   self.onStopRecord)
         ui.exportRecordButton.connect('clicked(bool)', self.onExportRecord)
-        ui.loadRecordButton.connect('clicked(bool)',   self.onLoadRecord)
-        ui.replayRecordButton.connect('clicked(bool)', self.onReplayRecord)
 
         # Record volume / seg changes when active.
         ui.sourceVolumeSelector.connect(
             'currentNodeChanged(vtkMRMLNode*)',
-            lambda node: (self._recorder.record_volume_changed(node.GetName() if node else None)
-                          if self._recorder.is_active else None),
+            self._onRecordedVolumeChanged,
         )
         ui.segmentationNodeSelector.connect(
             'currentNodeChanged(vtkMRMLNode*)',
@@ -250,29 +329,38 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def _onParameterNodeModified(self, *_):
         if not self._parameterNode:
             return
-        vol = self._parameterNode.GetNodeReference(_INPUT_VOLUME)
-        seg = self._parameterNode.GetNodeReference(_SEGMENTATION)
-        self.ui.sourceVolumeSelector.setCurrentNode(vol)
-        self.ui.segmentationNodeSelector.setCurrentNode(seg)
-        if seg:
-            self.ui.segmentSelector.setCurrentNode(seg)
-        self.ui.addSegmentButton.setEnabled(vol is not None)
-        self._syncWLFromVolume(vol)
-        self.ui.showCurrentSegmentCheckBox.blockSignals(True)
-        self.ui.showCurrentSegmentCheckBox.setChecked(True)
-        self.ui.showCurrentSegmentCheckBox.blockSignals(False)
-        self.ui.showSegmentsCheckBox.blockSignals(True)
-        self.ui.showSegmentsCheckBox.setChecked(self._savedSegmentsVisible)
-        self.ui.showSegmentsCheckBox.blockSignals(False)
-        segID = self.ui.segmentSelector.currentSegmentID() if seg else None
-        self.logic.set_saved_segments_visibility(seg, segID, self._savedSegmentsVisible)
-        if seg and segID:
-            pos_node, neg_node = self.logic.get_segment_prompt_nodes(seg, segID)
-        else:
-            pos_node, neg_node = None, None
-        self._set_prompt_nodes(pos_node, neg_node)
+        if getattr(self, '_syncing_parameter_node_to_ui', False):
+            return
+        self._syncing_parameter_node_to_ui = True
+        try:
+            vol = self._parameterNode.GetNodeReference(_INPUT_VOLUME)
+            seg = self._parameterNode.GetNodeReference(_SEGMENTATION)
+            self.ui.sourceVolumeSelector.setCurrentNode(vol)
+            self.ui.segmentationNodeSelector.setCurrentNode(seg)
+            if seg:
+                self.ui.segmentSelector.setCurrentNode(seg)
+            self.ui.addSegmentButton.setEnabled(vol is not None)
+            self._syncWLFromVolume(vol)
+            self.ui.showCurrentSegmentCheckBox.blockSignals(True)
+            self.ui.showCurrentSegmentCheckBox.setChecked(True)
+            self.ui.showCurrentSegmentCheckBox.blockSignals(False)
+            self.ui.showSegmentsCheckBox.blockSignals(True)
+            self.ui.showSegmentsCheckBox.setChecked(self._savedSegmentsVisible)
+            self.ui.showSegmentsCheckBox.blockSignals(False)
+            segID = self.ui.segmentSelector.currentSegmentID() if seg else None
+            self.logic.set_saved_segments_visibility(
+                seg, segID, self._savedSegmentsVisible)
+            if seg and segID:
+                pos_node, neg_node = self.logic.create_segment_prompt_nodes(seg, segID)
+            else:
+                pos_node, neg_node = None, None
+            self._set_prompt_nodes(pos_node, neg_node)
+        finally:
+            self._syncing_parameter_node_to_ui = False
 
     def _onNodeSelectorChanged(self, *_):
+        if getattr(self, '_syncing_parameter_node_to_ui', False):
+            return
         if not self._parameterNode:
             return
         vol = self.ui.sourceVolumeSelector.currentNode()
@@ -291,13 +379,13 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._rewire_segmentation_observer(seg)
 
     # ------------------------------------------------------------------ #
-    # Segment-rename sync                                                  #
+    # Segment lifecycle sync                                               #
     # ------------------------------------------------------------------ #
 
     def _rewire_segmentation_observer(self, seg):
-        """Keep exactly one SegmentModified observer on the active segmentation.
+        """Keep exactly one lifecycle observer set on the active segmentation.
 
-        The event lives on vtkSegmentation (the inner object), not on
+        Segment events live on vtkSegmentation (the inner object), not on the
         vtkMRMLSegmentationNode, so we observe GetSegmentation() directly.
         """
         new_obj = seg.GetSegmentation() if seg is not None else None
@@ -305,19 +393,88 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if old_obj is new_obj:
             return
         if old_obj is not None:
-            self.removeObserver(old_obj, old_obj.SegmentModified,
-                                self._onSegmentModified)
+            for event, callback in (
+                (old_obj.SegmentAdded, self._onSegmentAdded),
+                (old_obj.SegmentRemoved, self._onSegmentRemoved),
+                (old_obj.SegmentModified, self._onSegmentModified),
+            ):
+                self.removeObserver(old_obj, event, callback)
         self._observed_segmentation = seg
         self._observed_seg_obj      = new_obj
+        self._observed_segment_ids  = self._segment_ids(seg)
+        self._observed_segment_names = self._segment_names(seg)
         if new_obj is not None:
+            self.addObserver(new_obj, new_obj.SegmentAdded,
+                             self._onSegmentAdded)
+            self.addObserver(new_obj, new_obj.SegmentRemoved,
+                             self._onSegmentRemoved)
             self.addObserver(new_obj, new_obj.SegmentModified,
                              self._onSegmentModified)
+
+    @staticmethod
+    def _segment_ids(seg):
+        if seg is None:
+            return set()
+        segmentation = seg.GetSegmentation()
+        return {
+            segmentation.GetNthSegmentID(i)
+            for i in range(segmentation.GetNumberOfSegments())
+        }
+
+    @staticmethod
+    def _segment_names(seg):
+        if seg is None:
+            return {}
+        segmentation = seg.GetSegmentation()
+        names = {}
+        for i in range(segmentation.GetNumberOfSegments()):
+            sid = segmentation.GetNthSegmentID(i)
+            seg_obj = segmentation.GetSegment(sid)
+            names[sid] = seg_obj.GetName() if seg_obj else sid
+        return names
+
+    def _onSegmentAdded(self, caller, event, callData=None):
+        if self._observed_segmentation is None:
+            return
+        current_ids = self._segment_ids(self._observed_segmentation)
+        added = set()
+        if callData is not None:
+            added.add(str(callData))
+        added.update(current_ids - self._observed_segment_ids)
+        self._observed_segment_ids = current_ids
+        self._observed_segment_names = self._segment_names(self._observed_segmentation)
+        for seg_id in sorted(sid for sid in added if sid in current_ids):
+            self.logic.create_segment_prompt_nodes(self._observed_segmentation, seg_id)
+
+    def _onSegmentRemoved(self, caller, event, callData=None):
+        removed = set()
+        if callData is not None:
+            removed.add(str(callData))
+        if self._observed_segmentation is not None:
+            current_ids = self._segment_ids(self._observed_segmentation)
+            removed.update(self._observed_segment_ids - current_ids)
+            self._observed_segment_ids = current_ids
+            current_names = self._segment_names(self._observed_segmentation)
+        else:
+            current_names = {}
+        for seg_id in sorted(removed):
+            seg_name = self._observed_segment_names.get(seg_id, seg_id)
+            self._record_segment_removed_by_name(seg_id, seg_name)
+        self._observed_segment_names = current_names
 
     def _onSegmentModified(self, caller, event, callData=None):
         """Rename markup nodes when their owning segment is renamed."""
         seg_id = str(callData) if callData is not None else None
         if not seg_id or self._observed_segmentation is None:
             return
+        current_name = self._segment_name(self._observed_segmentation, seg_id)
+        old_name = self._observed_segment_names.get(seg_id)
+        if old_name == current_name:
+            return
+        self._observed_segment_names[seg_id] = current_name
+        if getattr(self._recorder, 'is_active', False):
+            self._recorder.record_segment_renamed(
+                seg_id, old_name or seg_id, current_name or seg_id)
         self.logic.sync_prompt_node_names(self._observed_segmentation, seg_id)
 
     # ------------------------------------------------------------------ #
@@ -327,13 +484,26 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def onRecord(self, *_):
         if self._recorder.is_active:
             return
+        place_states = self._prompt_place_states()
         vol = self._parameterNode.GetNodeReference(_INPUT_VOLUME) if self._parameterNode else None
         seg = self._parameterNode.GetNodeReference(_SEGMENTATION) if self._parameterNode else None
         self._recorder.start(
             volume_node       = vol,
             segmentation_name = seg.GetName() if seg else None,
+            record_non_annotative_movement = (
+                self.ui.recordNonAnnotativeMovementCheckBox.isChecked()
+                if hasattr(self.ui, 'recordNonAnnotativeMovementCheckBox')
+                else False
+            ),
         )
         self._update_record_ui()
+        self._set_prompt_place_states(place_states)
+
+    def _onRecordedVolumeChanged(self, node):
+        if not self._recorder.is_active:
+            return
+        self._recorder.set_volume_node(node)
+        self._recorder.record_volume_changed(node.GetName() if node else None)
 
     def onStopRecord(self, *_):
         if not self._recorder.is_active:
@@ -356,73 +526,38 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         except Exception as exc:
             slicer.util.errorDisplay(f'Failed to save recording:\n{exc}')
 
-    def onLoadRecord(self, *_):
-        from core._mouse_recorder import MouseEventRecorder
-        path = qt.QFileDialog.getOpenFileName(None, 'Load Recording', '', 'JSON files (*.json)')
-        if not path:
-            return
-        try:
-            self._loaded_record = MouseEventRecorder.load_from_file(path)
-            slicer.util.infoDisplay(f'Loaded {len(self._loaded_record)} events from:\n{path}')
-        except Exception as exc:
-            slicer.util.errorDisplay(f'Failed to load recording:\n{exc}')
-        self._update_record_ui()
-
-    def onReplayRecord(self, *_):
-        if self._loaded_record is None:
-            slicer.util.warningDisplay('No recording loaded. Use Load first.')
-            return
-        from core._replay import ReplayEngine
-        if self._replay_engine is not None and self._replay_engine.is_running:
-            self._replay_engine.stop()
-        self._replay_engine = ReplayEngine()
-        self._replay_engine.start(self._loaded_record, self, on_done=self._on_replay_done)
-
-    def _on_replay_done(self):
-        self._update_record_ui()
-        slicer.util.infoDisplay('Replay complete.')
-
     def _update_record_ui(self):
         ui        = self.ui
         is_active = self._recorder.is_active
         has_events = len(self._recorder) > 0
 
-        replay_ok     = False
-        replay_reason = ''
-        if self._loaded_record is not None and not is_active:
-            vol = (self._parameterNode.GetNodeReference(_INPUT_VOLUME)
-                   if self._parameterNode else None)
-            replay_ok, replay_reason = self._loaded_record.matches_volume(vol)
-
         ui.recordButton.setVisible(not is_active)
         ui.stopRecordButton.setVisible(is_active)
         ui.exportRecordButton.setEnabled(is_active or has_events)
-        ui.replayRecordButton.setEnabled(replay_ok)
 
         if is_active:
             status = f'Recording... ({len(self._recorder)} events)'
-        elif self._loaded_record is not None:
-            n = len(self._loaded_record)
-            status = (f'Loaded: {n} events — ready to replay' if replay_ok
-                      else f'Loaded: {n} events — {replay_reason}')
         elif has_events:
             status = f'Recorded: {len(self._recorder)} events'
         else:
             status = ''
         ui.recordStatusLabel.setText(status)
 
-    def _recorder_context(self) -> dict:
+    def _recorder_context(self, view_name=None) -> dict:
         seg_id = self.ui.segmentSelector.currentSegmentID()
         if self.ui.brushToolButton.isChecked():
             tool = 'brush'
         elif self.ui.eraseToolButton.isChecked():
             tool = 'erase'
+        elif isinstance(self._active_handler, PointHandler):
+            tool = 'point'
         else:
             tool = None
-        # Resolve active slice so replay can re-paint strokes on the right slice.
+        # Resolve active slice so exported records have the active view context.
         pn = self._parameterNode
         vol = pn.GetNodeReference(_INPUT_VOLUME) if pn else None
-        axis, slice_idx = self.logic.active_slice_info(self.currentViewName, vol)
+        active_view = view_name or self.currentViewName
+        axis, slice_idx = self.logic.active_slice_info(active_view, vol)
         if tool in ('brush', 'erase'):
             editor = self.logic.get_segment_editor()
             pn_ed  = editor.mrmlSegmentEditorNode() if editor else None
@@ -436,11 +571,269 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         return {
             'segment_id':      seg_id,
             'tool':            tool,
-            'view_name':       self.currentViewName,
+            'view_name':       active_view,
             'axis':            axis,
             'slice_idx':       slice_idx,
             'brush_radius_mm': brush_radius_mm,
         }
+
+    def _observe_prompt_node_for_recording(self, node, is_negative):
+        if node is None:
+            return
+        key = (node.GetID(), bool(is_negative))
+        if key in self._recorded_prompt_node_ids:
+            return
+        try:
+            defined_event = slicer.vtkMRMLMarkupsNode.PointPositionDefinedEvent
+        except Exception:
+            return
+        self.addObserver(
+            node, defined_event,
+            lambda caller, event_id, callData=None, neg=bool(is_negative):
+                self._onPromptPointDefinedForRecording(caller, neg),
+        )
+        for event_name, phase in (
+            ('PointStartInteractionEvent', 'start'),
+            ('PointModifiedEvent', 'move'),
+            ('PointEndInteractionEvent', 'end'),
+        ):
+            event = getattr(slicer.vtkMRMLMarkupsNode, event_name, None)
+            if event is None:
+                continue
+            self.addObserver(
+                node, event,
+                lambda caller, event_id, callData=None, neg=bool(is_negative),
+                       ph=phase: self._onPromptPointDragForRecording(
+                           caller, neg, ph, callData),
+            )
+        removed_event = getattr(slicer.vtkMRMLMarkupsNode, 'PointRemovedEvent', None)
+        if removed_event is not None:
+            self.addObserver(
+                node, removed_event,
+                lambda caller, event_id, callData=None, neg=bool(is_negative):
+                    self._onPromptPointRemovedForRecording(caller, neg, callData),
+            )
+        self._recorded_prompt_node_ids.add(key)
+
+    def _onPromptPointDefinedForRecording(self, node, is_negative):
+        if not self._recorder.is_active:
+            return
+        seg_id = self._segment_id_for_prompt_node(node)
+        if not seg_id:
+            seg_id = self.ui.segmentSelector.currentSegmentID()
+        idx = self._last_defined_control_point_index(node)
+        if idx < 0:
+            return
+        ras = [0.0, 0.0, 0.0]
+        try:
+            node.GetNthControlPointPositionWorld(idx, ras)
+        except Exception:
+            node.GetNthControlPointPosition(idx, ras)
+        point_id = self._control_point_id(node, idx)
+        point_name = self._control_point_name(node, idx)
+        self._cache_recorded_prompt_point(
+            node, is_negative, idx, seg_id, ras, point_id, point_name)
+        self._recorder.record_point_placed(
+            seg_id, list(ras), bool(is_negative), view_name=self.currentViewName,
+            point_index=idx, point_id=point_id, point_name=point_name,
+            point_action='place')
+        key = (node.GetID(), bool(is_negative), idx)
+        if not hasattr(self, '_pending_point_confirmations'):
+            self._pending_point_confirmations = {}
+        self._pending_point_confirmations[key] = {
+            'segment_id': seg_id,
+            'ras': list(ras),
+            'is_negative': bool(is_negative),
+            'point_index': idx,
+            'point_id': point_id,
+            'point_name': point_name,
+            'view_name': self.currentViewName,
+            'confirmed': True,
+        }
+
+    def _onPromptPointDragForRecording(self, node, is_negative, phase, callData=None):
+        if not self._recorder.is_active:
+            return
+        if not self._recorder.should_sample_point_drag(phase):
+            return
+        idx = self._control_point_index_from_call_data(node, callData)
+        key = (node.GetID(), bool(is_negative))
+        if phase == 'start':
+            if idx < 0 or not self._is_control_point_defined(node, idx):
+                return
+            pending_key = (node.GetID(), bool(is_negative), idx)
+            if pending_key in getattr(self, '_pending_point_confirmations', {}):
+                # A just-created point is confirmed on release only. Minor
+                # press/release drift before that is placement motion, not a
+                # relocation of an existing point.
+                return
+            self._active_point_drags[key] = idx
+        else:
+            if key not in self._active_point_drags:
+                if phase == 'end':
+                    self._confirm_pending_point(node, is_negative, idx)
+                return
+            idx = self._active_point_drags[key]
+        if idx >= node.GetNumberOfControlPoints():
+            return
+        if not self._is_control_point_defined(node, idx):
+            return
+        seg_id = self._segment_id_for_prompt_node(node)
+        if not seg_id:
+            seg_id = self.ui.segmentSelector.currentSegmentID()
+        ras = [0.0, 0.0, 0.0]
+        try:
+            node.GetNthControlPointPositionWorld(idx, ras)
+        except Exception:
+            node.GetNthControlPointPosition(idx, ras)
+        point_id = self._control_point_id(node, idx)
+        point_name = self._control_point_name(node, idx)
+        self._cache_recorded_prompt_point(
+            node, is_negative, idx, seg_id, ras, point_id, point_name)
+        self._recorder.record_point_drag(
+            phase, seg_id, ras, is_negative, view_name=self.currentViewName,
+            point_index=idx, point_id=point_id, point_name=point_name)
+        if phase == 'end':
+            self._active_point_drags.pop(key, None)
+
+    def _confirm_pending_point(self, node, is_negative, idx):
+        if not hasattr(self, '_pending_point_confirmations'):
+            self._pending_point_confirmations = {}
+        if idx < 0:
+            idx = self._last_defined_control_point_index(node)
+        pending = self._pending_point_confirmations.pop(
+            (node.GetID(), bool(is_negative), idx), None)
+        if not pending:
+            return
+        if idx >= node.GetNumberOfControlPoints():
+            return
+        if not self._is_control_point_defined(node, idx):
+            return
+        ras = [0.0, 0.0, 0.0]
+        try:
+            node.GetNthControlPointPositionWorld(idx, ras)
+        except Exception:
+            node.GetNthControlPointPosition(idx, ras)
+        pending['ras'] = list(ras)
+        pending['point_id'] = self._control_point_id(node, idx)
+        pending['point_name'] = self._control_point_name(node, idx)
+        self._cache_recorded_prompt_point(
+            node, is_negative, idx, pending['segment_id'], ras,
+            pending['point_id'], pending['point_name'])
+        if pending.get('confirmed'):
+            return
+        self._recorder.record_point_placed(
+            pending['segment_id'], pending['ras'], pending['is_negative'],
+            view_name=pending['view_name'], point_index=pending['point_index'],
+            point_id=pending['point_id'], point_name=pending['point_name'],
+            point_action='place')
+
+    def _onPromptPointRemovedForRecording(self, node, is_negative, callData=None):
+        if not self._recorder.is_active:
+            return
+        idx = self._control_point_index_from_call_data(node, callData)
+        if idx < 0:
+            try:
+                idx = int(str(callData))
+            except Exception:
+                idx = -1
+        cache_key = (node.GetID(), bool(is_negative), idx)
+        cached = getattr(self, '_recorded_prompt_point_cache', {}).pop(cache_key, None)
+        if not cached:
+            return
+        self._pending_point_confirmations.pop(cache_key, None)
+        drag_key = (node.GetID(), bool(is_negative))
+        if self._active_point_drags.get(drag_key) == idx:
+            self._active_point_drags.pop(drag_key, None)
+        self._recorder.record_point_removed(
+            cached['segment_id'], cached.get('ras'), bool(is_negative),
+            view_name=self.currentViewName, point_index=idx,
+            point_id=cached.get('point_id'),
+            point_name=cached.get('point_name'))
+
+    def _cache_recorded_prompt_point(self, node, is_negative, idx, segment_id,
+                                     ras, point_id, point_name=None):
+        if not hasattr(self, '_recorded_prompt_point_cache'):
+            self._recorded_prompt_point_cache = {}
+        self._recorded_prompt_point_cache[(node.GetID(), bool(is_negative), idx)] = {
+            'segment_id': segment_id,
+            'ras': list(ras),
+            'point_id': point_id,
+            'point_name': point_name,
+        }
+
+    @staticmethod
+    def _control_point_index_from_call_data(node, callData=None):
+        try:
+            if callData is not None:
+                idx = int(str(callData))
+                if 0 <= idx < node.GetNumberOfControlPoints():
+                    return idx
+        except Exception:
+            pass
+        return SegmentHumanBodyWidget._last_defined_control_point_index(node)
+
+    @staticmethod
+    def _control_point_id(node, idx):
+        try:
+            return node.GetNthControlPointID(idx)
+        except Exception:
+            return str(idx)
+
+    @staticmethod
+    def _control_point_name(node, idx):
+        for method_name in (
+            'GetNthControlPointLabel',
+            'GetNthControlPointName',
+        ):
+            try:
+                value = getattr(node, method_name)(idx)
+                if value:
+                    return str(value)
+            except Exception:
+                pass
+        return SegmentHumanBodyWidget._control_point_id(node, idx)
+
+    @staticmethod
+    def _is_control_point_defined(node, idx):
+        try:
+            defined = slicer.vtkMRMLMarkupsNode.PositionDefined
+        except Exception:
+            defined = 2
+        try:
+            return node.GetNthControlPointPositionStatus(idx) == defined
+        except Exception:
+            return True
+
+    @staticmethod
+    def _last_defined_control_point_index(node):
+        try:
+            defined = slicer.vtkMRMLMarkupsNode.PositionDefined
+        except Exception:
+            defined = 2
+        for idx in range(node.GetNumberOfControlPoints() - 1, -1, -1):
+            try:
+                if node.GetNthControlPointPositionStatus(idx) == defined:
+                    return idx
+            except Exception:
+                return idx
+        return -1
+
+    def _segment_id_for_prompt_node(self, node):
+        seg = self.ui.segmentationNodeSelector.currentNode()
+        if not seg or not node:
+            return ''
+        node_id = node.GetID()
+        segmentation = seg.GetSegmentation()
+        for i in range(segmentation.GetNumberOfSegments()):
+            sid = segmentation.GetNthSegmentID(i)
+            seg_obj = segmentation.GetSegment(sid)
+            for tag in (_POS_TAG, _NEG_TAG):
+                value = vtk.reference('')
+                seg_obj.GetTag(tag, value)
+                if str(value) == node_id:
+                    return sid
+        return ''
 
     # ------------------------------------------------------------------ #
     # Segment Editor effects                                               #
@@ -485,6 +878,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if not seg:
             slicer.util.warningDisplay('Please select a volume first.')
             return
+        self._rewire_segmentation_observer(seg)
         # Cache the active handler before creation, detach cleanly, then restore.
         # Suppress place-mode signals during creation so setCurrentNode calls inside
         # _set_prompt_nodes don't spuriously re-activate the wrong widget.
@@ -513,8 +907,26 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if not seg or not segID:
             slicer.util.warningDisplay('No segment selected.')
             return
+        next_id = self._segment_id_before(seg, segID)
+        self._record_action('remove_segment')
         self.logic.delete_segment_prompt_nodes(seg, segID)
         self.logic.remove_segment(seg, segID)
+        if next_id:
+            self.ui.segmentSelector.setCurrentSegmentID(next_id)
+
+    @staticmethod
+    def _segment_id_before(seg_node, segment_id):
+        segmentation = seg_node.GetSegmentation()
+        ids = [
+            segmentation.GetNthSegmentID(i)
+            for i in range(segmentation.GetNumberOfSegments())
+        ]
+        if segment_id not in ids:
+            return ''
+        idx = ids.index(segment_id)
+        if idx > 0:
+            return ids[idx - 1]
+        return ids[1] if len(ids) > 1 else ''
 
     def _onSegmentIDChanged(self, segmentID):
         seg = self.ui.segmentationNodeSelector.currentNode()
@@ -522,7 +934,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             # No segment selected — clear the prompt widgets.
             self._set_prompt_nodes(None, None)
             return
-        pos_node, neg_node = self.logic.get_segment_prompt_nodes(seg, segmentID)
+        pos_node, neg_node = self.logic.create_segment_prompt_nodes(seg, segmentID)
         self._set_prompt_nodes(pos_node, neg_node)
 
         editor = self.logic.get_segment_editor()
@@ -557,6 +969,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if self._suppressing_place_mode:
             return
         if active:
+            self._deactivateEffect()
             self._active_prompt_widget = src_widget
             PointHandler().attach(self)
         elif isinstance(self._active_handler, PointHandler):
@@ -614,11 +1027,13 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     # ------------------------------------------------------------------ #
 
     def _onUndo(self):
+        self._record_action('onUndo')
         editor = self.logic.get_segment_editor()
         if editor:
             editor.undo()
 
     def _onRedo(self):
+        self._record_action('onRedo')
         editor = self.logic.get_segment_editor()
         if editor:
             editor.redo()
@@ -668,6 +1083,36 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.logic.apply_window_level(vol,
                                       self.ui.windowSpinBox.value,
                                       self.ui.levelSpinBox.value)
+
+    # ------------------------------------------------------------------ #
+    # Recording helpers                                                    #
+    # ------------------------------------------------------------------ #
+
+    def _record_action(self, name: str):
+        if self._recorder.is_active:
+            self._recorder.record_action(name)
+
+    @staticmethod
+    def _segment_name(seg_node, segment_id):
+        try:
+            seg_obj = seg_node.GetSegmentation().GetSegment(segment_id)
+            return seg_obj.GetName() if seg_obj else str(segment_id)
+        except Exception:
+            return str(segment_id)
+
+    def _record_segment_created(self, seg_node, segment_id):
+        if self._recorder.is_active and segment_id:
+            self._recorder.record_segment_created(
+                segment_id, self._segment_name(seg_node, segment_id))
+
+    def _record_segment_removed(self, seg_node, segment_id):
+        if self._recorder.is_active and segment_id:
+            self._recorder.record_segment_removed(
+                segment_id, self._segment_name(seg_node, segment_id))
+
+    def _record_segment_removed_by_name(self, segment_id, seg_name):
+        if self._recorder.is_active and segment_id:
+            self._recorder.record_segment_removed(segment_id, seg_name or segment_id)
 
     # ------------------------------------------------------------------ #
     # Segment visibility                                                   #

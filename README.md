@@ -5,6 +5,39 @@
 
 SegmentHumanBody aims to asist its users in segmenting medical data on <a href="https://github.com/Slicer/Slicer">3D Slicer</a> by integrating the <a href="https://github.com/mazurowski-lab/SegmentAnyBone">SegmentAnyBone</a>, and <a href="https://github.com/mazurowski-lab/SLM-SAM2">SLM-SAM2</a> developed by Mazurowski Lab.
 
+## Current Development Branch
+
+The active development branch (`feature/native-editor-wrapper`) keeps the
+existing Slicer module UI but delegates interactive editing to Slicer's native
+Segment Editor tools. Brush and erase use Slicer's Paint/Erase effects, prompt
+points use native markups nodes, and undo/redo use Slicer's native undo stack.
+
+The current focus is a mouse-centered annotation-process recorder:
+
+- records only Red/Green/Yellow slice-view mouse events inside the active volume;
+- resolves raw movement into in-volume RAS samples before timer sampling or annotation policy filtering;
+- assigns exported process events compact `id` values starting at 1; metadata is not an event;
+- exports a compact `{type, metadata, events}` process log;
+- uses RAS as the canonical coordinate; 3D IJK can be derived later from event RAS plus recorded volume metadata;
+- samples in-volume movement at 30 records/sec;
+- listens to both Qt slice-view events and high-priority, non-consuming VTK slice interactor events so native Segment Editor brush/erase input is captured before Paint/Erase can consume it;
+- records mouse status (`move`, `press`, `release`, `view`);
+- records active handler/tool plus only the parameters needed for reconstruction, such as brush radius;
+- differentiates `annotation_move` from `non_annotation_move`, with matching `annotation_trajectory` or `visualization_trajectory` roles;
+- caches initial Red/Green/Yellow slice views at recording start and stores later visual snapshots only for explicit view-change events, without repeated slice-view dimensions;
+- updates the recording event count as records arrive;
+- records new point placement as one semantic `point_placed` verdict with point ID/name while keeping raw point listener boundaries recordable;
+- treats press-release drift during new point placement as `non_annotation_move` trajectory;
+- keeps segment switches out of the event stream, relying on the segment ID carried by boundary, trajectory, and semantic events;
+- infers a brush/erase `press` boundary if Slicer drops the initial press but a drag sample or release is observed;
+- records brush/erase press, release, held-button movement, and released-button hover as listener events inside the active volume;
+- records segment removal and segment rename, but not segment creation;
+- records existing-point relocation as `point_drag_start` grab, sampled `non_annotation_move` trajectory, and final `point_placed` replace;
+- records control-point deletion as `point_removed` with the last cached point location;
+
+The model-family framework is still present. A placeholder `Default` family with
+an `Identity` variant is available as a template for future model integrations.
+
 ## License
 
 The repository is licensed under the [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/)

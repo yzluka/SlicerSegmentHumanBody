@@ -132,6 +132,42 @@ class SegmentHumanBodyLogicTest(unittest.TestCase):
         self.assertEqual(id(self._logic._tracker), tracker_id,
                          "Tracker must be reused across calls for the same segment")
 
+    def test_remove_segment_selects_immediate_previous_segment(self):
+        from SegmentHumanBody import SegmentHumanBodyWidget
+
+        volumeNode = _make_volume()
+        segNode, _ = _make_seg(volumeNode)
+        segmentation = segNode.GetSegmentation()
+        segA = segmentation.AddEmptySegment('SegA')
+        segB = segmentation.AddEmptySegment('SegB')
+        segC = segmentation.AddEmptySegment('SegC')
+
+        self.assertEqual(
+            SegmentHumanBodyWidget._segment_id_before(segNode, segC), segB)
+        self.assertEqual(
+            SegmentHumanBodyWidget._segment_id_before(segNode, segB), segA)
+
+    def test_remove_first_segment_selects_next_segment(self):
+        from SegmentHumanBody import SegmentHumanBodyWidget
+
+        volumeNode = _make_volume()
+        segNode, _ = _make_seg(volumeNode)
+        segmentation = segNode.GetSegmentation()
+        segA = segmentation.AddEmptySegment('SegA')
+        segB = segmentation.AddEmptySegment('SegB')
+
+        self.assertEqual(
+            SegmentHumanBodyWidget._segment_id_before(segNode, segA), segB)
+
+    def test_remove_only_segment_selects_none(self):
+        from SegmentHumanBody import SegmentHumanBodyWidget
+
+        volumeNode = _make_volume()
+        segNode, segA = _make_seg(volumeNode, with_segment=True)
+
+        self.assertEqual(
+            SegmentHumanBodyWidget._segment_id_before(segNode, segA), '')
+
     # ---- expandSegWithSPX ----
 
     def test_expand_seg_with_spx_expands_matched_labels(self):
@@ -638,6 +674,133 @@ class MouseFilterTest(unittest.TestCase):
 # ===========================================================================
 # Segment creation handler lifecycle — simulated user behaviour sequences
 # ===========================================================================
+
+class HandlerWrapperLifecycleTest(unittest.TestCase):
+    """Regression tests for tool-handler mutual exclusion."""
+
+    def setUp(self):
+        import qt
+        if not hasattr(qt, 'QObject'):
+            raise unittest.SkipTest('requires a live Slicer Qt runtime')
+
+    class _FakePlaceWidget:
+        def __init__(self):
+            self.placeModeEnabled = False
+            self.place_multiple = None
+
+        def setPlaceModeEnabled(self, active):
+            self.placeModeEnabled = bool(active)
+
+        def setPlaceMultipleMarkups(self, value):
+            self.place_multiple = value
+
+    class _FakeMarkupWidget:
+        def __init__(self, place_widget, flip_on_set_current_node=False):
+            self.place_widget = place_widget
+            self.current_node = None
+            self.flip_on_set_current_node = flip_on_set_current_node
+
+        def findChildren(self, _klass):
+            return [self.place_widget]
+
+        def setCurrentNode(self, node):
+            self.current_node = node
+            if self.flip_on_set_current_node:
+                self.place_widget.setPlaceModeEnabled(True)
+
+    def _bind_prompt_helpers(self, widget):
+        import types
+        from SegmentHumanBody import SegmentHumanBodyWidget
+        for name in (
+            '_markup_place_widgets',
+            '_prompt_place_states',
+            '_set_prompt_place_states',
+            '_set_prompt_widget_place_mode',
+            '_deactivate_prompt_place_mode',
+            '_set_prompt_nodes_preserving_place_mode',
+            '_set_prompt_nodes',
+        ):
+            setattr(widget, name, types.MethodType(
+                getattr(SegmentHumanBodyWidget, name), widget))
+
+    def _make_prompt_widget_stub(self):
+        w = MagicMock()
+        w._suppressing_place_mode = False
+        w.ui = MagicMock()
+        w._pos_place = self._FakePlaceWidget()
+        w._neg_place = self._FakePlaceWidget()
+        w.ui.positivePrompts = self._FakeMarkupWidget(w._pos_place)
+        w.ui.negativePrompts = self._FakeMarkupWidget(w._neg_place)
+        self._bind_prompt_helpers(w)
+        return w
+
+    def _make_handler_widget_stub(self):
+        w = self._make_prompt_widget_stub()
+        vol = object()
+        seg = MagicMock()
+        seg.GetSegmentation.return_value.GetNumberOfSegments.return_value = 1
+        w.logic = MagicMock()
+        w.logic.getVolumeAndSegmentation.return_value = (vol, seg)
+        w.ui.sourceVolumeSelector.currentNode.return_value = vol
+        w.ui.segmentationNodeSelector.currentNode.return_value = seg
+        w.ui.segmentSelector.currentSegmentID.return_value = 'Segment_1'
+        w._parameterNode = MagicMock()
+        w._active_handler = None
+        w._active_prompt_widget = w.ui.positivePrompts
+        w._ensure_current_prompt_nodes = MagicMock()
+        return w
+
+    def test_set_prompt_nodes_preserves_inactive_place_mode(self):
+        from SegmentHumanBody import SegmentHumanBodyWidget
+
+        w = self._make_prompt_widget_stub()
+        w.ui.positivePrompts.flip_on_set_current_node = True
+        w.ui.negativePrompts.flip_on_set_current_node = True
+
+        SegmentHumanBodyWidget._set_prompt_nodes(w, object(), object())
+
+        self.assertFalse(w._pos_place.placeModeEnabled)
+        self.assertFalse(w._neg_place.placeModeEnabled)
+
+    def test_point_handler_attach_enables_wrapped_place_tool(self):
+        from core._input import PointHandler
+
+        w = self._make_handler_widget_stub()
+        PointHandler().attach(w)
+
+        self.assertIsInstance(w._active_handler, PointHandler)
+        self.assertTrue(w._pos_place.placeModeEnabled)
+
+    def test_point_handler_detach_disables_wrapped_place_tool(self):
+        from core._input import PointHandler
+
+        w = self._make_handler_widget_stub()
+        handler = PointHandler()
+        handler.attach(w)
+        handler.detach(w)
+
+        self.assertFalse(w._pos_place.placeModeEnabled)
+        self.assertFalse(w._neg_place.placeModeEnabled)
+        self.assertIsNone(w._active_handler)
+
+    def test_stroke_attach_detaches_point_handler_and_disables_point_tool(self):
+        from core._input import BrushHandler, PointHandler
+
+        w = self._make_handler_widget_stub()
+        PointHandler().attach(w)
+        self.assertTrue(w._pos_place.placeModeEnabled)
+
+        original_on_attach = BrushHandler._on_attach
+        try:
+            BrushHandler._on_attach = lambda self_h, widget: None
+            BrushHandler().attach(w)
+        finally:
+            BrushHandler._on_attach = original_on_attach
+
+        self.assertFalse(w._pos_place.placeModeEnabled)
+        self.assertFalse(w._neg_place.placeModeEnabled)
+        self.assertIsInstance(w._active_handler, BrushHandler)
+
 
 class AddSegmentHandlerTest(unittest.TestCase):
     """Slicer-native behaviour tests for handler lifecycle around segment creation.

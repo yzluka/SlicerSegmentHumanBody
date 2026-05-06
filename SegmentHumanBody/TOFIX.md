@@ -1,145 +1,105 @@
-# TOFIX.md — Restoration Roadmap (`feature/native-editor-wrapper`)
+# TOFIX.md - Native Editor Wrapper Roadmap
 
-This branch deliberately strips model-family logic and replaces the custom
-stroke tracker with Slicer's native Segment Editor.  The table below records
-everything that was omitted, partially broken, or intentionally deferred so
-that nothing is forgotten when functionality is restored.
+This branch keeps Slicer's native editor behavior and builds mouse-centered
+process recording around it.
 
-**Guiding rule for every fix**: prefer re-using or delegating to a 3D Slicer
-native tool over writing custom logic.  Only add custom code where Slicer has
-no equivalent.
+## Completed In This Branch
 
----
+- Segment lifecycle recording:
+  - `segment_removed` from active `vtkSegmentation.SegmentRemoved`
+  - `segment_renamed` from active `vtkSegmentation.SegmentModified`
+  - segment creation is not recorded as a standalone process event
 
-## Priority 1 — Broken / Silently Wrong
+- Prompt-node wiring that preserves markups placement state.
+- Handler wrapper mutual exclusion:
+  - Point detach disables point placement.
+  - Brush/erase detach disables wrapped Segment Editor effects.
+- Segment removal selection:
+  - Deleting a segment switches to the immediate previous segment when possible.
+- Default model family template:
+  - `Default` / `Identity`.
+- Mouse-centered recorder scope:
+  - Each record gets a sequential `event_id`.
+  - Exported top-level schema is `event_id`, `timestamp`, `ras`, `event`,
+    `payload`; `ijk` is derived during export and screen-space XY is not
+    exported.
+  - Records only slice-view events inside active volume.
+  - In-volume movement is sampled at 30 records/sec while skipping unchanged
+    samples.
+  - The recorder is listener-first: raw press/release/move inside volume views
+    should be recorded before downstream annotative/non-annotative policy.
+  - Slice input is captured with Qt event filters plus VTK interactor observers;
+    Qt raw `MouseMove` is suppressed when VTK move capture is available.
+  - Wheel/view movement recorded as `view_changed` visual trajectory data.
+  - Trajectory events are labeled by kind (`annotation_move`,
+    `non_annotation_move`, `view_change`) and role (annotation or visualization
+    trajectory).
+  - Initial slice visual state cached on one `metadata` event.
+  - Record count updated live as records are appended.
+  - Point placement recorded semantically as one `point_placed` release
+    boundary after interaction end/release.
+  - New-point press/release drift is `non_annotation_move` trajectory and does
+    not become point relocation.
+  - Existing-point relocation records grab/replace boundaries plus
+    `non_annotation_move` trajectory.
+  - Point-drag move throttling happens before node/RAS work.
+  - Point preview/pre-assignment hover movement is not recorded as point drag.
+  - Segment selection changes are not standalone events.
+  - Parameter-node-to-UI sync has a reentrancy guard to avoid selector feedback
+    loops.
+## Priority 1 - Validate In Full GUI
 
-### 1.1  Recording replay fails silently
-**Symptom**: `ReplayEngine._do_stroke` skips every stroke because
-`_seg_id_map` is always empty.  
-**Root cause**: `_recorder.record_segment_created(segment_id, ...)` is never
-called in this branch.  On the main branch it is called from `onAddSegment`.  
-**Fix**: Call `self._recorder.record_segment_created(segment_id, seg_name)`
-inside `_onAddSegment` (after Slicer creates the segment) and
-`self._recorder.record_segment_changed(old_id, new_id)` inside
-`_onSegmentIDChanged`.  Both methods already exist in `_mouse_recorder.py`.
+These behaviors need manual or full-GUI Slicer validation:
 
-### 1.2  Point confirmation does nothing
-**Symptom**: Placing a positive/negative prompt point has no effect on the
-segment mask — points are purely decorative.  
-**Root cause**: `_onPointConfirmed` and the VTK observer that calls it were
-removed when the model-family system was stripped.  
-**Fix options** (pick one or combine):  
-- Wire a `PointModifiedEvent` observer → call a new `Logic.apply_point()`
-  that uses Slicer's `SegmentEditorEffects` (Grow from seeds, Paint) rather
-  than the custom SPX path.  
-- Restore the SPX path from main branch as an optional family so the widget
-  stays model-agnostic.  
-**Note**: `PointLog` already records which segment each point belongs to and
-is ready to feed a confirmation handler.
+1. Start recording should not change the active Slicer tool.
+2. Brush -> Point should show and enable point placement.
+3. Point -> Brush/Erase should disable point placement.
+4. In-volume mouse trajectory should record at approximately 30 Hz.
+5. Raw press/release/move inside volume views should enter the listener event
+   stream before annotative/non-annotative policy.
+6. Brush/erase held-button movement and released-button hover should both be
+   listener-recordable inside volume views.
+8. Out-of-volume mouse movement should not record.
+9. Moving back into the active volume should resume recording.
+10. Point placement should create one `point_placed` boundary after release/end.
+11. Existing-point relocation should record grab/replace boundaries and sampled
+    `non_annotation_move` movement.
 
----
 
-## Priority 2 — Hidden UI That Had Working Functionality
+## Priority 2 - Recorder Coverage
 
-All items below are hidden via `_HIDDEN_WIDGETS` in `SegmentHumanBodyWidget`.
-The UI elements exist in `SegmentHumanBody.ui`; only the Python wiring is
-missing.
+The current recorder captures core mouse-centered process data. Remaining gaps:
 
-### 2.1  Export / Import Annotation Log
-**Widgets**: `exportAnnotationLogButton`, `importAnnotationLogButton`  
-**Status**: `PointLog.export()` exists.  No handler, no file dialog, no
-snapshot-before-export call.  
-**Fix**: Add `_onExportPointLog` (snapshot current segment first, then
-`point_log.export()` → JSON file) and `_onImportPointLog` (load JSON →
-`point_log.save()` per segment + call `restore_segment_points` for active
-segment).  Wire to the existing buttons and un-hide them.
+- Record point deletion semantic events if analysis needs them.
+- Record brush parameter changes when users adjust Segment Editor options.
+- Record only segmentation-changing hotkeys/actions; avoid general UI-macro
+  capture.
+- Add full-GUI tests for slice-view event filtering, point placement, and point
+  drag events.
 
-### 2.2  Slice-view selector
-**Widget**: `sliceViewDropdown`  
-**Status**: `Logic.active_slice_info(view_name, vol)` already resolves
-axis/slice from any view name.  Dropdown was wired to `currentViewName` on
-main branch.  
-**Fix**: Un-hide, populate with `['Red', 'Green', 'Yellow']`, connect
-`currentIndexChanged` → `self.currentViewName = ...`.
+## Priority 3 - Model Families
 
-### 2.3  Assign Label (2D / 3D)
-**Widgets**: `assignLabel2D`, `assignLabel3D`  
-**Status**: Fully functional on main branch via `logic.commit_point()` /
-`logic.expandSegWithSPX()`.  Removed with model-family system.  
-**Fix**: Restore when model families are re-enabled (see Priority 3).
+The active template is `Default` / `Identity`. The model-family UI is still
+hidden.
 
-### 2.4  Create Box Prompt
-**Widget**: `goToMarkupsButton`  
-**Status**: Navigated to the Markups module for ROI placement.  Trivial to
-restore.  
-**Fix**: Un-hide, connect `clicked` →
-`slicer.util.selectModule('Markups')`.
+Restore path:
 
-### 2.5  SAM mask selector
-**Widget**: `samMaskDropdown`  
-**Status**: Populated by `SAMFamily.confirm_model()` on main branch.  
-**Fix**: Restore with SAM family (see Priority 3).
+1. Keep `Default` / `Identity` as the baseline family.
+2. Restore model-family dropdown wiring.
+3. Restore model-variant dropdown wiring.
+4. Restore `confirmModelSelection`.
+5. Reintroduce SPX/SAM/Auto UI buttons through `VISIBLE_BUTTONS`.
+6. Keep native Segment Editor brush/erase behavior unchanged.
 
----
+## Priority 4 - Annotation Log Import/Export
 
-## Priority 3 — Model Family System (Deferred Until Model Weights Available)
+The old TimedMarker annotation-log system is not the same as the current
+mouse-centered process recorder.
 
-The entire `FAMILY_REGISTRY` in `core/modelFamilies.py` is intact on the
-main branch.  This branch hides the family UI but keeps the registry
-importable.
+Before restoring it, decide whether the product needs:
 
-| Widget (hidden) | Depends on |
-|---|---|
-| `modelFamilyDropdown` | `FAMILY_REGISTRY` |
-| `modelVariantDropdown` | active family `MODEL_MAP` |
-| `confirmModelSelection` | `family.confirm_model()` |
-| `paramTextEdit` | `family.PARAM_HINT` |
-| `docLinkLabel` | `family.DOC_URL` |
-| `expandSelectedLabelButton` | `SPXModelFamily.on_expand()` |
-| `showSPXBoundaryCheckBox` | `utils.spx_boundary_mask()` |
-| `runAutomaticSegmentation` | `AutoModelFamily` |
+- Annotation-result logs only.
+- Annotation-process logs only.
+- Both, with separate export formats.
 
-**Restore path**:
-1. Import `FAMILY_REGISTRY` and wire `modelFamilyDropdown`.
-2. Restore `updateUIVisibility()` from main branch — it reads
-   `family.VISIBLE_BUTTONS` and shows/hides widgets accordingly.
-3. Restore `confirmModelSelection` handler → `family.confirm_model()`.
-4. Restore `expandSelectedLabelButton` / E-hotkey → `logic.expandSegWithSPX()`.
-5. Restore `showSPXBoundaryCheckBox` / Q-hotkey → `utils.spx_boundary_mask()`.
-
----
-
-## Priority 4 — Minor Gaps and Polish
-
-### 4.1  Point log: position drags not captured in real time
-**Impact**: If the user drags a point and then calls `point_log.export()`
-without switching segments, the exported `ras` is the original placement
-position.  
-**Fix**: Call `logic.snapshot_segment_points(seg_id, pos_node, neg_node)`
-at the top of any export handler before `point_log.export()`.  No
-architectural change needed.
-
-### 4.2  `SetNthControlPointID` compatibility
-**Location**: `Logic.restore_segment_points()`  
-**Status**: Wrapped in `try/except AttributeError`.  If the API is absent,
-cp_ids renumber on each restore and `sync_removed` may miss stale entries.  
-**Fix**: Verify once in Slicer 5.10 console:
-```python
-n = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLMarkupsFiducialNode')
-idx = n.AddControlPoint([0,0,0])
-n.SetNthControlPointID(idx, 'test-id')
-print(n.GetNthControlPointID(idx))   # expect 'test-id'
-slicer.mrmlScene.RemoveNode(n)
-```
-If it fails, replace with the log-update approach (store new cp_id from
-`GetNthControlPointID(idx)` and call `point_log.save(segment_id,
-new_entries)`).
-
-### 4.3  Undo/redo scope
-**Current**: Ctrl+Z / Ctrl+Shift+Z delegate to Slicer's Segment Editor undo
-stack.  This is correct for brush/erase strokes.  
-**Gap**: Point placements (markup node additions) are not in the Segment
-Editor undo stack — Ctrl+Z after placing a point undoes the last brush
-stroke instead.  
-**Fix**: When point confirmation is restored (1.2), push a custom undo entry
-or use Slicer's `vtkMRMLMarkupsNode` undo support.
+Avoid mixing the two JSON formats unless a migration layer is explicitly added.
