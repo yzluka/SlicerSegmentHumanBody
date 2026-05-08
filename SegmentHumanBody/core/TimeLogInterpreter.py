@@ -11,7 +11,10 @@ Raw log format (SegmentHumanBody.raw_input):
     point_placed    — {event:"point_placed", timestamp, view, ijk, segment, point, ...}
     point_replaced  — {event:"point_replaced", ...}
     point_removed   — {event:"point_removed",  ...}
+    point_drag_start — {event:"point_drag_start", ijk, point, ...} origin captured for replace
     point_drag_move — trajectory; skipped in compact output
+    tool_selected   — {event:"tool_selected", tool, segment?} → tool_change (unless after segment_created)
+    segment_removed — {event:"segment_removed", segment, seg_name?} → segment_removed
     brush_parameters_changed — updates brush state
 
 Compact output (SegmentHumanBody.annotation_process):
@@ -22,12 +25,14 @@ Compact output (SegmentHumanBody.annotation_process):
     place:        {id, event:"place",   timestamp, ijk, view, segment, point, point_name, point_index, negative}
     replace:      {id, event:"replace", ...same as place...}
     remove:       {id, event:"remove",  ...same as place...}
-  Delta events:
-    slice_change: {id, event:"slice_change", timestamp, view, slice}
-    tool_change:  {id, event:"tool_change",  timestamp, tool, segment?}
-                  Sourced from explicit tool_selected raw events.
-    brush_change: {id, event:"brush_change", timestamp, view, tool, brush_mm?, sphere?}
-                  brush_mm and sphere present only when their respective value changed.
+  Delta / lifecycle events:
+    slice_change:    {id, event:"slice_change",    timestamp, view, slice}
+    tool_change:     {id, event:"tool_change",     timestamp, tool, segment?}
+                     Sourced from explicit tool_selected raw events. Suppressed when
+                     the tool_selected was auto-triggered by a new segment.
+    brush_change:    {id, event:"brush_change",    timestamp, view, tool, brush_mm?, sphere?}
+                     brush_mm and sphere present only when their respective value changed.
+    segment_removed: {id, event:"segment_removed", timestamp, segment, seg_name?}
 
   segment, tool, and brush_mm are written only on press (delta pattern).
   Idle/hover trajectory is omitted entirely.
@@ -66,7 +71,8 @@ class TimeLogInterpreter:
         companions = _find_point_companions(raws)
         events = []
         export_id = 1
-        last_slice = {}   # view -> int
+        last_slice = {}       # view -> int
+        point_positions = {}  # ('id', pt_id) | ('name', pt_name) -> last known ijk
 
         for i, raw in enumerate(raws):
             if i in companions:
@@ -92,14 +98,15 @@ class TimeLogInterpreter:
                 last_slice[view] = new_slice
 
             if evt == 'tool_selected':
-                tool = raw.get('tool')
-                ev = {'id': export_id, 'event': 'tool_change',
-                      'timestamp': raw.get('timestamp'), 'tool': tool}
-                segment = raw.get('segment')
-                if segment:
-                    ev['segment'] = segment
-                export_id += 1
-                events.append(ev)
+                if not _is_segment_creation_tool_select(raws, i):
+                    tool = raw.get('tool')
+                    ev = {'id': export_id, 'event': 'tool_change',
+                          'timestamp': raw.get('timestamp'), 'tool': tool}
+                    segment = raw.get('segment')
+                    if segment:
+                        ev['segment'] = segment
+                    export_id += 1
+                    events.append(ev)
 
             elif evt == 'mouse':
                 for ev in self._from_mouse(raw, last_slice):
@@ -116,12 +123,39 @@ class TimeLogInterpreter:
                     events.append(ev)
 
             elif evt in _POINT_BOUNDARY_EVENTS:
-                ev = self._from_point_event(raw, last_slice)
+                pt_id = raw.get('point')
+                pt_name = raw.get('point_name')
+                ijk_start = None
+                if evt == 'point_replaced':
+                    ijk_start = (point_positions.get(('id', pt_id))
+                                 or point_positions.get(('name', pt_name)))
+                ev = self._from_point_event(raw, last_slice, ijk_start=ijk_start)
                 if ev is not None:
                     ev['id'] = export_id
                     export_id += 1
                     events.append(ev)
-            # point_drag_move, segment_*, volume_changed, etc.: not in annotation-process log
+                    if ev.get('ijk') and evt in ('point_placed', 'point_replaced'):
+                        if pt_id:
+                            point_positions[('id', pt_id)] = ev['ijk']
+                        if pt_name:
+                            point_positions[('name', pt_name)] = ev['ijk']
+                    elif evt == 'point_removed':
+                        point_positions.pop(('id', pt_id), None)
+                        point_positions.pop(('name', pt_name), None)
+
+            elif evt == 'segment_removed':
+                ev = {'id': export_id, 'event': 'segment_removed',
+                      'timestamp': raw.get('timestamp')}
+                segment = raw.get('segment')
+                if segment:
+                    ev['segment'] = segment
+                seg_name = raw.get('seg_name')
+                if seg_name:
+                    ev['seg_name'] = seg_name
+                export_id += 1
+                events.append(ev)
+            # point_drag_move, point_drag_start, segment_created/selected/renamed,
+            # volume_changed, etc.: not in annotation-process log
 
         return {
             'type': EXPORT_TYPE,
@@ -190,21 +224,26 @@ class TimeLogInterpreter:
                 yield ev
             # Other states (idle single boundary): omitted.
 
-    def _from_point_event(self, raw, last_slice=None):
-        # Prefer pre-computed IJK on the raw event (added by export_raw_data via ras_to_ijk).
+    def _point_ijk(self, raw, last_slice=None):
+        """Derive IJK for a point event: prefer raw.ijk, fall back to mouse_boundary.xy."""
         ijk = raw.get('ijk')
+        if ijk is not None:
+            return ijk
+        view = raw.get('view')
+        mb = raw.get('mouse_boundary') or {}
+        xy = mb.get('xy')
+        if xy is None:
+            return None
+        slice_idx = raw.get('slice')
+        if slice_idx is None and last_slice and view:
+            slice_idx = last_slice.get(view)
+        return self._to_ijk(view, xy, slice_idx)
+
+    def _from_point_event(self, raw, last_slice=None, ijk_start=None):
+        ijk = self._point_ijk(raw, last_slice)
         view = raw.get('view')
         if ijk is None:
-            mb = raw.get('mouse_boundary') or {}
-            xy = mb.get('xy')
-            if xy is None:
-                return None
-            slice_idx = raw.get('slice')
-            if slice_idx is None and last_slice and view:
-                slice_idx = last_slice.get(view)
-            ijk = self._to_ijk(view, xy, slice_idx)
-            if ijk is None:
-                return None
+            return None
 
         event_type = _POINT_EVENT_MAP.get(raw.get('event'), raw.get('event'))
         ev = {'event': event_type, 'timestamp': raw.get('timestamp'), 'ijk': ijk}
@@ -214,6 +253,8 @@ class TimeLogInterpreter:
             val = raw.get(key)
             if val is not None:
                 ev[key] = val
+        if ijk_start is not None:
+            ev['ijk_start'] = ijk_start
         return ev
 
     def _to_ijk(self, view, xy, slice_idx=None):
@@ -255,8 +296,11 @@ def _find_point_companions(raws):
             while j >= 0:
                 r = raws[j]
                 re = r.get('event')
-                if re == 'point_drag_move' or (
-                        re == 'mouse' and isinstance(r.get('timestamps'), list)):
+                if re == 'point_drag_move':
+                    j -= 1
+                    continue
+                if re == 'mouse' and isinstance(r.get('timestamps'), list):
+                    companions.add(j)
                     j -= 1
                     continue
                 if re == 'mouse':
@@ -270,6 +314,23 @@ def _find_point_companions(raws):
                 j -= 1
 
     return companions
+
+
+def _is_segment_creation_tool_select(raws, i):
+    """True if the tool_selected at index i was auto-triggered by a new segment.
+
+    Looks backward past any segment_selected events; if the first earlier
+    meaningful event is segment_created, the tool_selected is automatic and
+    should not produce a tool_change in the compact log.
+    """
+    j = i - 1
+    while j >= 0:
+        prev_evt = raws[j].get('event')
+        if prev_evt == 'segment_selected':
+            j -= 1
+            continue
+        return prev_evt == 'segment_created'
+    return False
 
 
 # ── Matrix / coordinate helpers ───────────────────────────────────────────────
