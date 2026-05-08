@@ -676,7 +676,7 @@ def test_vtk_interactor_uses_dataprobe_device_xy(monkeypatch):
 
     assert calls[0][1] == [10, 20]
     assert calls[0][3]['xy_source'] == 'vtk_device'
-    assert calls[0][3]['xy_global'] == [1368, 2131]
+    assert 'xy_global' not in calls[0][3]
 
 
 def test_event_payload_exposes_handler_and_params():
@@ -697,44 +697,6 @@ def test_event_payload_exposes_handler_and_params():
         'slice_idx': 3,
     }
 
-
-def test_press_and_release_are_recorded_even_inside_move_sample_window(monkeypatch):
-    recorder = MouseEventRecorder(sample_rate_hz=12)
-    recorder._active = True
-    recorder._volume_node = object()
-    recorder.context_fn = lambda view_name=None: {
-        'tool': 'brush',
-        'axis': 0,
-        'slice_idx': 3,
-        'brush_radius_mm': 2.5,
-    }
-    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view, volume_node=None: {'view_name': view})
-
-    recorder._on_mouse(
-        'Red', (10, 20), MOVE,
-        {'mouse_status': 'move', 'analysis_event_type': 'trajectory_event'},
-    )
-    recorder._sample_pending_move()
-    recorder._on_mouse(
-        'Red', (11, 21), PRESS,
-        {'mouse_status': 'press', 'analysis_event_type': 'boundary_event'},
-    )
-    recorder._on_mouse(
-        'Red', (12, 22), RELEASE,
-        {'mouse_status': 'release', 'analysis_event_type': 'boundary_event'},
-    )
-
-    assert [r.event_type for r in recorder.records] == [MOVE, PRESS, RELEASE]
-    assert recorder.records[0].payload['analysis_event_type'] == 'trajectory_event'
-    assert recorder.records[0].ras is None
-    assert recorder.records[0].payload['xy'] == [10, 20]
-    assert 'trajectory_kind' not in recorder.records[0].payload
-    assert 'trajectory_role' not in recorder.records[0].payload
-    assert recorder.records[1].payload['mouse_status'] == 'press'
-    assert recorder.records[1].payload['analysis_event_type'] == 'boundary_event'
-    assert recorder.records[1].payload['handler'] == 'brush'
-    assert recorder.records[2].payload['mouse_status'] == 'release'
-    assert recorder.records[2].payload['analysis_event_type'] == 'boundary_event'
 
 
 def test_move_sampling_uses_latest_position_without_duplicates(monkeypatch):
@@ -1098,31 +1060,15 @@ def test_brush_drag_move_stays_raw_when_press_was_not_seen(monkeypatch):
     assert recorder.records[0].ras is None
 
 
-def test_brush_release_without_seen_press_stays_raw_release(monkeypatch):
+
+def test_view_changed_records_boundary_z_without_repeating_visual_state(monkeypatch):
     recorder = MouseEventRecorder(sample_rate_hz=12)
-    recorder._active = True
     recorder._volume_node = object()
     recorder.context_fn = lambda view_name=None: {
         'tool': 'brush',
-        'axis': 0,
-        'slice_idx': 3,
-        'brush_radius_mm': 2.5,
+        'view_name': view_name or 'Red',
+        'slice_idx': 42,
     }
-    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view, volume_node=None: {'view_name': view})
-
-    recorder._on_mouse(
-        'Red', (10, 20), RELEASE,
-        {'mouse_status': 'release', 'analysis_event_type': 'boundary_event'},
-    )
-
-    assert [r.event_type for r in recorder.records] == [RELEASE]
-    assert recorder.records[0].payload['mouse_status'] == 'release'
-    assert recorder.records[0].payload['handler'] == 'brush'
-
-
-def test_visualization_trajectory_role_for_view_events(monkeypatch):
-    recorder = MouseEventRecorder(sample_rate_hz=12)
-    recorder._volume_node = object()
     monkeypatch.setattr(recorder_mod, '_visual_state', lambda view, volume_node=None: {'view_name': view})
 
     recorder._on_mouse(
@@ -1134,8 +1080,23 @@ def test_visualization_trajectory_role_for_view_events(monkeypatch):
         },
     )
 
-    assert recorder.records[0].payload['visual_state'] == {'view_name': 'Red'}
+    assert 'visual_state' not in recorder.records[0].payload
+    assert recorder.records[0].payload['analysis_event_type'] == 'boundary_event'
+    assert recorder.records[0].payload['slice_idx'] == 42
     assert 'trajectory_role' not in recorder.records[0].payload
+
+    event = recorder.export_raw_data()['events'][0]
+    assert event['event'] == VIEW_CHANGED
+    assert event['event_type'] == 'boundary_event'
+    assert event['z'] == 42
+
+    recorder._append(MOVE, None, {
+        'view_name': 'Red',
+        'xy': [11, 21],
+        'mouse_button_state': 'released',
+    })
+    events = recorder.export_raw_data()['events']
+    assert events[1]['z'] == 42
 
 
 def test_point_drag_records_boundary_and_non_annotation_trajectory(monkeypatch):
@@ -1206,26 +1167,6 @@ def test_point_placement_is_single_release_boundary_event(monkeypatch):
     assert payload['trajectory_role'] is None
 
 
-def test_raw_point_press_release_are_recorded_as_listener_events(monkeypatch):
-    recorder = MouseEventRecorder(sample_rate_hz=12)
-    recorder._active = True
-    recorder._volume_node = object()
-    recorder.context_fn = lambda view_name=None: {'tool': 'point'}
-    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view, volume_node=None: {'view_name': view})
-
-    recorder._on_mouse(
-        'Red', (10, 20), PRESS,
-        {'mouse_status': 'press', 'analysis_event_type': 'boundary_event'},
-    )
-    recorder._on_mouse(
-        'Red', (10, 20), RELEASE,
-        {'mouse_status': 'release', 'analysis_event_type': 'boundary_event'},
-    )
-
-    assert [r.event_type for r in recorder.records] == [PRESS, RELEASE]
-    assert recorder.records[0].payload['handler'] == 'point'
-    assert recorder.records[1].payload['handler'] == 'point'
-
 
 def test_mouse_listener_records_xy_without_coordinate_conversion(monkeypatch):
     recorder = MouseEventRecorder(sample_rate_hz=12)
@@ -1263,22 +1204,6 @@ def test_point_drag_sampling_can_be_checked_before_node_work():
 # export_interpreted_data / export_raw_data
 # ---------------------------------------------------------------------------
 
-def test_interpreted_maps_annotation_move_to_brush_move():
-    recorder = MouseEventRecorder()
-    recorder._append(
-        MOVE, [1.0, 2.0, 3.0],
-        {'mouse_status': 'move', 'analysis_event_type': 'trajectory_event',
-         'trajectory_kind': 'annotation_move', 'handler': 'brush',
-         'segment_id': 'seg-1'},
-    )
-    events = recorder.export_interpreted_data()['events']
-    assert len(events) == 1
-    assert events[0]['event'] == 'brush_move'
-    assert 'pressed' not in events[0]
-    assert 'kind' not in events[0]
-    assert 'analysis' not in events[0]
-
-
 def test_interpreted_omits_non_annotation_move_from_cleaned_record():
     recorder = MouseEventRecorder()
     recorder._append(
@@ -1289,57 +1214,6 @@ def test_interpreted_omits_non_annotation_move_from_cleaned_record():
     )
     events = recorder.export_interpreted_data()['events']
     assert events == []
-
-
-def test_interpreted_infers_brush_move_from_raw_xy_and_cached_context():
-    identity = [1.0, 0.0, 0.0, 0.0,
-                0.0, 1.0, 0.0, 0.0,
-                0.0, 0.0, 1.0, 0.0,
-                0.0, 0.0, 0.0, 1.0]
-    recorder = MouseEventRecorder()
-    recorder._append(METADATA, None, {
-        'volume': {
-            'dimensions': [10, 10, 10],
-            'ras_to_ijk': identity,
-        },
-        'initial_visual_state': {
-            'Red': {'xy_to_ras': identity, 'xy_to_ijk': identity},
-        },
-        'initial_handler_context': {
-            'Red': {
-                'view_name': 'Red',
-                'handler': 'brush',
-                'tool': 'brush',
-                'segment_id': 'seg-a',
-                'brush_radius_mm': 2.5,
-                'slice_idx': 4,
-            },
-        },
-    })
-    recorder._append(
-        MOVE, None,
-        {
-            'view_name': 'Red',
-            'xy': [3, 4],
-            'mouse_status': 'move',
-            'left_button_down': True,
-            'mouse_button_state': 'pressed',
-            'analysis_event_type': 'trajectory_event',
-        },
-    )
-
-    events = recorder.export_interpreted_data()['events']
-
-    assert events == [{
-        'id': 1,
-        'timestamp': recorder.records[1].timestamp.isoformat(timespec='milliseconds'),
-        'event': 'brush_move',
-        'ijk': [3, 4, 0],
-        'view': 'Red',
-        'segment': 'seg-a',
-        'tool': 'brush',
-        'brush_mm': 2.5,
-    }]
 
 
 def test_interpreted_prefers_dataprobe_xy_to_ijk_over_xy_to_ras():
@@ -1387,118 +1261,7 @@ def test_interpreted_prefers_dataprobe_xy_to_ijk_over_xy_to_ras():
 
     events = recorder.export_interpreted_data()['events']
 
-    assert events[0]['ijk'] == [30, 40, 5]
-
-
-def test_interpreted_emits_brush_click_when_press_release_has_no_move():
-    identity = [1.0, 0.0, 0.0, 0.0,
-                0.0, 1.0, 0.0, 0.0,
-                0.0, 0.0, 1.0, 0.0,
-                0.0, 0.0, 0.0, 1.0]
-    recorder = MouseEventRecorder()
-    recorder._append(METADATA, None, {
-        'volume': {
-            'dimensions': [10, 10, 10],
-            'ras_to_ijk': identity,
-        },
-        'initial_visual_state': {
-            'Red': {'xy_to_ras': identity, 'xy_to_ijk': identity},
-        },
-    })
-    recorder._append(
-        PRESS, None,
-        {
-            'view_name': 'Red',
-            'xy': [3, 4],
-            'mouse_status': 'press',
-            'analysis_event_type': 'boundary_event',
-            'handler': 'brush',
-            'tool': 'brush',
-            'segment_id': 'seg-a',
-            'brush_radius_mm': 2.5,
-            'visual_state': {'xy_to_ras': identity, 'xy_to_ijk': identity},
-        },
-    )
-    recorder._append(
-        RELEASE, None,
-        {
-            'view_name': 'Red',
-            'xy': [3, 4],
-            'mouse_status': 'release',
-            'analysis_event_type': 'boundary_event',
-        },
-    )
-
-    events = recorder.export_interpreted_data()['events']
-
-    assert events == [{
-        'id': 1,
-        'timestamp': recorder.records[2].timestamp.isoformat(timespec='milliseconds'),
-        'event': 'brush_click',
-        'ijk': [3, 4, 0],
-        'view': 'Red',
-        'segment': 'seg-a',
-        'tool': 'brush',
-        'brush_mm': 2.5,
-    }]
-    assert [event['event'] for event in recorder.export_raw_data()['events']] == [
-        PRESS, RELEASE,
-    ]
-
-
-def test_interpreted_does_not_emit_brush_click_when_pressed_move_was_recorded():
-    identity = [1.0, 0.0, 0.0, 0.0,
-                0.0, 1.0, 0.0, 0.0,
-                0.0, 0.0, 1.0, 0.0,
-                0.0, 0.0, 0.0, 1.0]
-    recorder = MouseEventRecorder()
-    recorder._append(METADATA, None, {
-        'volume': {
-            'dimensions': [10, 10, 10],
-            'ras_to_ijk': identity,
-        },
-        'initial_visual_state': {
-            'Red': {'xy_to_ras': identity, 'xy_to_ijk': identity},
-        },
-    })
-    recorder._append(
-        PRESS, None,
-        {
-            'view_name': 'Red',
-            'xy': [3, 4],
-            'mouse_status': 'press',
-            'analysis_event_type': 'boundary_event',
-            'handler': 'brush',
-            'tool': 'brush',
-            'segment_id': 'seg-a',
-            'brush_radius_mm': 2.5,
-            'visual_state': {'xy_to_ras': identity, 'xy_to_ijk': identity},
-        },
-    )
-    recorder._append(
-        MOVE, None,
-        {
-            'view_name': 'Red',
-            'xy': [4, 4],
-            'mouse_status': 'move',
-            'left_button_down': True,
-            'mouse_button_state': 'pressed',
-            'analysis_event_type': 'trajectory_event',
-        },
-    )
-    recorder._append(
-        RELEASE, None,
-        {
-            'view_name': 'Red',
-            'xy': [4, 4],
-            'mouse_status': 'release',
-            'analysis_event_type': 'boundary_event',
-        },
-    )
-
-    events = recorder.export_interpreted_data()['events']
-
-    assert [event['event'] for event in events] == ['brush_move']
+    assert events[0]['ijk'] == [[30, 40, 5]]
 
 
 def test_interpreted_skips_raw_xy_outside_volume():
@@ -1573,32 +1336,7 @@ def test_interpreted_uses_strict_ijk_bounds_for_active_region():
 
     events = recorder.export_interpreted_data()['events']
 
-    assert [event['ijk'] for event in events] == [[1, 1, 0]]
-
-
-def test_interpreted_skips_point_placement_outside_ijk_bounds():
-    identity = [1.0, 0.0, 0.0, 0.0,
-                0.0, 1.0, 0.0, 0.0,
-                0.0, 0.0, 1.0, 0.0,
-                0.0, 0.0, 0.0, 1.0]
-    recorder = MouseEventRecorder()
-    recorder._append(METADATA, None, {
-        'volume': {
-            'dimensions': [5, 5, 5],
-            'ras_to_ijk': identity,
-        },
-    })
-    recorder.record_point_placed(
-        'seg-a', [-0.25, 1.0, 1.0], False,
-        point_index=0, point_id='cp-0', point_name='Pos-1')
-    recorder.record_point_placed(
-        'seg-a', [1.0, 1.0, 1.0], False,
-        point_index=1, point_id='cp-1', point_name='Pos-2')
-
-    events = recorder.export_interpreted_data()['events']
-
-    assert [event['point'] for event in events] == ['cp-1']
-    assert events[0]['ijk'] == [1, 1, 1]
+    assert events[0]['ijk'] == [[1, 1, 0]]
 
 
 def test_raw_export_filters_mouse_events_outside_ijk_bounds():
@@ -1641,92 +1379,6 @@ def test_raw_export_filters_mouse_events_outside_ijk_bounds():
     assert 'ijk' not in events[0]
 
 
-def test_brush_parameter_changes_are_coalesced_until_release(monkeypatch):
-    recorder = MouseEventRecorder(sample_rate_hz=12)
-    recorder._append(METADATA, None, {'volume': {'spacing': [2.0, 4.0, 8.0]}})
-    recorder._active = True
-    state = {'brush_radius_mm': 2.5}
-    recorder.context_fn = lambda view_name=None: {
-        'tool': 'brush',
-        'segment_id': 'seg-a',
-        'view_name': view_name or 'Red',
-        'axis': 0,
-        'slice_idx': 7,
-        'brush_radius_mm': state['brush_radius_mm'],
-    }
-    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view, volume_node=None: {'view_name': view})
-
-    recorder._on_mouse(
-        'Red', (10, 20), PRESS,
-        {'mouse_status': 'press', 'analysis_event_type': 'boundary_event'},
-    )
-    state['brush_radius_mm'] = 3.0
-    recorder.record_brush_diameter_changed(6.0)
-    state['brush_radius_mm'] = 4.0
-    recorder.record_brush_diameter_changed(8.0)
-    recorder._on_mouse(
-        'Red', (11, 21), RELEASE,
-        {'mouse_status': 'release', 'analysis_event_type': 'boundary_event'},
-    )
-
-    raw_events = recorder.export_raw_data()['events']
-    raw_params = [
-        event for event in raw_events
-        if event['event'] == BRUSH_PARAMETERS_CHANGED
-    ]
-    clean_params = [
-        event for event in recorder.export_interpreted_data()['events']
-        if event['event'] == 'brush_parameters'
-    ]
-
-    assert [r.event_type for r in recorder.records if r.event_type != METADATA] == [
-        PRESS, BRUSH_PARAMETERS_CHANGED, RELEASE,
-    ]
-    assert len(raw_params) == 1
-    assert raw_params[0]['diameter_mm'] == 8.0
-    assert raw_params[0]['tool'] == 'brush'
-    assert len(clean_params) == 1
-    assert clean_params[0]['diameter_ijk'] == [4.0, 2.0, 1.0]
-    assert 'diameter_mm' not in clean_params[0]
-
-
-def test_release_context_records_silent_final_brush_parameter_change(monkeypatch):
-    recorder = MouseEventRecorder(sample_rate_hz=12)
-    recorder._append(METADATA, None, {'volume': {'spacing': [2.0, 4.0, 8.0]}})
-    recorder._active = True
-    state = {'brush_radius_mm': 2.5}
-    recorder.context_fn = lambda view_name=None: {
-        'tool': 'erase',
-        'segment_id': 'seg-a',
-        'view_name': view_name or 'Red',
-        'axis': 0,
-        'slice_idx': 7,
-        'brush_radius_mm': state['brush_radius_mm'],
-    }
-    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view, volume_node=None: {'view_name': view})
-
-    recorder._on_mouse(
-        'Red', (10, 20), PRESS,
-        {'mouse_status': 'press', 'analysis_event_type': 'boundary_event'},
-    )
-    state['brush_radius_mm'] = 5.0
-    recorder._on_mouse(
-        'Red', (11, 21), RELEASE,
-        {'mouse_status': 'release', 'analysis_event_type': 'boundary_event'},
-    )
-
-    params = [
-        event for event in recorder.export_interpreted_data()['events']
-        if event['event'] == 'brush_parameters'
-    ]
-
-    assert [r.event_type for r in recorder.records if r.event_type != METADATA] == [
-        PRESS, BRUSH_PARAMETERS_CHANGED, RELEASE,
-    ]
-    assert params[0]['tool'] == 'erase'
-    assert params[0]['diameter_ijk'] == [5.0, 2.5, 1.25]
-
-
 def test_interpreted_suppresses_press_and_release():
     recorder = MouseEventRecorder()
     recorder._append(PRESS, [1.0, 2.0, 3.0],
@@ -1737,47 +1389,25 @@ def test_interpreted_suppresses_press_and_release():
     assert events == []
 
 
-def test_interpreted_maps_point_placed_to_point_placement():
-    recorder = MouseEventRecorder()
-    recorder.record_point_placed(
-        'seg-a', [1.0, 2.0, 3.0], False,
-        point_index=0, point_id='cp-0', point_name='Pos-1')
-    events = recorder.export_interpreted_data()['events']
-    assert len(events) == 1
-    ev = events[0]
-    assert ev['event'] == 'point_placement'
-    assert ev['point'] == 'cp-0'
-    assert ev['point_name'] == 'Pos-1'
-    assert 'ras_source' not in ev
-    assert 'mouse' not in ev
-
-
-def test_interpreted_maps_point_drag_end_to_point_move():
-    recorder = MouseEventRecorder()
-    recorder._active = True
-    recorder.record_point_drag(
-        'start', 'seg-a', [1.0, 2.0, 3.0], False,
-        point_index=0, point_id='cp-0', point_name='Pos-1')
-    recorder.record_point_drag(
-        'end', 'seg-a', [4.0, 5.0, 6.0], False,
-        point_index=0, point_id='cp-0', point_name='Pos-1')
-    events = recorder.export_interpreted_data()['events']
-    event_types = [e['event'] for e in events]
-    assert 'point_move' in event_types
-    assert 'point_drag_start' not in event_types
-    assert 'point_replaced' not in event_types
-
-
 def test_interpreted_uses_absolute_timestamps():
+    identity = [1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0]
     recorder = MouseEventRecorder()
+    recorder._append(METADATA, None, {
+        'volume': {'dimensions': [10, 10, 10], 'ras_to_ijk': identity},
+        'initial_visual_state': {'Red': {'xy_to_ijk': identity}},
+        'initial_handler_context': {'Red': {'view_name': 'Red', 'handler': 'brush'}},
+    })
     recorder._append(
-        MOVE, [1.0, 2.0, 3.0],
+        MOVE, None,
         {'mouse_status': 'move', 'analysis_event_type': 'trajectory_event',
-         'trajectory_kind': 'annotation_move', 'handler': 'brush'},
+         'mouse_button_state': 'pressed', 'view_name': 'Red', 'xy': [1, 2]},
     )
     events = recorder.export_interpreted_data()['events']
     ts = events[0]['timestamp']
-    assert 'T' in ts   # ISO-8601 format with date and time
+    assert all('T' in t for t in ts)  # ISO-8601 format with date and time
     assert 't_ms' not in events[0]
 
 
@@ -1786,25 +1416,29 @@ def test_raw_includes_press_release_move():
     recorder._append(PRESS, [1.0, 2.0, 3.0],
                      {'mouse_status': 'press', 'analysis_event_type': 'boundary_event',
                       'view_name': 'Red', 'slice_idx': 7,
+                      'xy': [100, 200],
                       'xy_global': [100, 200]})
     recorder._append(
         MOVE, [2.0, 3.0, 4.0],
         {'mouse_status': 'move', 'analysis_event_type': 'trajectory_event',
          'view_name': 'Red', 'mouse_button_state': 'pressed',
          'trajectory_kind': 'annotation_move', 'slice_idx': 7,
+         'xy': [101, 201],
          'xy_global': [101, 201], 'handler': 'brush',
          'segment_id': 'seg-a', 'brush_radius_mm': 2.5},
     )
     recorder._append(RELEASE, [3.0, 4.0, 5.0],
                      {'mouse_status': 'release', 'analysis_event_type': 'boundary_event',
                       'view_name': 'Red', 'slice_idx': 7,
+                      'xy': [102, 202],
                       'xy_global': [102, 202]})
     events = recorder.export_raw_data()['events']
-    assert [e['event'] for e in events] == ['press', 'move', 'release']
-    assert [e['pressed'] for e in events] == [1, 1, 0]
+    assert [e['event'] for e in events] == ['mouse', 'mouse', 'mouse']
+    assert [e['mouse_state'] for e in events] == ['press', 'hold', 'release']
     assert events[1]['view'] == 'Red'
     assert events[1]['slice'] == 7
-    assert events[1]['xy_global'] == [101, 201]
+    assert all('xy_global' not in e for e in events)
+    assert events[1]['xy'] == [[101, 201]]
     assert all('ras' not in e for e in events)
     assert all('ijk' not in e for e in events)
     assert events[1]['tool'] == 'brush'
@@ -1853,25 +1487,34 @@ def test_raw_context_is_exported_as_deltas_not_repeated():
 
     assert events[0] == {
         'timestamp': recorder.records[1].timestamp.isoformat(timespec='milliseconds'),
-        'event': MOVE,
+        'event': 'mouse',
         'view': 'Red',
         'slice': 7,
+        'z': 7,
+        'mouse_state': 'hold',
+        'tool': 'brush',
+        'segment': 'seg-a',
+        'diameter_mm': 5.0,
         'xy': [10, 20],
-        'xy_global': [100, 200],
-        'pressed': 1,
     }
+    assert all('xy_global' not in e for e in events)
     assert events[1]['segment'] == 'seg-b'
-    assert 'tool' not in events[1]
-    assert 'diameter_mm' not in events[1]
+    assert events[1]['tool'] == 'brush'
+    assert events[1]['diameter_mm'] == 5.0
 
 
-def test_raw_excludes_semantic_events():
+def test_raw_includes_markup_source_events_for_offline_interpretation():
     recorder = MouseEventRecorder()
     recorder.record_point_placed(
         'seg-a', [1.0, 2.0, 3.0], False,
         point_index=0, point_id='cp-0', point_name='Pos-1')
     events = recorder.export_raw_data()['events']
-    assert all(e['event'] not in ('point_placed', 'point_placement') for e in events)
+    assert events[0]['event'] == POINT_PLACED
+    assert 'markup_ras' not in events[0]
+    assert 'ras' not in events[0]
+    assert 'ijk' not in events[0]
+    assert events[0]['segment'] == 'seg-a'
+    assert events[0]['point'] == 'cp-0'
 
 
 def test_raw_uses_absolute_timestamps():

@@ -78,9 +78,9 @@ Defines the handler wrappers:
 Only one handler should be active at a time. A handler is considered a wrapper:
 detaching it must also disable the Slicer tool it wraps.
 
-### `core/_mouse_recorder.py`
+### `core/_mouse_recorder.py` and `core/TimeLogInterpreter.py`
 
-Mouse-centered process recorder.
+Mouse-centered recorder plus offline raw-log interpreter.
 
 Recording is intentionally not a general UI macro. It captures:
 
@@ -89,11 +89,17 @@ Recording is intentionally not a general UI macro. It captures:
 - Slice-view Qt events plus high-priority, non-consuming VTK interactor events,
   so native Segment Editor brush/erase input is visible to the recorder before
   Paint/Erase can consume it.
-- Compact export as `{type, metadata, events}` with event `id` and
-  `t_ms` relative to recording start.
+- Raw input export is the source of truth. Compact interpreted export is
+  regenerated from `_raw.json` by `TimeLogInterpreter`.
+- Mouse raw entries keep original input fields: view, slice index, VTK device
+  XY, optional global screen XY, pressed state, and wheel delta when relevant.
+- Raw source entries also keep tool selection, segment lifecycle/selection,
+  model selection, brush parameter changes, and markups point events needed for
+  offline interpretation outside Slicer.
 - Metadata is not an event; exported event IDs start at 1 for process events.
-- RAS position relative to the active volume; IJK is derivable from RAS plus
-  recorded volume metadata and is not duplicated in every event.
+- Interpreted events use IJK. Mouse IJK is derived from raw XY plus stored
+  per-view `xy_to_ijk`; point IJK is derived from raw markups world position
+  plus recorded volume metadata.
 - Mouse status: `move`, `press`, `release`, or `view`.
 - Trajectory kind/role: held-button edit paths are `annotation_move` /
   `annotation_trajectory`; released-button hover paths are
@@ -110,12 +116,12 @@ Recording is intentionally not a general UI macro. It captures:
   as `non_annotation_move`.
 - Existing-point relocation from markups-node events: start is
   `point_drag_start`/`grab`, movement is sampled `non_annotation_move`
-  visualization trajectory, and release is `point_placed`/`replace`.
+  visualization trajectory, and release is `point_replaced`/`replace`.
 - Control-point deletion from markups-node events: `point_removed` with the
   last cached point location.
 - Segmentation-changing actions such as segment remove/rename and undo/redo.
-- Segment switches are not standalone events; the active segment is carried by
-  boundary, trajectory, and semantic event payloads.
+- Segment switches record raw `segment_selected`; active segment context is
+  still carried by boundary and trajectory payloads.
 - Brush/erase drag samples or releases infer a missing `press` boundary if
   Slicer does not deliver the initial press event.
 - Brush/erase press, release, held-button movement, and released-button
@@ -123,14 +129,20 @@ Recording is intentionally not a general UI macro. It captures:
 - Slice-view movement such as wheel/scroll as `view_changed` visual trajectory
   events, including the recorded Red/Green/Yellow visual state.
 - Initial Red/Green/Yellow slice visual states in one `metadata` record.
+- Slice-view mouse coordinates come from the single VTK interactor listener
+  (`GetEventPosition()` device XY) and are interpreted through the same
+  DataProbe-style XY-to-IJK path used for active-volume checks.
 
-Movement is sampled by timer at 30 records/sec. Raw movement is resolved into
-in-volume RAS samples before classification, unchanged positions are skipped,
-and events outside the active volume are ignored until the cursor maps back
-inside the volume.
+Movement is considered by timer at 60 records/sec and thinned by cached
+XY-to-IJK scale. Annotation moves target >=0.5 IJK voxels clamped to 1-4 px;
+hover moves target >=2 IJK voxels clamped to 2-12 px; 100/250 ms time caps keep
+continuity. The compact policy is stored in `metadata.move_thinning`.
+Active-volume membership is checked on cached per-view DataProbe-style
+XY-to-IJK matrices, so inactive XY is ignored before it accumulates. Export
+still recomputes IJK bounds from stored metadata for consistency.
 
-Segment removal and rename are observed on the active `vtkSegmentation` object.
-Segment creation is not recorded as a standalone process event.
+Segment creation, removal, rename, and selection are observed as raw source
+events. They are not brush/point annotation trajectories.
 
 ### `core/modelFamilies.py` and `core/modelRegistry.py`
 

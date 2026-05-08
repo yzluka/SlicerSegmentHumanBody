@@ -58,11 +58,18 @@ slice views and map inside the active volume.
 
 Current schema is intentionally strict while this branch is under test:
 
-- Saved recordings are compact process logs with top-level `type`, `metadata`,
-  and `events`.
-- `xy_global` / screen-space coordinates are not exported.
-- RAS is the canonical coordinate. 3D IJK can be derived later from each event
-  RAS plus recorded volume metadata; do not duplicate IJK into every event.
+- Saving writes both a raw source log (`*_raw.json`) and a compact process log.
+  The compact log must be derived from the raw log by `TimeLogInterpreter`.
+- The interpreted annotation-process export uses IJK as the compact coordinate
+  for cursor-derived events. Mouse entries in the raw-input export intentionally
+  omit RAS/IJK and store the original input facts: view, VTK device XY,
+  optional global screen XY, pressed state, and wheel delta when relevant.
+  Raw source events also include tool changes, segment lifecycle/selection,
+  model changes, brush parameter changes, and markups point events.
+- `metadata.volume` stores both `ijk_to_ras` and `ras_to_ijk` (its pre-computed
+  inverse). Markup point events may carry world RAS because Slicer provides the
+  accepted point location that way; their cleaned IJK is derived with
+  `ras_to_ijk`.
 
 The recorder is an event-listener-style component. It should first produce a
 correct in-volume event stream, then annotate events with
@@ -70,43 +77,58 @@ annotative/non-annotative classification. Do not let policy decisions drop raw
 press/release/move events inside volume views.
 
 Exactly one `metadata` record is created when recording starts. It caches volume
-metadata, the 30 Hz sample rate, the initial Red/Green/Yellow visual state, and
-whether recording began with the left mouse button already down.
+metadata, the 60 Hz sample rate, the initial Red/Green/Yellow visual state
+(including each view's DataProbe-style 4x4 `xy_to_ijk` matrix when available),
+the `ras_sources` dictionary explaining coordinate sources, and whether
+recording began with the left mouse button already down.
 
 Metadata is not an exported event. The compact export stores:
 
 - `metadata.start_time`: absolute time for the recording.
-- `events[].id`: sequential event reference starting at 1 for process events
-  only.
-- `events[].t_ms`: event time relative to `metadata.start_time`.
-- `events[].ras`: 3D Slicer RAS coordinate when the event has an in-volume
-  position.
-- `events[].mouse`: `move`, `press`, `release`, or `view`.
-- `events[].pressed`: `1` when the left mouse button is down, `0` when
-  released.
-- `events[].kind`: `annotation_move`, `non_annotation_move`, or `view_change`.
-- `events[].role`: `annotation_trajectory` or `visualization_trajectory`.
-- `events[].tool`: `brush`, `erase`, `point`, or `None`.
-- `events[].brush_mm`: brush/erase radius when relevant.
-- Point fields (`point`, `point_index`, `point_action`, `negative`) only when
-  relevant.
-- View fields (`view_event`, `wheel_delta`, `visual_state`) only for explicit
-  view-change events. Initial Red/Green/Yellow state lives in metadata.
-  Visual-state snapshots omit repeated slice-view dimensions.
 
-Movement samples the latest in-volume cursor position at 30 records/sec and
-skips unchanged positions.
+Boundary events (one per stroke boundary or point action):
 
-Slice-view capture uses both Qt event filters and high-priority, non-consuming
-VTK interactor observers because native Segment Editor Paint/Erase may bypass
-one path or abort propagation after handling the event. Avoid doing
-unnecessary work in raw mouse callbacks, but do not defer active-volume
-membership until the timer: each raw move should resolve XY to RAS immediately
-and cache the latest valid in-volume sample with its original timestamp. The
-timer only appends the latest cached valid sample. Boundary events should flush
-pending movement before appending themselves so event order remains meaningful.
-When VTK move capture is available, Qt `MouseMove` capture is disabled to avoid
-duplicate high-frequency callbacks.
+- `press`: `{id, event, timestamp, ijk, view, tool, segment, brush_mm}`.
+  `brush_mm` only present for `brush`/`erase` tools.
+- `hold`: `{id, event, timestamp:[…], ijk:[[i,j,k],…], view}`.
+  All in-volume annotation samples collapsed into arrays. `segment`, `tool`, and
+  `brush_mm` are omitted — they are carried on the preceding `press`.
+- `release`: `{id, event, timestamp, ijk, view}`.
+- `place`: new point placed. `{id, event, timestamp, ijk, view, segment, point,
+  point_name, point_index, negative}`.
+- `replace`: point relocated. Same fields as `place`.
+- `remove`: point deleted. Same fields as `place`.
+
+Delta events (emitted only when the value changes):
+
+- `slice_change`: `{id, event, timestamp, view, slice}`. Emitted before the
+  next boundary event when the active slice in a view shifts.
+- `tool_change`: `{id, event, timestamp, view, tool}`. Emitted when the active
+  tool changes within a view.
+- `brush_change`: `{id, event, timestamp, view, tool, brush_mm}`. Emitted when
+  the brush/erase radius changes.
+
+IJK coordinates are derived from VTK device XY via the stored DataProbe-style
+`xy_to_ijk` matrix. Point events prefer the pre-computed IJK on the raw event
+(derived from world RAS via `metadata.volume.ras_to_ijk`), falling back to
+`mouse_boundary.xy` + `xy_to_ijk`. Idle/hover trajectory is omitted entirely.
+
+Movement considers the latest in-volume cursor position at 60 records/sec and
+adaptively thins writes using cached XY-to-IJK scale. Pressed annotation moves
+target at least 0.5 IJK voxels, clamped to 1-4 px; released hover moves target
+at least 2 IJK voxels, clamped to 2-12 px. Time caps keep annotation moves at
+least every 100 ms and hover moves at least every 250 ms. The compact policy
+constants are stored in `metadata.move_thinning`.
+
+Each slice view owns one recording listener. The listener uses only VTK
+interactor `GetEventPosition()` device XY, the same coordinate source consumed
+by Slicer DataProbe. Qt event-filter capture is intentionally not used because
+it can report a different origin. Avoid heavy work in raw mouse callbacks.
+The active-volume hot-path check uses cached per-view DataProbe-style XY-to-IJK
+transforms, so inactive XY is dropped before it accumulates, while export still
+performs the same IJK-bounds validation. The timer only appends the latest
+cached valid sample. Boundary events should flush pending movement before
+appending themselves so event order remains meaningful.
 
 Brush/erase press is a required boundary event. If Slicer drops the initial
 press but a brush/erase drag sample or release is observed, infer a `press`
@@ -116,18 +138,20 @@ Brush/erase movement is classified from the mouse button state: held-button
 movement is `annotation_move`; released-button movement is
 `non_annotation_move`. Both are listener-recordable in volume views.
 
-Point placement is recorded semantically via markups-node events as one
-`point_placed` boundary, not as raw press plus release mouse boundaries. A new
-point records its `point_placed` verdict on `PointPositionDefinedEvent`, using
-the defined control-point location. The later interaction end is used only to
-refresh cached metadata and must not duplicate the verdict. Include point ID
-and point name/label when available. Minor drift between press and release is
-`non_annotation_move` trajectory.
+Point placement is captured as a raw markups-node source event and interpreted
+as one compact `point_placement` boundary, not as raw press plus release mouse
+boundaries. A new point records its source verdict on
+`PointPositionDefinedEvent`, using the defined control-point location. The
+later interaction end is used only to refresh cached metadata and must not
+duplicate the verdict. Include point ID and point name/label when available.
+Minor drift between press and release is `non_annotation_move` trajectory.
 
 Point relocation is also semantic annotation process data. Record markups
 `PointStartInteractionEvent` as `point_drag_start` with `point_action: grab`;
-record `PointEndInteractionEvent` as `point_placed` with
-`point_action: replace` at the final RAS. Sample `PointModifiedEvent` movement
+record `PointEndInteractionEvent` as `point_replaced` (distinct event type)
+with `point_action: replace` at the final RAS. This separates new placements
+(`point_placed`) from relocations (`point_replaced`) at the event-type level,
+not just through the `point_action` field. Sample `PointModifiedEvent` movement
 as `non_annotation_move` instead of creating a new point.
 During compact export, suppress raw point-tool mouse press/move/release
 companions for an accepted point relocation; those raw mouse RAS values are a
@@ -153,6 +177,57 @@ carried on boundary, trajectory, and semantic payloads.
 Guard signal loops explicitly. In particular, parameter-node-to-UI sync uses
 `_syncing_parameter_node_to_ui` so selector changes caused by sync do not write
 straight back into the parameter node.
+
+## Robustness and Predictability
+
+**Rule: No silent failures. No fallback assignments. Every unexpected state is an error.**
+
+This module follows a strict no-silent-failure policy. The goal is that bugs
+surface immediately at the point of cause, not later as incorrect behavior.
+
+### Mandatory error on unexpected state
+
+1. **Raise on missing internal attributes.**  
+   Every attribute used by a method must be initialized in `__init__`. Methods
+   must not patch a missing attribute with a fallback (`if not hasattr(self, …):
+   self.x = {}`). If the attribute is absent, the `AttributeError` is the correct
+   outcome — it identifies the missing initialization.
+
+2. **Raise on required data that is absent.**  
+   When a method depends on a value that must be present (a segment ID in a cached
+   point record, a node tag set during initialization), it must raise `RuntimeError`
+   if that value is falsy or missing. It must not silently substitute a UI fallback
+   such as `currentSegmentID()`. A silent substitute converts a detectable bug into
+   invisible wrong behavior.
+
+3. **Do not swallow exceptions.**  
+   `except Exception: return` and `except Exception: pass` are forbidden. If a
+   statement can raise, let the exception propagate. Slicer prints Python
+   tracebacks from event callbacks to the console — that is the correct visibility
+   for unexpected errors, not a silent no-op.
+
+4. **No defensive `getattr` fallbacks on own attributes.**  
+   `getattr(self, '_foo', default)` and `getattr(widget, '_bar', default)` are
+   only acceptable for attributes owned by external Slicer/VTK/Qt objects whose
+   existence is version-dependent. For attributes this module controls,
+   use direct access. A missing attribute must raise `AttributeError`.
+
+### When `None` / empty returns are legitimate
+
+- A method that queries optional Slicer state (e.g. no volume selected, no
+  segment selected) may return `None` or an empty string — these represent valid
+  absent-selection states, not errors. The caller must check and decide.
+- Early returns inside MRML event callbacks are acceptable when the event fires
+  during a known transient state (e.g. `PointPositionDefinedEvent` with no
+  defined control point during continuous placement preview). Log a `debug`
+  message so the path is visible.
+
+### Rationale
+
+Silent fallbacks turn initialization bugs into data-integrity bugs: the wrong
+segment is recorded, the wrong point is tracked, and the error is only visible
+long after the code that caused it ran. An immediate `RuntimeError` or
+`AttributeError` is always cheaper to debug than a subtly wrong recording.
 
 ## Model Family Template
 

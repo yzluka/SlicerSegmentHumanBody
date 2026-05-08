@@ -80,28 +80,30 @@ Recording is mouse-centered. It is not a general UI macro recorder.
 |---|---|---|
 | 5.1a | Event ID | Every internal record has a sequential integer `event_id`; compact export writes it as `id` |
 | 5.1 | Capture scope | Only Red/Green/Yellow slice-view events are considered |
-| 5.1b | Native editor capture | Slice-view recording listens to both Qt mouse events and high-priority, non-consuming VTK interactor events so native Segment Editor brush/erase effects are captured before Paint/Erase can abort propagation; Qt raw `MouseMove` is disabled when VTK move capture is available |
-| 5.2 | Active volume boundary | Mouse events outside the active volume are ignored |
+| 5.1b | Native editor capture | Each slice view owns one recording listener. The listener uses only the VTK interactor `GetEventPosition()` device-XY stream, matching Slicer DataProbe. Qt event-filter capture is intentionally not used because it can produce a different coordinate origin |
+| 5.2 | Active volume boundary | Mouse events outside the active volume are ignored using cached per-view DataProbe-style `xy_to_ijk` bounds checks (`sliceView.convertDeviceToXYZ()` plus background-layer `GetXYToIJKTransform()`) |
 | 5.3 | Return inside volume | Recording resumes when the mouse maps back inside the volume |
-| 5.4 | Movement sampling | In-volume movement is sampled at 30 Hz. Raw press/release/move events inside volume views are recordable regardless of later annotative/non-annotative policy |
+| 5.4 | Movement sampling | In-volume movement is sampled at 60 Hz, then thinned by cached XY-to-IJK scale. Annotation moves target >=0.5 IJK voxels clamped to 1-4 px; hover moves target >=2 IJK voxels clamped to 2-12 px. Time caps keep annotation moves at least every 100 ms and hover moves at least every 250 ms. Policy constants are stored in `metadata.move_thinning` |
 | 5.5 | Scroll/wheel | Wheel events record `view_changed` visual trajectory events |
 | 5.6 | Mouse status | Records include `move`, `press`, `release`, or `view` |
-| 5.7 | Handler state | Mouse records include the active handler/tool; compact export includes only parameters needed to reconstruct the event, such as brush diameter |
-| 5.8 | Visualization state | Initial Red/Green/Yellow state is stored once in metadata; later snapshots are stored only on explicit `view_changed` events |
-| 5.9 | Points | New point placement is recorded as one semantic `point_placed` verdict when Slicer defines the control point; point removal records `point_removed`; raw point press/release listener boundaries remain recordable |
+| 5.7 | Handler state | Raw mouse records carry handler/tool context as deltas; compact export includes only parameters needed to reconstruct the semantic event, such as brush diameter |
+| 5.8 | Visualization state | Initial Red/Green/Yellow state is stored once in metadata; later snapshots are stored on infrequent boundary/view events so raw XY can be interpreted offline |
+| 5.9 | Points | Point markups source events are kept in `_raw.json`; new point placement becomes compact `point_placement`, relocation drag-end becomes compact `point_move`, and removal becomes compact `point_removed` during offline interpretation |
 | 5.10 | Hotkeys/actions | Only segmentation-changing actions should be semantic recording actions |
-| 5.11 | Segment creation | Segment creation is not recorded as a standalone process event |
-| 5.12 | Segment removal/rename | Active-segmentation `SegmentRemoved` records `segment_removed` with last known segment name; name changes record `segment_renamed` with old/new names |
+| 5.11 | Segment creation | Segment creation is recorded as a raw source event, not as an annotation trajectory |
+| 5.12 | Segment removal/rename | Active-segmentation `SegmentRemoved` records raw `segment_removed` with last known segment name; name changes record raw `segment_renamed` with old/new names |
 | 5.13 | Trajectory classification | Trajectory events include `trajectory_kind` (`annotation_move`, `non_annotation_move`, or `view_change`) and `trajectory_role` (`annotation_trajectory` or `visualization_trajectory`) |
-| 5.14 | Point relocation | Existing point drag start records `point_drag_start` with `point_action: grab`; sampled drag movement records `point_drag_move`; release records `point_placed` with `point_action: replace` at the final RAS; move/end are ignored unless a valid defined-point drag start was accepted; just-defined placement points are not treated as relocation |
+| 5.14 | Point relocation | Existing point drag start records `point_drag_start` with `point_action: grab`; sampled drag movement records `point_drag_move`; release records `point_replaced` with `point_action: replace` at the final RAS; move/end are ignored unless a valid defined-point drag start was accepted; just-defined placement points are not treated as relocation |
 | 5.15 | Metadata | Exactly one `metadata` record is created when recording starts; it stores volume metadata, sample rate, initial Red/Green/Yellow visual state, and whether recording started while the left button was already down |
 | 5.16 | Live count | Record status count updates as events are appended |
-| 5.17 | Segment switching | Segment selection changes are not recorded as standalone events; the active segment is carried on boundary/trajectory/semantic payloads |
+| 5.17 | Segment switching | Segment selection changes record raw `segment_selected`; mouse/tool events still carry active segment context as needed |
 | 5.18 | Brush/erase press fallback | If Slicer drops the initial press but a brush/erase drag sample or release is observed, a `press` boundary is inferred before that first sampled move/release |
+| 5.19 | Tool selection | Activating a tool records `tool_selected` with `tool: 'brush'`, `'erase'`, or `'point'` and the active `segment_id`. Explicitly deactivating a tool (toggle off without switching to another) records `tool_selected` with `tool: null`. Switching directly from one tool to another records only the activation event for the incoming tool. |
 
-Movement capture is staged before policy classification. Each raw move is converted
-to RAS immediately and kept only if it maps inside the active volume; the timer
-then appends the latest valid in-volume movement sample at the configured rate.
+Movement capture is staged before policy classification. Each raw move keeps the
+original VTK device XY and is kept only if cached DataProbe-style XY-to-IJK
+mapping places it inside the active volume; the timer then appends the latest
+valid in-volume movement sample at the configured rate.
 If the cursor leaves the volume before the timer fires, the last valid
 in-volume sample is still eligible to record. Boundary events flush any pending
 movement first, so event order follows the user's interaction order.
@@ -120,7 +122,7 @@ markups control point and stored as a verdict `point_placed` event with
 `point_action: place`, point ID, and point name/label when available. Minor
 movement between press and release is `non_annotation_move` trajectory. For
 relocating an already placed point, start/end are `point_drag_start` /
-`point_placed` boundaries with `point_action: grab` / `replace`, and sampled
+`point_replaced` boundaries with `point_action: grab` / `replace`, and sampled
 movement is `non_annotation_move`. Point deletion records a `point_removed`
 boundary with the last cached RAS, point ID, point index, segment ID, and
 positive/negative point role when available.
@@ -131,14 +133,19 @@ Point-drag move throttling occurs before node lookup/RAS extraction. Segment
 modified handling only syncs prompt names when the segment name actually
 changes. Parameter-node-to-UI sync is guarded against selector feedback loops.
 
-The saved recording is a compact process log:
+Saving writes two logs. The raw log is the source of truth; the compact process
+log is generated from it by `core.TimeLogInterpreter.TimeLogInterpreter`.
+`TimeLogInterpreter` must be able to run outside Slicer using only `_raw.json`.
+
+The compact process log is:
 
 - top level: `type`, `metadata`, `events`
-- `metadata`: one session-start block with volume metadata, sample rate,
-  coordinate system (`RAS`), initial Red/Green/Yellow visual state, and absolute
-  `start_time`
-- each event: `id`, `t_ms`, `event`, optional `ras`, and only the fields needed
-  for that event
+- `metadata`: one session-start block with volume metadata (including `ijk_to_ras`
+  and `ras_to_ijk`), sample rate, coordinate system (`IJK`), initial
+  Red/Green/Yellow visual state, and absolute `start_time`
+- each interpreted event: `id`, absolute `timestamp`, `event`, optional `ijk`
+  (voxel indices derived from DataProbe-style device XY for cursor events or
+  from markup RAS for point events), and only the fields needed for that event
 
 Metadata is not an event. Exported event IDs start at 1 and count only
 process events in `events`. Visual-state snapshots intentionally omit repeated
@@ -161,9 +168,35 @@ Mouse movement and boundaries use compact event fields:
 - view fields (`view_event`, `wheel_delta`, `visual_state`) only for
   `view_changed` events
 
-RAS is the canonical 3D coordinate. Screen-space XY is not exported. IJK can be
-derived later from event RAS plus `metadata.volume.ijk_to_ras`; it is not
-duplicated into every event.
+IJK is the canonical compact coordinate for interpreted events.
+The separate raw-input export stores original input facts: absolute timestamp,
+event, view, VTK device XY, optional global screen XY, pressed state, and wheel
+delta when relevant. It also stores source events needed for offline
+interpretation: tool selection, segment creation/removal/rename/selection,
+model selection, brush parameter changes, and markups point source events.
+Mouse raw events intentionally omit RAS/IJK. Markups point source events may
+carry `markup_ras` because Slicer provides the accepted point in world
+coordinates rather than as a mouse XY event.
+
+Export-time interpretation uses stored per-view `xy_to_ijk` matrices captured
+from the same route as Slicer DataProbe. Point-event IJK is derived from markup
+RAS with `metadata.volume.ras_to_ijk`.
+
+### Coordinate System
+
+Mouse coordinates are VTK device XY in the slice view and are documented in
+`metadata.ras_sources`:
+
+- `cursor` - VTK interactor `GetEventPosition()` device XY interpreted through
+  `sliceView.convertDeviceToXYZ()` and the background layer
+  `GetXYToIJKTransform()`, matching Slicer DataProbe. Used for mouse `move`,
+  `press`, `release`, and `view_changed` events. The 4x4 `xy_to_ijk` matrix for
+  each slice view is stored in `metadata.initial_visual_state` and updated in
+  `view_changed` events.
+- `markup_world` - `vtkMRMLMarkupsFiducialNode.GetNthControlPointPositionWorld()`;
+  the actual 3D placement position after Slicer crosshair/picking. Used for
+  `point_placed`, `point_replaced`, `point_removed`, `point_drag_start`, and
+  `point_drag_move` events.
 
 ## 6. Model Family Template
 

@@ -42,23 +42,6 @@
        </layout>
       </item>
       <item>
-       <layout class="QHBoxLayout">
-        <item>
-         <widget class="QPushButton" name="loadRecordButton">
-          <property name="text"><string>Load</string></property>
-          <property name="toolTip"><string>Load a previously saved recording JSON file</string></property>
-         </widget>
-        </item>
-        <item>
-         <widget class="QPushButton" name="replayRecordButton">
-          <property name="text"><string>Replay</string></property>
-          <property name="enabled"><bool>false</bool></property>
-          <property name="toolTip"><string>Replay loaded recording onto a new segmentation (requires matching volume)</string></property>
-         </widget>
-        </item>
-       </layout>
-      </item>
-      <item>
        <widget class="QLabel" name="recordStatusLabel">
         <property name="text"><string></string></property>
        </widget>

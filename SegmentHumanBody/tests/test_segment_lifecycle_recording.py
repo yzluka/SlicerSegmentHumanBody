@@ -1,5 +1,6 @@
 import SegmentHumanBody as segment_module
 from SegmentHumanBody import SegmentHumanBodyWidget
+from core._input import PointHandler as _PointHandlerBase
 
 
 class _FakeSegment:
@@ -143,7 +144,7 @@ def _record_widget(recorder):
     return widget
 
 
-def test_segment_added_event_creates_prompt_nodes_without_recording_creation():
+def test_segment_added_event_creates_prompt_nodes_and_records_creation():
     seg_node = _FakeSegNode()
     recorder = _FakeRecorder()
     widget = _widget(seg_node, recorder)
@@ -151,7 +152,7 @@ def test_segment_added_event_creates_prompt_nodes_without_recording_creation():
     seg_node.GetSegmentation().add('seg-a', 'Femur')
     widget._onSegmentAdded(seg_node.GetSegmentation(), None, 'seg-a')
 
-    assert recorder.created == []
+    assert recorder.created == [('seg-a', 'Femur')]
     assert widget.logic.prompt_nodes_created == [(seg_node, 'seg-a')]
     assert widget._observed_segment_ids == {'seg-a'}
     assert widget._observed_segment_names == {'seg-a': 'Femur'}
@@ -327,8 +328,23 @@ class _MovingPromptNode(_FakePromptNode):
         ras[:] = self.positions.pop(0) if self.positions else [4.0, 5.0, 6.0]
 
 
+class _TwoPointPromptNode(_FakePromptNode):
+    def GetNumberOfControlPoints(self):
+        return 2
+
+    def GetNthControlPointPositionWorld(self, index, ras):
+        ras[:] = [float(index), float(index + 1), float(index + 2)]
+
+    def GetNthControlPointID(self, index):
+        return f'cp-{index}'
+
+    def GetNthControlPointLabel(self, index):
+        return f'P-{index}'
+
+
 class _FakePointDragRecorder:
     is_active = True
+    _active_mouse_press = False  # required by _onPromptPointRemovedForRecording
 
     def __init__(self):
         self.drags = []
@@ -346,6 +362,45 @@ class _FakePointDragRecorder:
 
     def should_sample_point_drag(self, phase):
         return True
+
+
+def test_prompt_node_observers_request_integer_calldata():
+    widget = SegmentHumanBodyWidget.__new__(SegmentHumanBodyWidget)
+    widget._recorded_prompt_node_ids = set()
+    observers = []
+    widget.addObserver = lambda node, event, method: observers.append((event, method))
+    node = _FakePromptNode(status=2)
+
+    SegmentHumanBodyWidget._observe_prompt_node_for_recording(widget, node, False)
+
+    assert observers
+    assert all(
+        getattr(method, 'CallDataType', None) == segment_module.vtk.VTK_INT
+        for _, method in observers
+    )
+
+
+def test_point_defined_uses_calldata_index_not_last_defined_point():
+    widget = SegmentHumanBodyWidget.__new__(SegmentHumanBodyWidget)
+    widget._recorder = _FakePointDragRecorder()
+    widget._active_point_drags = {}
+    widget._pending_point_confirmations = {}
+    widget._pending_drag_removals = {}
+    widget._recently_placed = {}
+    widget._recorded_prompt_point_cache = {}
+    widget._segment_id_for_prompt_node = lambda node: 'seg-a'
+    widget.ui = _FakeUI()
+    widget.currentViewName = 'Red'
+    node = _TwoPointPromptNode(status=2)
+
+    SegmentHumanBodyWidget._onPromptPointDefinedForRecording(
+        widget, node, False, 0)
+
+    assert len(widget._recorder.points) == 1
+    args, kwargs = widget._recorder.points[0]
+    assert args[:3] == ('seg-a', [0.0, 1.0, 2.0], False)
+    assert kwargs['point_index'] == 0
+    assert kwargs['point_id'] == 'cp-0'
 
 
 def test_point_drag_recording_ignores_not_yet_defined_points():
@@ -403,6 +458,9 @@ def test_point_drag_recording_accepts_previously_defined_points():
     widget = SegmentHumanBodyWidget.__new__(SegmentHumanBodyWidget)
     widget._recorder = _FakePointDragRecorder()
     widget._active_point_drags = {}
+    widget._pending_point_confirmations = {}
+    widget._recorded_prompt_point_cache = {}
+    widget._segment_id_for_prompt_node = lambda node: 'seg-a'
     widget.ui = _FakeUI()
     widget.currentViewName = 'Red'
     node = _FakePromptNode(status=2)
@@ -422,10 +480,15 @@ def test_point_placement_records_release_verdict_after_point_is_defined():
     widget._recorder = _FakePointDragRecorder()
     widget._active_point_drags = {}
     widget._pending_point_confirmations = {}
+    widget._pending_drag_removals = {}
+    widget._recently_placed = {}
     widget._recorded_prompt_point_cache = {}
+    widget._segment_id_for_prompt_node = lambda node: 'seg-a'
+    widget._schedule_pending_point_confirmation = lambda *_: None
     widget.ui = _FakeUI()
     widget.currentViewName = 'Red'
     node = _FakePromptNode(status=2)
+    widget._recorder._active_mouse_press = True
 
     SegmentHumanBodyWidget._onPromptPointDefinedForRecording(
         widget, node, False)
@@ -443,30 +506,26 @@ def test_point_placement_records_release_verdict_after_point_is_defined():
     assert kwargs['point_name'] == 'P-0'
 
 
-def test_point_placement_fallback_confirms_when_end_event_is_missing(monkeypatch):
-    callbacks = []
-
-    class _Timer:
-        @staticmethod
-        def singleShot(delay_ms, callback):
-            callbacks.append((delay_ms, callback))
-
+def test_point_placement_confirms_on_release_when_end_event_is_missing():
     widget = SegmentHumanBodyWidget.__new__(SegmentHumanBodyWidget)
     widget._recorder = _FakePointDragRecorder()
     widget._active_point_drags = {}
     widget._pending_point_confirmations = {}
+    widget._pending_drag_removals = {}
+    widget._recently_placed = {}
     widget._recorded_prompt_point_cache = {}
+    widget._segment_id_for_prompt_node = lambda node: 'seg-a'
     widget.ui = _FakeUI()
     widget.currentViewName = 'Red'
     node = _FakePromptNode(status=2)
-    monkeypatch.setattr(segment_module.qt, 'QTimer', _Timer, raising=False)
+    widget._recorder._active_mouse_press = True
 
     SegmentHumanBodyWidget._onPromptPointDefinedForRecording(
         widget, node, False)
     assert widget._recorder.points == []
-    assert callbacks[0][0] == 500
 
-    callbacks[0][1]()
+    widget._recorder._active_mouse_press = False
+    SegmentHumanBodyWidget._confirm_all_pending_points(widget)
 
     assert len(widget._recorder.points) == 1
     assert widget._pending_point_confirmations == {}
@@ -477,9 +536,15 @@ def test_pending_point_start_does_not_record_relocation_drag():
     widget._recorder = _FakePointDragRecorder()
     widget._active_point_drags = {}
     widget._pending_point_confirmations = {}
+    widget._pending_drag_removals = {}
+    widget._recently_placed = {}
+    widget._recorded_prompt_point_cache = {}
+    widget._segment_id_for_prompt_node = lambda node: 'seg-a'
+    widget._schedule_pending_point_confirmation = lambda *_: None
     widget.ui = _FakeUI()
     widget.currentViewName = 'Red'
     node = _FakePromptNode(status=2)
+    widget._recorder._active_mouse_press = True
 
     SegmentHumanBodyWidget._onPromptPointDefinedForRecording(
         widget, node, False)
@@ -502,10 +567,15 @@ def test_pending_point_remove_is_treated_as_unconfirmed_placement_cancel():
     widget._recorder = _FakePointDragRecorder()
     widget._active_point_drags = {}
     widget._pending_point_confirmations = {}
+    widget._pending_drag_removals = {}
+    widget._recently_placed = {}
     widget._recorded_prompt_point_cache = {}
+    widget._segment_id_for_prompt_node = lambda node: 'seg-a'
+    widget._schedule_pending_point_confirmation = lambda *_: None
     widget.ui = _FakeUI()
     widget.currentViewName = 'Red'
     node = _FakePromptNode(status=2)
+    widget._recorder._active_mouse_press = True
 
     SegmentHumanBodyWidget._onPromptPointDefinedForRecording(
         widget, node, False)
@@ -522,7 +592,11 @@ def test_point_remove_during_active_drag_is_not_semantic_deletion():
     widget._recorder = _FakePointDragRecorder()
     widget._active_point_drags = {}
     widget._pending_point_confirmations = {}
+    widget._pending_drag_removals = {}
+    widget._recently_placed = {}
     widget._recorded_prompt_point_cache = {}
+    widget._segment_id_for_prompt_node = lambda node: 'seg-a'
+    widget._schedule_pending_point_confirmation = lambda *_: None
     widget.ui = _FakeUI()
     widget.currentViewName = 'Red'
     node = _FakePromptNode(status=2)
@@ -548,6 +622,7 @@ def test_point_drag_end_without_displacement_is_not_replacement():
     widget._active_point_drags = {}
     widget._pending_point_confirmations = {}
     widget._recorded_prompt_point_cache = {}
+    widget._segment_id_for_prompt_node = lambda node: 'seg-a'
     widget.ui = _FakeUI()
     widget.currentViewName = 'Red'
     node = _FakePromptNode(status=2)
@@ -567,6 +642,7 @@ def test_point_drag_end_with_displacement_records_replacement():
     widget._active_point_drags = {}
     widget._pending_point_confirmations = {}
     widget._recorded_prompt_point_cache = {}
+    widget._segment_id_for_prompt_node = lambda node: 'seg-a'
     widget.ui = _FakeUI()
     widget.currentViewName = 'Red'
     node = _MovingPromptNode([
@@ -589,7 +665,11 @@ def test_point_removal_records_cached_control_point():
     widget._recorder = _FakePointDragRecorder()
     widget._active_point_drags = {}
     widget._pending_point_confirmations = {}
+    widget._pending_drag_removals = {}
+    widget._recently_placed = {}
     widget._recorded_prompt_point_cache = {}
+    widget._segment_id_for_prompt_node = lambda node: 'seg-a'
+    widget._schedule_pending_point_confirmation = lambda *_: None
     widget.ui = _FakeUI()
     widget.currentViewName = 'Red'
     node = _FakePromptNode(status=2)
@@ -597,6 +677,10 @@ def test_point_removal_records_cached_control_point():
     SegmentHumanBodyWidget._onPromptPointDefinedForRecording(
         widget, node, True)
     SegmentHumanBodyWidget._confirm_pending_point(widget, node, True, 0)
+    # Arm the newly placed point for real deletion without relying on elapsed
+    # time. This test verifies record_point_removed, not internal Slicer
+    # remove/recreate suppression.
+    SegmentHumanBodyWidget._arm_recorded_prompt_points_for_deletion(widget)
     SegmentHumanBodyWidget._onPromptPointRemovedForRecording(
         widget, node, True, '0')
 
@@ -606,3 +690,190 @@ def test_point_removal_records_cached_control_point():
     assert kwargs['point_index'] == 0
     assert kwargs['point_id'] == 'cp-0'
     assert kwargs['point_name'] == 'P-0'
+
+
+def test_fresh_point_internal_remove_is_suppressed_until_next_press():
+    widget = SegmentHumanBodyWidget.__new__(SegmentHumanBodyWidget)
+    widget._recorder = _FakePointDragRecorder()
+    widget._active_point_drags = {}
+    widget._pending_point_confirmations = {}
+    widget._pending_drag_removals = {}
+    widget._recently_placed = {}
+    widget._recorded_prompt_point_cache = {}
+    widget._segment_id_for_prompt_node = lambda node: 'seg-a'
+    widget._schedule_pending_point_confirmation = lambda *_: None
+    widget.ui = _FakeUI()
+    widget.currentViewName = 'Red'
+    node = _FakePromptNode(status=2)
+
+    SegmentHumanBodyWidget._onPromptPointDefinedForRecording(
+        widget, node, False)
+    SegmentHumanBodyWidget._confirm_pending_point(widget, node, False, 0)
+    SegmentHumanBodyWidget._onPromptPointRemovedForRecording(
+        widget, node, False, '0')
+
+    assert widget._recorder.removed_points == []
+    assert (node.GetID(), False, 0) in widget._recorded_prompt_point_cache
+
+    SegmentHumanBodyWidget._arm_recorded_prompt_points_for_deletion(widget)
+    SegmentHumanBodyWidget._onPromptPointRemovedForRecording(
+        widget, node, False, '0')
+
+    assert len(widget._recorder.removed_points) == 1
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Segment-delete guard regression tests
+# Covers three bugs fixed together:
+#   • F-1 spurious fiducial: _configureUnlimitedPlacement called on None node
+#   • no-tool auto-switch: _set_prompt_nodes didn't force place states off
+#   • Qt error: setPlaceModeEnabled(True) called after last segment deleted
+# ─────────────────────────────────────────────────────────────────────
+
+class _NopPointHandler(_PointHandlerBase):
+    """PointHandler with Qt-free _on_detach for pure-Python unit tests."""
+    def _on_detach(self, widget):
+        pass
+
+
+class _ExtendedFakeRecorder(_FakeRecorder):
+    """_FakeRecorder that also handles record_tool_selected (called by detach)."""
+    def record_tool_selected(self, tool, segment_id=None):
+        pass
+
+    def record_action(self, name):
+        pass
+
+
+class _DeleteLogic:
+    def delete_segment_prompt_nodes(self, seg_node, segment_id):
+        pass
+
+    def remove_segment(self, seg_node, segment_id):
+        seg_node.GetSegmentation().remove(segment_id)
+
+
+def _onremove_widget(seg_node, handler=None, prompt_widget=None):
+    """Minimal SegmentHumanBodyWidget stub for _onRemoveSegment testing."""
+    widget = SegmentHumanBodyWidget.__new__(SegmentHumanBodyWidget)
+    widget._recorder = _ExtendedFakeRecorder()
+    widget._active_handler = handler
+    widget._attaching_handler = None
+    widget._active_prompt_widget = prompt_widget
+    widget._suppressing_place_mode = False
+    widget.logic = _DeleteLogic()
+    widget._set_prompt_nodes = lambda pos, neg: None
+    widget._ensure_current_prompt_nodes = lambda: None
+    widget._record_action = lambda name: None
+
+    class _SegSelector:
+        def currentSegmentID(self_):
+            seg = seg_node.GetSegmentation()
+            return seg.GetNthSegmentID(0) if seg.GetNumberOfSegments() else ''
+        def setCurrentSegmentID(self_, id_):
+            pass
+
+    class _FakeRemoveUI:
+        segmentSelector = _SegSelector()
+        segmentationNodeSelector = type(
+            '_N', (), {'currentNode': lambda self_: seg_node})()
+
+    widget.ui = _FakeRemoveUI()
+    return widget
+
+
+def test_configure_unlimited_placement_not_called_when_nodes_are_none(monkeypatch):
+    """F-1 regression: _configureUnlimitedPlacement must not fire when nodes are None.
+
+    Calling it with a None-backed widget causes Slicer to auto-create a default
+    "F-1" fiducial node and silently activate placement mode.
+    """
+    configure_calls = []
+    monkeypatch.setattr(
+        SegmentHumanBodyWidget,
+        '_configureUnlimitedPlacement',
+        staticmethod(lambda mw: configure_calls.append(mw)),
+    )
+
+    widget = SegmentHumanBodyWidget.__new__(SegmentHumanBodyWidget)
+    widget._suppressing_place_mode = False
+
+    class _FakeMarkupWidget:
+        def setCurrentNode(self, node):
+            pass
+        def findChildren(self, t):
+            return []
+
+    class _FakeUI:
+        positivePrompts = _FakeMarkupWidget()
+        negativePrompts = _FakeMarkupWidget()
+
+    widget.ui = _FakeUI()
+    widget._prompt_place_states = lambda: [False, False]
+    widget._set_prompt_place_states = lambda s: None
+    widget._observe_prompt_node_for_recording = lambda n, is_negative: None
+
+    widget._set_prompt_nodes_preserving_place_mode(None, None)
+
+    assert configure_calls == [], (
+        'F-1 regression: _configureUnlimitedPlacement was called when both nodes '
+        'are None — this creates a spurious Slicer "F-1" fiducial node'
+    )
+
+
+def test_set_prompt_nodes_forces_place_states_off_when_no_handler_active(monkeypatch):
+    """No-tool regression: segment delete must not auto-switch cursor to point mode.
+
+    When _active_handler is not PointHandler, _set_prompt_nodes must pass
+    force_states=[False, False] so programmatic node rewiring cannot re-activate
+    placement mode through a deferred Qt signal.
+    """
+    calls = []
+
+    def _spy(pos_node, neg_node, force_states=None):
+        calls.append(force_states)
+
+    widget = SegmentHumanBodyWidget.__new__(SegmentHumanBodyWidget)
+    widget._active_handler = None
+    widget._set_prompt_nodes_preserving_place_mode = _spy
+
+    widget._set_prompt_nodes(None, None)
+
+    assert calls == [[False, False]], (
+        'no-tool regression: _set_prompt_nodes did not pass force_states=[False, False] '
+        'when no handler is active — segment deletion auto-activates point mode'
+    )
+
+
+def test_remove_last_segment_with_point_handler_does_not_reactivate_place_mode():
+    """Qt-error regression: setPlaceModeEnabled(True) must not be called when no segment remains.
+
+    Deleting the last segment while PointHandler is active used to call
+    setPlaceModeEnabled(True) unconditionally in the finally block, which raised:
+      "[Qt] void qSlicerMarkupsPlaceWidget::setPlaceModeEnabled(bool) activate failed:
+       Markups module logic, scene, or interaction node is invalid"
+    """
+    activate_calls = []
+
+    class _TrackingPlaceWidget:
+        def setPlaceModeEnabled(self, active):
+            if active:
+                activate_calls.append(True)
+
+    class _TrackingPromptWidget:
+        def findChildren(self, t):
+            return [_TrackingPlaceWidget()]
+
+    seg_node = _FakeSegNode()
+    seg_node.GetSegmentation().add('seg-a', 'Femur')
+
+    handler = _NopPointHandler()
+    widget = _onremove_widget(
+        seg_node, handler=handler, prompt_widget=_TrackingPromptWidget())
+
+    SegmentHumanBodyWidget._onRemoveSegment(widget)
+
+    assert activate_calls == [], (
+        'Qt error regression: setPlaceModeEnabled(True) called after deleting '
+        'the last segment with PointHandler active'
+    )

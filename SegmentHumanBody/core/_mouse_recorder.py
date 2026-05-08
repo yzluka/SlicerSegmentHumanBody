@@ -3,9 +3,8 @@
 Mouse events are recorded only when they occur inside a Slicer slice view and
 the event VTK device XY maps inside the active volume through the same
 XY-to-IJK route used by Slicer DataProbe. UI-panel movement is therefore
-ignored. The recording is not a general UI macro; it captures the
-mouse trajectory in 3D relative to the volume, the active handler/tool and its
-parameters, mouse-triggered semantic actions, and segmentation-changing hotkeys.
+ignored. The recording is not a general UI macro; raw export captures original
+mouse/source facts only. Semantic reconstruction belongs to TimeLogInterpreter.
 """
 
 import collections
@@ -36,6 +35,7 @@ SESSION_STOP           = 'session_stop'
 SEGMENT_CREATED        = 'segment_created'
 SEGMENT_REMOVED        = 'segment_removed'
 SEGMENT_RENAMED        = 'segment_renamed'
+SEGMENT_SELECTED       = 'segment_selected'
 VOLUME_CHANGED         = 'volume_changed'
 MODEL_FAMILY_CHANGED   = 'model_family_changed'
 MODEL_VARIANT_CHANGED  = 'model_variant_changed'
@@ -55,6 +55,14 @@ TOOL_SELECTED          = 'tool_selected'
 
 EXPORT_TYPE            = 'SegmentHumanBody.annotation_process'
 VTK_OBSERVER_PRIORITY  = 1000.0
+
+MOUSE_EVENT            = 'mouse'
+MOUSE_PRESS            = 'press'
+MOUSE_HOLD             = 'hold'
+MOUSE_RELEASE          = 'release'
+MOUSE_IDLE             = 'idle'
+BOUNDARY_EVENT         = 'boundary_event'
+TRAJECTORY_EVENT       = 'trajectory_event'
 
 MOVE_ANNOTATION_TARGET_IJK = 0.5
 MOVE_HOVER_TARGET_IJK      = 2.0
@@ -128,43 +136,42 @@ class _SliceRecordInteractorObserver:
         try:
             x, y = caller.GetEventPosition()
             xy = [int(x), int(y)]
-            xy_global = _qt_cursor_global_xy()
             if event_name == 'MouseMoveEvent':
-                self._on_mouse(self._view_name, xy, MOVE, _with_xy_global({
+                self._on_mouse(self._view_name, xy, MOVE, {
                     'mouse_status': 'move',
                     'left_button_down': self._left_down or _left_button_is_down(),
                     'input_source': 'vtk_interactor',
                     'xy_source': 'vtk_device',
                     'analysis_event_type': 'trajectory_event',
-                }, xy_global))
+                })
             elif event_name == 'LeftButtonPressEvent':
                 self._left_down = True
-                self._on_mouse(self._view_name, xy, PRESS, _with_xy_global({
+                self._on_mouse(self._view_name, xy, PRESS, {
                     'mouse_status': 'press',
                     'left_button_down': True,
                     'input_source': 'vtk_interactor',
                     'xy_source': 'vtk_device',
                     'analysis_event_type': 'boundary_event',
-                }, xy_global))
+                })
             elif event_name == 'LeftButtonReleaseEvent':
-                self._on_mouse(self._view_name, xy, RELEASE, _with_xy_global({
+                self._on_mouse(self._view_name, xy, RELEASE, {
                     'mouse_status': 'release',
                     'left_button_down': False,
                     'input_source': 'vtk_interactor',
                     'xy_source': 'vtk_device',
                     'analysis_event_type': 'boundary_event',
-                }, xy_global))
+                })
                 self._left_down = False
             elif event_name in ('MouseWheelForwardEvent', 'MouseWheelBackwardEvent'):
                 delta = 120 if event_name == 'MouseWheelForwardEvent' else -120
-                self._on_mouse(self._view_name, xy, VIEW_CHANGED, _with_xy_global({
+                self._on_mouse(self._view_name, xy, VIEW_CHANGED, {
                     'mouse_status': 'view',
                     'view_event': 'wheel',
                     'wheel_delta': [0, delta],
                     'input_source': 'vtk_interactor',
                     'xy_source': 'vtk_device',
-                    'analysis_event_type': 'trajectory_event',
-                }, xy_global))
+                    'analysis_event_type': 'boundary_event',
+                })
         except Exception as exc:
             log.error('[SliceRecordInteractorObserver] %s', exc)
 
@@ -214,6 +221,7 @@ class MouseEventRecorder:
     SEGMENT_CREATED        = SEGMENT_CREATED
     SEGMENT_REMOVED        = SEGMENT_REMOVED
     SEGMENT_RENAMED        = SEGMENT_RENAMED
+    SEGMENT_SELECTED       = SEGMENT_SELECTED
     VOLUME_CHANGED         = VOLUME_CHANGED
     MODEL_FAMILY_CHANGED   = MODEL_FAMILY_CHANGED
     MODEL_VARIANT_CHANGED  = MODEL_VARIANT_CHANGED
@@ -242,12 +250,14 @@ class MouseEventRecorder:
         self._last_recorded_move_state = None
         self._last_sampled_move_key = None
         self._last_boundary_key = None
+        self._last_mouse_boundary_by_view = {}
         self._active_mouse_press = False
         self._last_point_drag_ts: datetime.datetime | None = None
         self._active_brush_stroke_params = None
         self._pending_brush_params_record = None
         self._volume_node = None
         self._active_region_gate = None
+        self._bound_tool_context = {'tool': None}
         self.context_fn = None
         self.on_record_appended = None
         self._next_event_id = 1
@@ -274,6 +284,9 @@ class MouseEventRecorder:
             self._start_move_timer()
         hz = round(1000.0 / self._move_interval_ms)
         initial_visual_state = _all_slice_visual_state(volume_node)
+        initial_handler_context = self._all_handler_context()
+        self._bound_tool_context = _initial_bound_tool_context(
+            initial_handler_context)
         metadata = {
             'volume': _volume_metadata(volume_node),
             'segmentation': segmentation_name,
@@ -283,21 +296,16 @@ class MouseEventRecorder:
             'recorder_style': 'event_listener',
             'started_with_left_button_down': self._active_mouse_press,
             'initial_visual_state': initial_visual_state,
-            'initial_handler_context': self._all_handler_context(),
+            'initial_handler_context': initial_handler_context,
             'mouse_xy_system': 'vtk_device_dataprobe',
             'interpreted_coordinate_system': 'IJK',
-            'ras_system': 'world_RAS',
-            'ras_sources': {
+            'mouse_state_terms': [MOUSE_PRESS, MOUSE_HOLD,
+                                  MOUSE_RELEASE, MOUSE_IDLE],
+            'coordinate_sources': {
                 'cursor': (
-                    'VTK interactor GetEventPosition device XY interpreted by '
-                    'sliceView.convertDeviceToXYZ() and background layer '
-                    'GetXYToIJKTransform(), matching Slicer DataProbe; initial '
-                    'and per-view-change xy_to_ijk matrices are in '
-                    'initial_visual_state'
-                ),
-                'markup_world': (
-                    'vtkMRMLMarkupsFiducialNode.GetNthControlPointPositionWorld(); '
-                    'actual 3D placement position after Slicer crosshair/picking'
+                    'VTK interactor GetEventPosition device XY interpreted '
+                    'with the per-view xy_to_ijk matrices stored once in '
+                    'metadata.initial_visual_state.'
                 ),
             },
         }
@@ -321,11 +329,13 @@ class MouseEventRecorder:
         self._last_recorded_move_state = None
         self._last_sampled_move_key = None
         self._last_boundary_key = None
+        self._last_mouse_boundary_by_view = {}
         self._active_mouse_press = False
         self._last_point_drag_ts = None
         self._active_brush_stroke_params = None
         self._pending_brush_params_record = None
         self._active_region_gate = None
+        self._bound_tool_context = {'tool': None}
         self._next_event_id = 1
 
     def record_action(self, name: str):
@@ -335,24 +345,65 @@ class MouseEventRecorder:
                              segment_id: str | None = None):
         if not self._active:
             return
-        payload = {'tool': tool}
-        if segment_id:
+        self._bound_tool_context = {'tool': tool}
+        if segment_id is not None:
+            self._bound_tool_context['segment_id'] = segment_id
+        payload = {'tool': tool, 'analysis_event_type': BOUNDARY_EVENT}
+        if segment_id is not None:
             payload['segment_id'] = segment_id
         self._append(TOOL_SELECTED, None, payload)
 
     def record_segment_created(self, segment_id: str, seg_name: str):
-        # Segment creation is intentionally not part of the current process log.
-        return
+        payload = self._source_context_payload()
+        payload.update({
+            'segment_id': segment_id,
+            'seg_name': seg_name,
+            'analysis_event_type': BOUNDARY_EVENT,
+        })
+        self._append(SEGMENT_CREATED, None, payload)
 
     def record_volume_changed(self, volume_name: str | None):
-        self._append(VOLUME_CHANGED, None, {'volume': volume_name})
+        payload = self._source_context_payload()
+        payload.update({
+            'volume': volume_name,
+            'analysis_event_type': BOUNDARY_EVENT,
+        })
+        self._append(VOLUME_CHANGED, None, payload)
 
     def set_volume_node(self, volume_node):
         self._volume_node = volume_node
+        self._update_metadata_volume(volume_node)
         self._active_region_gate = _ActiveRegionGate({
             'volume': _volume_metadata(volume_node),
             'initial_visual_state': _all_slice_visual_state(volume_node),
         })
+
+    def refresh_visual_state(self):
+        """Re-sample xy_to_ijk matrices after slice views finish updating."""
+        visual_state = _all_slice_visual_state(self._volume_node)
+        for idx, record in enumerate(self._records):
+            if record.event_type != METADATA:
+                continue
+            payload = dict(record.payload or {})
+            payload['initial_visual_state'] = visual_state
+            self._records[idx] = record._replace(payload=payload)
+            self._active_region_gate = _ActiveRegionGate({
+                'volume': payload.get('volume'),
+                'initial_visual_state': visual_state,
+            })
+            return
+
+    def _update_metadata_volume(self, volume_node):
+        volume = _volume_metadata(volume_node)
+        visual_state = _all_slice_visual_state(volume_node)
+        for idx, record in enumerate(self._records):
+            if record.event_type != METADATA:
+                continue
+            payload = dict(record.payload or {})
+            payload['volume'] = volume
+            payload['initial_visual_state'] = visual_state
+            self._records[idx] = record._replace(payload=payload)
+            return
 
     def record_model_family_changed(self, family: str):
         self._append(MODEL_FAMILY_CHANGED, None, {'family': family})
@@ -376,15 +427,34 @@ class MouseEventRecorder:
         self._record_or_buffer_brush_params(payload)
 
     def record_segment_removed(self, segment_id: str, seg_name: str):
-        self._append(SEGMENT_REMOVED, None, {
-            'segment_id': segment_id, 'seg_name': seg_name})
+        payload = self._source_context_payload()
+        payload.update({
+            'segment_id': segment_id,
+            'seg_name': seg_name,
+            'analysis_event_type': BOUNDARY_EVENT,
+        })
+        self._append(SEGMENT_REMOVED, None, payload)
 
     def record_segment_renamed(self, segment_id: str, old_name: str, new_name: str):
-        self._append(SEGMENT_RENAMED, None, {
+        payload = self._source_context_payload()
+        payload.update({
             'segment_id': segment_id,
             'old_name': old_name,
             'new_name': new_name,
+            'analysis_event_type': BOUNDARY_EVENT,
         })
+        self._append(SEGMENT_RENAMED, None, payload)
+
+    def record_segment_selected(self, segment_id: str | None, seg_name: str | None = None):
+        self._bound_tool_context['segment_id'] = segment_id
+        payload = self._source_context_payload()
+        payload.update({
+            'segment_id': segment_id,
+            'analysis_event_type': BOUNDARY_EVENT,
+        })
+        if seg_name:
+            payload['seg_name'] = seg_name
+        self._append(SEGMENT_SELECTED, None, payload)
 
     def record_point_placed(self, segment_id: str, ras: list, is_negative: bool,
                             view_name: str | None = None, point_index=None,
@@ -405,6 +475,7 @@ class MouseEventRecorder:
             payload['view_name'] = view_name
             payload['handler'] = 'point'
             payload['handler_params'] = {}
+            self._attach_last_mouse_boundary(payload, view_name, RELEASE)
         payload['analysis_event_type'] = 'boundary_event'
         payload['mouse_status'] = 'release'
         payload['point_action'] = 'place'
@@ -416,14 +487,17 @@ class MouseEventRecorder:
     def record_point_removed(self, segment_id: str, ras: list | None,
                              is_negative: bool, view_name: str | None = None,
                              point_index=None, point_id: str | None = None,
-                             point_name: str | None = None):
+                             point_name: str | None = None,
+                             mouse_pressed: bool = False):
+        boundary = PRESS if mouse_pressed else RELEASE
         payload = {
             'segment_id': segment_id,
             'is_negative': bool(is_negative),
             'handler': 'point',
             'handler_params': {},
             'analysis_event_type': 'boundary_event',
-            'mouse_status': 'release',
+            'mouse_status': 'press' if mouse_pressed else 'release',
+            'mouse_pressed': bool(mouse_pressed),
             'point_action': 'remove',
             'ras_source': 'markup_world',
             'trajectory_kind': None,
@@ -439,6 +513,7 @@ class MouseEventRecorder:
             payload['point_name'] = point_name
         if view_name:
             payload['view_name'] = view_name
+            self._attach_last_mouse_boundary(payload, view_name, boundary)
         self._append(POINT_REMOVED, list(ras) if ras is not None else None, payload)
 
     def record_point_drag(self, phase: str, segment_id: str, ras: list,
@@ -497,6 +572,8 @@ class MouseEventRecorder:
             payload['point_name'] = point_name
         if view_name:
             payload['view_name'] = view_name
+            boundary = RELEASE if event_type == POINT_REPLACED else PRESS
+            self._attach_last_mouse_boundary(payload, view_name, boundary)
         self._records.append(self._new_record(
             now, list(ras), event_type, payload))
         self._notify_record_appended()
@@ -532,36 +609,22 @@ class MouseEventRecorder:
         return metadata_record, metadata
 
     def export_interpreted_data(self) -> dict:
-        """Semantic process log: free_move, brush_move, point_placement, point_move etc.
-        Uses absolute timestamps. Press/release boundaries and drag intermediates omitted."""
-        _, metadata = self._export_metadata_block()
-        ras_to_ijk = _ras_to_ijk_matrix(metadata)
-        dims = _volume_dims_from_metadata(metadata)
-        spacing = _volume_spacing_from_metadata(metadata)
-        context = _ExportContext(metadata)
-        events = []
-        export_id = 1
-        for record in _records_for_compact_export(self._records):
-            prepared = context.prepare(record)
-            if not _record_inside_active_volume(prepared, ras_to_ijk, dims):
-                continue
-            ev = _interpreted_event(prepared, ras_to_ijk, export_id, spacing)
-            if ev is not None:
-                events.append(ev)
-                export_id += 1
-        return {
-            'type': EXPORT_TYPE,
-            'metadata': metadata,
-            'events': events,
-        }
+        """Semantic process log derived only from the exported raw log."""
+        from core.TimeLogInterpreter import TimeLogInterpreter
+        return TimeLogInterpreter(self.export_raw_data()).export()
 
     def export_raw_data(self) -> dict:
-        """Raw mouse signal log: press, release, move, view_changed.
-        Uses absolute timestamps. No semantic classification."""
+        """Raw source log.
+
+        Mouse entries keep only original device XY, view, slice, button state,
+        and sparse context deltas. Source entries keep tool/segment/point facts.
+        RAS/IJK and semantic classification are intentionally absent here.
+        """
         _, metadata = self._export_metadata_block()
         active_region = _ActiveRegionGate(metadata)
         context = _RawExportContext(metadata)
         events = []
+        pending_trajectory = None
         for record in self._records:
             if record.event_type == METADATA:
                 continue
@@ -569,7 +632,10 @@ class MouseEventRecorder:
                 continue
             ev = _raw_event(record, context)
             if ev is not None:
-                events.append(ev)
+                pending_trajectory = _append_raw_export_event(
+                    events, pending_trajectory, ev)
+        if pending_trajectory is not None:
+            events.append(pending_trajectory)
         return {
             'type': 'SegmentHumanBody.raw_input',
             'metadata': metadata,
@@ -739,10 +805,7 @@ class MouseEventRecorder:
         gate = self._active_region_gate
         if gate is None:
             return True
-        visual_state = None
-        if event_type in (PRESS, VIEW_CHANGED):
-            visual_state = _visual_state(view_name, self._volume_node)
-        return gate.accepts_xy(view_name, xy_local, visual_state=visual_state)
+        return gate.accepts_xy(view_name, xy_local)
 
     def _note_mouse_button_state(self, event_type):
         if event_type == PRESS:
@@ -754,7 +817,7 @@ class MouseEventRecorder:
 
     def _capture_pending_move(self, timestamp, view_name, xy_local, extra=None):
         payload = self._raw_mouse_payload(
-            view_name, xy_local, MOVE, extra, include_context=False)
+            view_name, xy_local, MOVE, extra)
         self._pending_move_sample = (timestamp, view_name, None, payload)
 
     def _sample_pending_move(self):
@@ -767,28 +830,32 @@ class MouseEventRecorder:
 
     def _append_mouse_record(self, timestamp, view_name, xy_local, event_type,
                              extra=None, dedupe=False):
-        include_context = event_type in (PRESS, RELEASE)
-        include_visual = event_type in (PRESS, VIEW_CHANGED)
         payload = self._raw_mouse_payload(
-            view_name, xy_local, event_type, extra,
-            include_context=include_context,
-            include_visual=include_visual)
+            view_name, xy_local, event_type, extra)
         ras = None
         self._append_prepared_mouse_record(
             timestamp, view_name, ras, event_type, payload, dedupe=dedupe)
 
-    def _raw_mouse_payload(self, view_name, xy_local, event_type, extra=None,
-                           include_context=False, include_visual=False):
-        payload = self._event_payload(view_name) if include_context else {
-            'view_name': view_name,
-        }
+    def _raw_mouse_payload(self, view_name, xy_local, event_type, extra=None):
+        payload = {'view_name': view_name}
+        payload.update(self._bound_tool_payload())
+        if event_type == VIEW_CHANGED:
+            payload.update(self._view_change_payload(view_name))
         if extra:
             payload.update(extra)
         payload['view_name'] = view_name
         payload['xy'] = [int(round(float(xy_local[0]))),
                          int(round(float(xy_local[1])))]
-        if include_visual:
-            payload['visual_state'] = _visual_state(view_name, self._volume_node)
+        payload['mouse_state'] = _mouse_state_from_payload(
+            event_type, payload, self._active_mouse_press)
+        payload['analysis_event_type'] = (
+            BOUNDARY_EVENT
+            if (
+                event_type == VIEW_CHANGED or
+                payload['mouse_state'] in (MOUSE_PRESS, MOUSE_RELEASE)
+            )
+            else TRAJECTORY_EVENT
+        )
         if event_type == MOVE:
             payload['mouse_button_state'] = (
                 'pressed'
@@ -796,6 +863,9 @@ class MouseEventRecorder:
                 else 'released'
             )
         return payload
+
+    def _view_change_payload(self, view_name):
+        return self._event_payload(view_name)
 
     def _append_prepared_mouse_record(self, timestamp, view_name, ras, event_type,
                                       payload, dedupe=False):
@@ -818,11 +888,13 @@ class MouseEventRecorder:
         if event_type == PRESS:
             self._active_mouse_press = True
             self._active_brush_stroke_params = _brush_param_state(payload)
+            self._remember_mouse_boundary(timestamp, view_name, payload)
             self._remember_boundary(timestamp, view_name, ras, event_type, payload)
         elif event_type == RELEASE:
             self._active_mouse_press = False
             self._active_brush_stroke_params = None
             self._pending_brush_params_record = None
+            self._remember_mouse_boundary(timestamp, view_name, payload)
             self._remember_boundary(timestamp, view_name, ras, event_type, payload)
         self._notify_record_appended()
         return True
@@ -870,22 +942,29 @@ class MouseEventRecorder:
         }
 
     def _is_duplicate_boundary(self, timestamp, view_name, ras, event_type, payload):
-        if event_type not in (PRESS, RELEASE):
-            return False
-        last = self._last_boundary_key
-        if last is None:
-            return False
-        key = _boundary_key(view_name, ras, event_type, payload)
-        last_key, last_ts = last
-        if key != last_key:
-            return False
-        return (timestamp - last_ts).total_seconds() * 1000.0 <= 100.0
+        return False
 
     def _remember_boundary(self, timestamp, view_name, ras, event_type, payload):
         self._last_boundary_key = (
             _boundary_key(view_name, ras, event_type, payload),
             timestamp,
         )
+
+    def _remember_mouse_boundary(self, timestamp, view_name, payload):
+        if not view_name or payload.get('xy') is None:
+            return
+        entry = {
+            'timestamp': timestamp.isoformat(timespec='milliseconds'),
+            'mouse_state': payload.get('mouse_state'),
+            'xy': list(payload.get('xy')),
+        }
+        self._last_mouse_boundary_by_view[view_name] = entry
+
+    def _attach_last_mouse_boundary(self, payload, view_name, expected_state):
+        boundary = self._last_mouse_boundary_by_view.get(view_name)
+        if not boundary or boundary.get('mouse_state') != expected_state:
+            return
+        payload['mouse_boundary'] = dict(boundary)
 
     def _start_move_timer(self):
         if self._move_timer is not None:
@@ -912,6 +991,17 @@ class MouseEventRecorder:
         payload['handler_params'] = _handler_params(payload)
         payload.setdefault('analysis_event_type', None)
         return payload
+
+    def _bound_tool_payload(self):
+        payload = dict(self._bound_tool_context)
+        if 'tool' in payload:
+            payload['handler'] = payload.get('tool')
+        return payload
+
+    def _source_context_payload(self):
+        if not callable(self.context_fn):
+            return {}
+        return self._event_payload(None)
 
     def _all_handler_context(self):
         if not callable(self.context_fn):
@@ -1000,6 +1090,19 @@ def _ras_to_ijk_matrix(metadata):
     return m if (m is not None and len(m) == 16) else None
 
 
+def _initial_bound_tool_context(initial_handler_context):
+    for view_name in ('Red', 'Green', 'Yellow'):
+        payload = (initial_handler_context or {}).get(view_name) or {}
+        tool = payload.get('handler') or payload.get('tool')
+        if tool is None:
+            continue
+        context = {'tool': tool}
+        if payload.get('segment_id') is not None:
+            context['segment_id'] = payload.get('segment_id')
+        return context
+    return {'tool': None}
+
+
 def _volume_dims_from_metadata(metadata):
     dims = ((metadata or {}).get('volume') or {}).get('dimensions')
     return dims if dims is not None and len(dims) >= 3 else None
@@ -1036,6 +1139,23 @@ def _xy_to_ijk_from_matrix(xy, mat16):
         mat16[4] * x + mat16[5] * y + mat16[7],
         mat16[8] * x + mat16[9] * y + mat16[11],
     ]
+
+
+def _mouse_state_from_payload(event_type, payload, active_mouse_press):
+    if event_type == PRESS:
+        return MOUSE_PRESS
+    if event_type == RELEASE:
+        return MOUSE_RELEASE
+    if event_type == MOVE:
+        pressed = (
+            payload.get('left_button_down') or
+            payload.get('mouse_button_state') == 'pressed' or
+            active_mouse_press
+        )
+        return MOUSE_HOLD if pressed else MOUSE_IDLE
+    return MOUSE_HOLD if (
+        payload.get('left_button_down') or active_mouse_press
+    ) else MOUSE_IDLE
 
 
 def _ras_inside_volume_matrix(ras, ras_to_ijk, dims):
@@ -1204,6 +1324,10 @@ class _ExportContext:
         if record.event_type == BRUSH_PARAMETERS_CHANGED:
             self._update_handler_context(payload)
             return record._replace(payload=payload)
+        if record.event_type in (
+                POINT_PLACED, POINT_REPLACED, POINT_REMOVED,
+                POINT_DRAG_START, POINT_DRAG_MOVE):
+            return self._enrich_cursor_record(record, payload)
         if record.event_type == MOVE:
             enriched = self._enrich_cursor_record(record, payload)
             self._note_brush_move(enriched)
@@ -1297,7 +1421,25 @@ class _ExportContext:
 
 
 _RAW_MOUSE_TYPES = (
-    PRESS, RELEASE, MOVE, VIEW_CHANGED, BRUSH_PARAMETERS_CHANGED,
+    PRESS, RELEASE, MOVE, VIEW_CHANGED,
+)
+
+_RAW_SOURCE_TYPES = (
+    TOOL_SELECTED,
+    BRUSH_PARAMETERS_CHANGED,
+    SEGMENT_CREATED,
+    SEGMENT_REMOVED,
+    SEGMENT_RENAMED,
+    SEGMENT_SELECTED,
+    VOLUME_CHANGED,
+    MODEL_FAMILY_CHANGED,
+    MODEL_VARIANT_CHANGED,
+    MODEL_CONFIRMED,
+    POINT_PLACED,
+    POINT_REPLACED,
+    POINT_REMOVED,
+    POINT_DRAG_START,
+    POINT_DRAG_MOVE,
 )
 
 _INTERPRETED_TYPE_MAP = {
@@ -1305,7 +1447,7 @@ _INTERPRETED_TYPE_MAP = {
     POINT_REPLACED:  'point_move',
     POINT_REMOVED:   'point_removed',
     BRUSH_PARAMETERS_CHANGED: 'brush_parameters',
-    BRUSH_CLICK: 'brush_click',
+    BRUSH_CLICK:     'brush_click',
 }
 
 _POINT_VERDICT_TYPES = (POINT_PLACED, POINT_REPLACED, POINT_REMOVED)
@@ -1414,14 +1556,21 @@ def _event_add_ijk(event_dict, record, ras_to_ijk):
 
 
 def _raw_event(record, context=None) -> dict | None:
-    """Raw input signal: original view/slice/global-XY mouse facts only."""
-    if record.event_type not in _RAW_MOUSE_TYPES:
+    """Raw input/source signal in the current no-back-compat format."""
+    if record.event_type not in _RAW_MOUSE_TYPES + _RAW_SOURCE_TYPES:
         return None
     payload = record.payload or {}
+    event_name = (
+        MOUSE_EVENT if record.event_type in (PRESS, RELEASE, MOVE)
+        else record.event_type
+    )
     ev = {
         'timestamp': record.timestamp.isoformat(timespec='milliseconds'),
-        'event': record.event_type,
+        'event': event_name,
     }
+    analysis_event_type = payload.get('analysis_event_type')
+    if analysis_event_type:
+        ev['event_type'] = analysis_event_type
     view = payload.get('view_name')
     if view:
         ev['view'] = view
@@ -1431,23 +1580,33 @@ def _raw_event(record, context=None) -> dict | None:
     )
     if slice_idx is not None:
         ev['slice'] = int(slice_idx)
+        ev['z'] = int(slice_idx)
     if payload.get('xy') is not None:
         ev['xy'] = [int(v) for v in payload['xy']]
-    if payload.get('xy_global') is not None:
-        ev['xy_global'] = [int(v) for v in payload['xy_global']]
-    if record.event_type == PRESS:
-        ev['pressed'] = 1
-    elif record.event_type == RELEASE:
-        ev['pressed'] = 0
-    elif record.event_type == MOVE:
-        state = payload.get('mouse_button_state')
-        if state is None:
-            state = 'pressed' if payload.get('left_button_down') else 'released'
-        ev['pressed'] = 1 if state == 'pressed' else 0
+    if record.event_type in (PRESS, RELEASE, MOVE):
+        ev['mouse_state'] = payload.get('mouse_state') or _mouse_state_from_payload(
+            record.event_type, payload, False)
+        _copy_mouse_binding_fields(ev, payload)
+        return ev
+    if record.event_type in (
+            TOOL_SELECTED,
+            SEGMENT_CREATED, SEGMENT_REMOVED, SEGMENT_RENAMED,
+            SEGMENT_SELECTED, VOLUME_CHANGED,
+            MODEL_FAMILY_CHANGED, MODEL_VARIANT_CHANGED, MODEL_CONFIRMED,
+            POINT_PLACED, POINT_REPLACED, POINT_REMOVED,
+            POINT_DRAG_START, POINT_DRAG_MOVE):
+        ev.setdefault('event_type', BOUNDARY_EVENT)
+        _copy_raw_payload_fields(ev, payload)
+        return ev
     if record.event_type == VIEW_CHANGED:
+        ev.setdefault('event_type', TRAJECTORY_EVENT)
+        ev['mouse_state'] = payload.get('mouse_state') or (
+            MOUSE_HOLD if payload.get('left_button_down') else MOUSE_IDLE)
+        _copy_mouse_binding_fields(ev, payload)
         if payload.get('wheel_delta') is not None:
             ev['wheel_delta'] = payload['wheel_delta']
     if record.event_type == BRUSH_PARAMETERS_CHANGED:
+        ev.setdefault('event_type', BOUNDARY_EVENT)
         fields = _brush_param_export_fields(payload, raw=True)
         if context is not None:
             context.note_slice(payload)
@@ -1469,6 +1628,107 @@ def _raw_event(record, context=None) -> dict | None:
         context.note_slice(payload)
     ev.update(delta)
     return ev
+
+
+def _append_raw_export_event(events, pending_trajectory, ev):
+    if not _is_mergeable_mouse_trajectory(ev):
+        if pending_trajectory is not None:
+            events.append(pending_trajectory)
+        events.append(ev)
+        return None
+    if (
+        pending_trajectory is None or
+        _trajectory_merge_key(pending_trajectory) != _trajectory_merge_key(ev)
+    ):
+        if pending_trajectory is not None:
+            events.append(pending_trajectory)
+        return _new_raw_trajectory_event(ev)
+    _append_raw_trajectory_sample(pending_trajectory, ev)
+    return pending_trajectory
+
+
+def _is_mergeable_mouse_trajectory(ev):
+    return (
+        ev.get('event') == MOUSE_EVENT and
+        ev.get('event_type') == TRAJECTORY_EVENT and
+        ev.get('mouse_state') in (MOUSE_HOLD, MOUSE_IDLE) and
+        ev.get('xy') is not None
+    )
+
+
+def _new_raw_trajectory_event(ev):
+    merged = {
+        key: value
+        for key, value in ev.items()
+        if key not in ('timestamp', 'xy')
+    }
+    merged['timestamps'] = [ev['timestamp']]
+    merged['xy'] = [list(ev['xy'])]
+    return merged
+
+
+def _append_raw_trajectory_sample(merged, ev):
+    merged['timestamps'].append(ev['timestamp'])
+    merged['xy'].append(list(ev['xy']))
+
+
+def _trajectory_merge_key(ev):
+    return (
+        ev.get('event'),
+        ev.get('event_type'),
+        ev.get('mouse_state'),
+        ev.get('view'),
+        ev.get('slice'),
+        ev.get('tool'),
+        ev.get('segment'),
+        ev.get('diameter_mm'),
+    )
+
+
+def _copy_mouse_binding_fields(ev, payload):
+    if 'tool' in payload:
+        ev['tool'] = payload.get('tool')
+    elif 'handler' in payload:
+        ev['tool'] = payload.get('handler')
+    else:
+        ev['tool'] = None
+    if payload.get('segment_id') is not None:
+        ev['segment'] = payload.get('segment_id')
+    diameter_mm = _brush_diameter_mm(payload)
+    if diameter_mm is not None:
+        ev['diameter_mm'] = diameter_mm
+
+
+def _copy_raw_payload_fields(ev, payload):
+    field_map = (
+        ('segment_id', 'segment'),
+        ('seg_name', 'seg_name'),
+        ('old_name', 'old_name'),
+        ('new_name', 'new_name'),
+        ('volume', 'volume'),
+        ('family', 'family'),
+        ('variant', 'variant'),
+        ('point_id', 'point'),
+        ('point_name', 'point_name'),
+        ('point_index', 'point_index'),
+        ('is_negative', 'negative'),
+        ('point_action', 'point_action'),
+        ('point_drag_phase', 'point_drag_phase'),
+        ('mouse_pressed', 'mouse_pressed'),
+        ('sphere', 'sphere'),
+    )
+    if 'tool' in payload:
+        ev['tool'] = payload.get('tool')
+    elif 'handler' in payload:
+        ev['tool'] = payload.get('handler')
+    if payload.get('mouse_boundary') is not None:
+        ev['mouse_boundary'] = payload.get('mouse_boundary')
+    for src, dst in field_map:
+        if src in payload and payload.get(src) is not None:
+            ev[dst] = payload.get(src)
+    diameter_mm = _brush_diameter_mm(payload)
+    if diameter_mm is not None:
+        ev['diameter_mm'] = diameter_mm
 
 
 def _interpreted_event(record, ras_to_ijk, export_id, spacing=None) -> dict | None:
@@ -1495,6 +1755,8 @@ def _interpreted_event(record, ras_to_ijk, export_id, spacing=None) -> dict | No
     view = payload.get('view_name')
     if view:
         ev['view'] = view
+    if payload.get('slice_idx') is not None:
+        ev['z'] = int(payload.get('slice_idx'))
     seg = payload.get('segment_id')
     if seg:
         ev['segment'] = seg
@@ -1524,6 +1786,8 @@ def _interpreted_event(record, ras_to_ijk, export_id, spacing=None) -> dict | No
         for k in ('old_name', 'new_name'):
             if payload.get(k):
                 ev[k] = payload[k]
+    if interp_type == 'tool_selected':
+        ev['tool'] = payload.get('tool')  # None is meaningful: tool was deselected
     return ev
 
 
@@ -1580,7 +1844,8 @@ def _compact_event(record, start_ts, export_id=None) -> dict:
         event['ras'] = [float(v) for v in record.ras]
     _copy_compact(payload, event, 'view_name', 'view')
     _copy_compact(payload, event, 'xy', 'xy')
-    _copy_compact(payload, event, 'xy_global', 'xy_global')
+    if payload.get('slice_idx') is not None:
+        event['z'] = int(payload.get('slice_idx'))
     _copy_compact(payload, event, 'mouse_status', 'mouse')
     pressed = _compact_pressed_state(record.event_type, payload)
     if pressed is not None:
@@ -1738,21 +2003,6 @@ def _slice_interactor(slice_view):
     if slice_view is None:
         return None
     return slice_view.interactor()
-
-
-def _with_xy_global(payload, xy_global):
-    if xy_global is not None:
-        payload['xy_global'] = xy_global
-    return payload
-
-
-def _qt_cursor_global_xy():
-    if not hasattr(qt, 'QCursor'):
-        return None
-    try:
-        return _point_xy(qt.QCursor.pos())
-    except Exception:
-        return None
 
 
 def _point_xy(point):
