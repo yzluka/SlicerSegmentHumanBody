@@ -2,6 +2,7 @@ import qt, vtk, slicer
 import logging
 import numpy as np
 import vtk.util.numpy_support as _vtk_ns
+from contextlib import contextmanager
 from slicer.ScriptedLoadableModule import (
     ScriptedLoadableModule,
     ScriptedLoadableModuleWidget,
@@ -16,6 +17,19 @@ from core._mouse_recorder import get_recorder
 from core._input import StrokeHandler, BrushHandler, EraseHandler, PointHandler
 
 log = logging.getLogger(__name__)
+
+
+@contextmanager
+def _suppress_vtk_warnings():
+    previous = vtk.vtkObject.GetGlobalWarningDisplay()
+    vtk.vtkObject.GlobalWarningDisplayOff()
+    try:
+        yield
+    finally:
+        if previous:
+            vtk.vtkObject.GlobalWarningDisplayOn()
+        else:
+            vtk.vtkObject.GlobalWarningDisplayOff()
 
 # MRML parameter-node reference keys
 _INPUT_VOLUME = 'InputVolume'
@@ -77,6 +91,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._eof_widget            = None   # borrowed EffectsOptionsFrame
         self._eof_orig_parent       = None   # original parent to return it to
         self._active_handler        = None   # current InputHandler subclass instance
+        self._attaching_handler     = None   # set during InputHandler.attach() to suppress spurious detach events
         self._active_prompt_widget  = None   # positivePrompts or negativePrompts last activated
         self._suppressing_place_mode = False  # True while segment creation is in progress
         self._observed_segmentation = None   # vtkMRMLSegmentationNode being tracked
@@ -87,7 +102,9 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._active_point_drags = {}
         self._pending_point_confirmations = {}
         self._recorded_prompt_point_cache = {}
+        self._pending_drag_removals = {}
         self._syncing_parameter_node_to_ui = False
+        self._recording_saved = True
 
     # ------------------------------------------------------------------ #
     # Lifecycle                                                            #
@@ -121,7 +138,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.initializeParameterNode()
         self._update_record_ui()
         self._recorder.context_fn = self._recorder_context
-        self._recorder.on_record_appended = self._update_record_ui
+        self._recorder.on_record_appended = self._onRecorderAppended
         qt.QTimer.singleShot(0, self._preloadSegmentEditor)
 
     def cleanup(self):
@@ -130,6 +147,9 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.removeObservers()
         self._deactivateEffect()
         self._returnEffectsOptionsFrame()
+        for entry in list(self._pending_drag_removals.values()):
+            entry['timer'].stop()
+        self._pending_drag_removals.clear()
 
     def enter(self):
         self.initializeParameterNode()
@@ -172,8 +192,16 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         Negative is configured first so that positive ends up as the last-touched
         widget — Slicer makes the last setCurrentNode call the active placement target.
+        Place-mode states are preserved only when a PointHandler is currently active;
+        otherwise they are forced to [False, False] so programmatic node rewiring
+        (e.g. segment switch, segment delete) cannot accidentally re-activate
+        point-placement mode when no tool is selected.
         """
-        self._set_prompt_nodes_preserving_place_mode(pos_node, neg_node)
+        if isinstance(self._active_handler, PointHandler):
+            self._set_prompt_nodes_preserving_place_mode(pos_node, neg_node)
+        else:
+            self._set_prompt_nodes_preserving_place_mode(
+                pos_node, neg_node, force_states=[False, False])
 
     def _markup_place_widgets(self):
         """Return the inner place widgets for positive/negative prompt widgets."""
@@ -192,11 +220,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         for _, place in self._markup_place_widgets():
             active = False
             if place is not None and hasattr(place, 'placeModeEnabled'):
-                try:
-                    value = place.placeModeEnabled
-                    active = bool(value() if callable(value) else value)
-                except Exception:
-                    active = False
+                value = place.placeModeEnabled
+                active = bool(value() if callable(value) else value)
             states.append(active)
         return states
 
@@ -226,18 +251,23 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         finally:
             self._suppressing_place_mode = old
 
-    def _set_prompt_nodes_preserving_place_mode(self, pos_node, neg_node):
-        states = self._prompt_place_states()
+    def _set_prompt_nodes_preserving_place_mode(self, pos_node, neg_node,
+                                                 force_states=None):
+        states = force_states if force_states is not None else self._prompt_place_states()
         old = self._suppressing_place_mode
         self._suppressing_place_mode = True
         try:
             self.ui.negativePrompts.setCurrentNode(neg_node)
-            self._configureUnlimitedPlacement(self.ui.negativePrompts)
+            if neg_node is not None:
+                self._configureUnlimitedPlacement(self.ui.negativePrompts)
             self.ui.positivePrompts.setCurrentNode(pos_node)
-            self._configureUnlimitedPlacement(self.ui.positivePrompts)
+            if pos_node is not None:
+                self._configureUnlimitedPlacement(self.ui.positivePrompts)
+            # Restore inside suppression: place-state signals must never escape
+            # into _onPlaceModeChanged during programmatic node rewiring.
+            self._set_prompt_place_states(states)
         finally:
             self._suppressing_place_mode = old
-        self._set_prompt_place_states(states)
         self._observe_prompt_node_for_recording(pos_node, is_negative=False)
         self._observe_prompt_node_for_recording(neg_node, is_negative=True)
 
@@ -329,7 +359,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def _onParameterNodeModified(self, *_):
         if not self._parameterNode:
             return
-        if getattr(self, '_syncing_parameter_node_to_ui', False):
+        if self._syncing_parameter_node_to_ui:
             return
         self._syncing_parameter_node_to_ui = True
         try:
@@ -359,7 +389,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self._syncing_parameter_node_to_ui = False
 
     def _onNodeSelectorChanged(self, *_):
-        if getattr(self, '_syncing_parameter_node_to_ui', False):
+        if self._syncing_parameter_node_to_ui:
             return
         if not self._parameterNode:
             return
@@ -482,22 +512,54 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     # ------------------------------------------------------------------ #
 
     def onRecord(self, *_):
-        if self._recorder.is_active:
+        if not self._prepare_recording_restart():
             return
         place_states = self._prompt_place_states()
+        if self._recorder.is_active:
+            self._recorder.stop()
+        self._recorder.clear()
         vol = self._parameterNode.GetNodeReference(_INPUT_VOLUME) if self._parameterNode else None
         seg = self._parameterNode.GetNodeReference(_SEGMENTATION) if self._parameterNode else None
         self._recorder.start(
             volume_node       = vol,
             segmentation_name = seg.GetName() if seg else None,
-            record_non_annotative_movement = (
-                self.ui.recordNonAnnotativeMovementCheckBox.isChecked()
-                if hasattr(self.ui, 'recordNonAnnotativeMovementCheckBox')
-                else False
-            ),
         )
+        self._recording_saved = False
         self._update_record_ui()
         self._set_prompt_place_states(place_states)
+
+    def _prepare_recording_restart(self):
+        if len(self._recorder) <= 0 or self._recording_saved:
+            return True
+        choice = self._prompt_unsaved_recording()
+        if choice == 'discard':
+            return True
+        if choice == 'save':
+            return self._save_recording_to_user_path()
+        return False
+
+    def _prompt_unsaved_recording(self):
+        box = qt.QMessageBox()
+        box.setWindowTitle('Unsaved Recording')
+        box.setText('The current recording has not been saved.')
+        box.setInformativeText('Save it before starting a new recording?')
+        save_button = box.addButton('Save', qt.QMessageBox.AcceptRole)
+        discard_button = box.addButton('Discard', qt.QMessageBox.DestructiveRole)
+        cancel_button = box.addButton('Cancel', qt.QMessageBox.RejectRole)
+        box.setDefaultButton(save_button)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked == save_button:
+            return 'save'
+        if clicked == discard_button:
+            return 'discard'
+        if clicked == cancel_button:
+            return 'cancel'
+        return 'cancel'
+
+    def _onRecorderAppended(self):
+        self._recording_saved = False
+        self._update_record_ui()
 
     def _onRecordedVolumeChanged(self, node):
         if not self._recorder.is_active:
@@ -512,26 +574,36 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._update_record_ui()
 
     def onExportRecord(self, *_):
+        self._save_recording_to_user_path()
+
+    def _save_recording_to_user_path(self):
         if self._recorder.is_active:
             self._recorder.stop()
             self._update_record_ui()
         path = qt.QFileDialog.getSaveFileName(None, 'Save Recording', '', 'JSON files (*.json)')
         if not path:
-            return
+            return False
         if not path.endswith('.json'):
             path += '.json'
+        base = path[:-5] if path.endswith('.json') else path
         try:
             self._recorder.save_to_file(path)
-            slicer.util.infoDisplay(f'Recording saved to:\n{path}')
+            self._recording_saved = True
+            self._update_record_ui()
+            slicer.util.infoDisplay(
+                f'Recording saved:\n  {base}.json\n  {base}_raw.json')
+            return True
         except Exception as exc:
             slicer.util.errorDisplay(f'Failed to save recording:\n{exc}')
+            return False
 
     def _update_record_ui(self):
         ui        = self.ui
         is_active = self._recorder.is_active
         has_events = len(self._recorder) > 0
 
-        ui.recordButton.setVisible(not is_active)
+        ui.recordButton.setVisible(True)
+        ui.recordButton.setText('Restart Record' if has_events else 'Start Record')
         ui.stopRecordButton.setVisible(is_active)
         ui.exportRecordButton.setEnabled(is_active or has_events)
 
@@ -541,6 +613,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             status = f'Recorded: {len(self._recorder)} events'
         else:
             status = ''
+        if has_events and not self._recording_saved:
+            status = f'{status} (unsaved)' if status else 'Unsaved recording'
         ui.recordStatusLabel.setText(status)
 
     def _recorder_context(self, view_name=None) -> dict:
@@ -561,10 +635,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if tool in ('brush', 'erase'):
             editor = self.logic.get_segment_editor()
             pn_ed  = editor.mrmlSegmentEditorNode() if editor else None
-            try:
-                diam = float(pn_ed.GetAttribute('BrushAbsoluteDiameter') or 10)
-            except Exception:
-                diam = 10.0
+            diam = float(pn_ed.GetAttribute('BrushAbsoluteDiameter') or 10) if pn_ed else 10.0
             brush_radius_mm = diam / 2.0
         else:
             brush_radius_mm = None
@@ -583,10 +654,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         key = (node.GetID(), bool(is_negative))
         if key in self._recorded_prompt_node_ids:
             return
-        try:
-            defined_event = slicer.vtkMRMLMarkupsNode.PointPositionDefinedEvent
-        except Exception:
-            return
+        defined_event = slicer.vtkMRMLMarkupsNode.PointPositionDefinedEvent
         self.addObserver(
             node, defined_event,
             lambda caller, event_id, callData=None, neg=bool(is_negative):
@@ -618,28 +686,66 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def _onPromptPointDefinedForRecording(self, node, is_negative):
         if not self._recorder.is_active:
             return
+
+        drag_key = (node.GetID(), bool(is_negative))
+        pending_drag = self._pending_drag_removals.pop(drag_key, None)
+        if pending_drag is not None:
+            pending_drag['timer'].stop()
+            old_cached = pending_drag['cached']
+            old_idx = pending_drag['idx']
+            new_idx = self._last_defined_control_point_index(node)
+            if new_idx < 0:
+                return
+            seg_id = old_cached.get('segment_id')
+            if not seg_id:
+                raise RuntimeError(
+                    '_onPromptPointDefinedForRecording: drag cache missing segment_id')
+
+            def _confirm_drag(node=node, is_negative=is_negative, new_idx=new_idx,
+                              seg_id=seg_id, old_cached=old_cached, old_idx=old_idx):
+                if new_idx >= node.GetNumberOfControlPoints():
+                    return
+                if not self._is_control_point_defined(node, new_idx):
+                    return
+                ras = [0.0, 0.0, 0.0]
+                node.GetNthControlPointPositionWorld(new_idx, ras)
+                point_id = old_cached.get('point_id')
+                point_name = old_cached.get('point_name')
+                # Slicer's drag-as-remove+recreate shifts all surviving points
+                # at indices above old_idx down by one. Rebuild the cache to
+                # match the new index layout before adding the dragged point.
+                cache = self._recorded_prompt_point_cache
+                node_id = node.GetID()
+                neg = bool(is_negative)
+                shifted = {k: cache.pop(k) for k in list(cache)
+                           if k[0] == node_id and k[1] == neg and k[2] > old_idx}
+                for k, v in shifted.items():
+                    cache[(node_id, neg, k[2] - 1)] = v
+                self._cache_recorded_prompt_point(
+                    node, is_negative, new_idx, seg_id, ras, point_id, point_name)
+                self._recorder.record_point_drag(
+                    'end', seg_id, ras, bool(is_negative),
+                    view_name=self.currentViewName,
+                    point_index=old_idx,
+                    point_id=point_id,
+                    point_name=point_name)
+
+            qt.QTimer.singleShot(500, _confirm_drag)
+            return
+
         seg_id = self._segment_id_for_prompt_node(node)
         if not seg_id:
-            seg_id = self.ui.segmentSelector.currentSegmentID()
+            raise RuntimeError(
+                f'_onPromptPointDefinedForRecording: node {node.GetID()} '
+                'has no segment tag — was it created outside create_segment_prompt_nodes?')
         idx = self._last_defined_control_point_index(node)
         if idx < 0:
             return
         ras = [0.0, 0.0, 0.0]
-        try:
-            node.GetNthControlPointPositionWorld(idx, ras)
-        except Exception:
-            node.GetNthControlPointPosition(idx, ras)
+        node.GetNthControlPointPositionWorld(idx, ras)
         point_id = self._control_point_id(node, idx)
         point_name = self._control_point_name(node, idx)
-        self._cache_recorded_prompt_point(
-            node, is_negative, idx, seg_id, ras, point_id, point_name)
-        self._recorder.record_point_placed(
-            seg_id, list(ras), bool(is_negative), view_name=self.currentViewName,
-            point_index=idx, point_id=point_id, point_name=point_name,
-            point_action='place')
         key = (node.GetID(), bool(is_negative), idx)
-        if not hasattr(self, '_pending_point_confirmations'):
-            self._pending_point_confirmations = {}
         self._pending_point_confirmations[key] = {
             'segment_id': seg_id,
             'ras': list(ras),
@@ -648,8 +754,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             'point_id': point_id,
             'point_name': point_name,
             'view_name': self.currentViewName,
-            'confirmed': True,
         }
+        self._schedule_pending_point_confirmation(node, is_negative, idx)
 
     def _onPromptPointDragForRecording(self, node, is_negative, phase, callData=None):
         if not self._recorder.is_active:
@@ -662,32 +768,42 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             if idx < 0 or not self._is_control_point_defined(node, idx):
                 return
             pending_key = (node.GetID(), bool(is_negative), idx)
-            if pending_key in getattr(self, '_pending_point_confirmations', {}):
+            if pending_key in self._pending_point_confirmations:
                 # A just-created point is confirmed on release only. Minor
                 # press/release drift before that is placement motion, not a
                 # relocation of an existing point.
                 return
-            self._active_point_drags[key] = idx
         else:
             if key not in self._active_point_drags:
                 if phase == 'end':
                     self._confirm_pending_point(node, is_negative, idx)
                 return
-            idx = self._active_point_drags[key]
+            drag = self._active_point_drags[key]
+            idx = drag['idx'] if isinstance(drag, dict) else drag
         if idx >= node.GetNumberOfControlPoints():
             return
         if not self._is_control_point_defined(node, idx):
             return
         seg_id = self._segment_id_for_prompt_node(node)
         if not seg_id:
-            seg_id = self.ui.segmentSelector.currentSegmentID()
+            raise RuntimeError(
+                f'_onPromptPointDragForRecording: node {node.GetID()} '
+                'has no segment tag — was it created outside create_segment_prompt_nodes?')
         ras = [0.0, 0.0, 0.0]
-        try:
-            node.GetNthControlPointPositionWorld(idx, ras)
-        except Exception:
-            node.GetNthControlPointPosition(idx, ras)
+        node.GetNthControlPointPositionWorld(idx, ras)
         point_id = self._control_point_id(node, idx)
         point_name = self._control_point_name(node, idx)
+        if phase == 'start':
+            self._active_point_drags[key] = {
+                'idx': idx,
+                'start_ras': list(ras),
+            }
+        elif phase == 'end':
+            drag = self._active_point_drags.get(key)
+            start_ras = drag.get('start_ras') if isinstance(drag, dict) else None
+            if start_ras is not None and _ras_positions_close(start_ras, ras):
+                self._active_point_drags.pop(key, None)
+                return
         self._cache_recorded_prompt_point(
             node, is_negative, idx, seg_id, ras, point_id, point_name)
         self._recorder.record_point_drag(
@@ -697,8 +813,6 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self._active_point_drags.pop(key, None)
 
     def _confirm_pending_point(self, node, is_negative, idx):
-        if not hasattr(self, '_pending_point_confirmations'):
-            self._pending_point_confirmations = {}
         if idx < 0:
             idx = self._last_defined_control_point_index(node)
         pending = self._pending_point_confirmations.pop(
@@ -710,51 +824,94 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if not self._is_control_point_defined(node, idx):
             return
         ras = [0.0, 0.0, 0.0]
-        try:
-            node.GetNthControlPointPositionWorld(idx, ras)
-        except Exception:
-            node.GetNthControlPointPosition(idx, ras)
+        node.GetNthControlPointPositionWorld(idx, ras)
         pending['ras'] = list(ras)
         pending['point_id'] = self._control_point_id(node, idx)
         pending['point_name'] = self._control_point_name(node, idx)
         self._cache_recorded_prompt_point(
             node, is_negative, idx, pending['segment_id'], ras,
             pending['point_id'], pending['point_name'])
-        if pending.get('confirmed'):
-            return
         self._recorder.record_point_placed(
             pending['segment_id'], pending['ras'], pending['is_negative'],
             view_name=pending['view_name'], point_index=pending['point_index'],
-            point_id=pending['point_id'], point_name=pending['point_name'],
-            point_action='place')
+            point_id=pending['point_id'], point_name=pending['point_name'])
+
+    def _schedule_pending_point_confirmation(self, node, is_negative, idx):
+        node_id = node.GetID()
+
+        def confirm_if_still_pending():
+            if (node_id, bool(is_negative), idx) not in self._pending_point_confirmations:
+                return
+            self._confirm_pending_point(node, is_negative, idx)
+
+        qt.QTimer.singleShot(500, confirm_if_still_pending)
 
     def _onPromptPointRemovedForRecording(self, node, is_negative, callData=None):
         if not self._recorder.is_active:
             return
         idx = self._control_point_index_from_call_data(node, callData)
-        if idx < 0:
-            try:
-                idx = int(str(callData))
-            except Exception:
-                idx = -1
+        if idx < 0 and callData is not None:
+            idx = int(str(callData))
         cache_key = (node.GetID(), bool(is_negative), idx)
-        cached = getattr(self, '_recorded_prompt_point_cache', {}).pop(cache_key, None)
+        if cache_key in self._pending_point_confirmations:
+            self._pending_point_confirmations.pop(cache_key, None)
+            return
+        drag_key = (node.GetID(), bool(is_negative))
+        active_drag = self._active_point_drags.get(drag_key)
+        active_idx = (
+            active_drag.get('idx') if isinstance(active_drag, dict)
+            else active_drag
+        )
+        if active_idx == idx:
+            return
+        cached = self._recorded_prompt_point_cache.pop(cache_key, None)
         if not cached:
             return
-        self._pending_point_confirmations.pop(cache_key, None)
-        drag_key = (node.GetID(), bool(is_negative))
-        if self._active_point_drags.get(drag_key) == idx:
-            self._active_point_drags.pop(drag_key, None)
+        # Slicer implements point dragging as remove+re-create internally.
+        # If the left mouse button is currently pressed, this is a "fake delete"
+        # (drag start), not a real deletion.  Buffer it and wait for the
+        # subsequent PointPositionDefinedEvent that will confirm the drag end.
+        if self._recorder._active_mouse_press:
+            self._buffer_drag_removal(node, bool(is_negative), idx, cached)
+            return
         self._recorder.record_point_removed(
             cached['segment_id'], cached.get('ras'), bool(is_negative),
             view_name=self.currentViewName, point_index=idx,
             point_id=cached.get('point_id'),
             point_name=cached.get('point_name'))
 
+    def _buffer_drag_removal(self, node, is_negative, idx, cached):
+        """Buffer a point removal that occurred during a mouse press (fake delete).
+
+        If PointPositionDefinedEvent fires within 400 ms the buffer is consumed
+        as a drag-end.  Otherwise the timeout emits the real point_removed.
+        """
+        key = (node.GetID(), bool(is_negative))
+        existing = self._pending_drag_removals.pop(key, None)
+        if existing is not None:
+            existing['timer'].stop()
+
+        def _on_timeout():
+            pending = self._pending_drag_removals.pop(key, None)
+            if pending is None:
+                return
+            self._recorder.record_point_removed(
+                pending['cached']['segment_id'],
+                pending['cached'].get('ras'),
+                bool(is_negative),
+                view_name=self.currentViewName,
+                point_index=pending['idx'],
+                point_id=pending['cached'].get('point_id'),
+                point_name=pending['cached'].get('point_name'))
+
+        timer = qt.QTimer()
+        timer.setSingleShot(True)
+        timer.connect('timeout()', _on_timeout)
+        timer.start(400)
+        self._pending_drag_removals[key] = {'idx': idx, 'cached': cached, 'timer': timer}
+
     def _cache_recorded_prompt_point(self, node, is_negative, idx, segment_id,
                                      ras, point_id, point_name=None):
-        if not hasattr(self, '_recorded_prompt_point_cache'):
-            self._recorded_prompt_point_cache = {}
         self._recorded_prompt_point_cache[(node.GetID(), bool(is_negative), idx)] = {
             'segment_id': segment_id,
             'ras': list(ras),
@@ -764,58 +921,30 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     @staticmethod
     def _control_point_index_from_call_data(node, callData=None):
-        try:
-            if callData is not None:
-                idx = int(str(callData))
-                if 0 <= idx < node.GetNumberOfControlPoints():
-                    return idx
-        except Exception:
-            pass
+        if callData is not None:
+            idx = int(str(callData))
+            if 0 <= idx < node.GetNumberOfControlPoints():
+                return idx
         return SegmentHumanBodyWidget._last_defined_control_point_index(node)
 
     @staticmethod
     def _control_point_id(node, idx):
-        try:
-            return node.GetNthControlPointID(idx)
-        except Exception:
-            return str(idx)
+        return node.GetNthControlPointID(idx)
 
     @staticmethod
     def _control_point_name(node, idx):
-        for method_name in (
-            'GetNthControlPointLabel',
-            'GetNthControlPointName',
-        ):
-            try:
-                value = getattr(node, method_name)(idx)
-                if value:
-                    return str(value)
-            except Exception:
-                pass
-        return SegmentHumanBodyWidget._control_point_id(node, idx)
+        value = node.GetNthControlPointLabel(idx)
+        return str(value) if value else SegmentHumanBodyWidget._control_point_id(node, idx)
 
     @staticmethod
     def _is_control_point_defined(node, idx):
-        try:
-            defined = slicer.vtkMRMLMarkupsNode.PositionDefined
-        except Exception:
-            defined = 2
-        try:
-            return node.GetNthControlPointPositionStatus(idx) == defined
-        except Exception:
-            return True
+        return node.GetNthControlPointPositionStatus(idx) == slicer.vtkMRMLMarkupsNode.PositionDefined
 
     @staticmethod
     def _last_defined_control_point_index(node):
-        try:
-            defined = slicer.vtkMRMLMarkupsNode.PositionDefined
-        except Exception:
-            defined = 2
+        defined = slicer.vtkMRMLMarkupsNode.PositionDefined
         for idx in range(node.GetNumberOfControlPoints() - 1, -1, -1):
-            try:
-                if node.GetNthControlPointPositionStatus(idx) == defined:
-                    return idx
-            except Exception:
+            if node.GetNthControlPointPositionStatus(idx) == defined:
                 return idx
         return -1
 
@@ -867,12 +996,13 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             seg = self.ui.segmentationNodeSelector.currentNode()
         # Auto-create segmentation when a volume is present but none exists yet.
         if vol and not seg:
-            seg = self.logic.create_segmentation_for_volume(vol)
-            self.ui.segmentationNodeSelector.blockSignals(True)
-            self.ui.segmentationNodeSelector.setCurrentNode(seg)
-            self.ui.segmentationNodeSelector.blockSignals(False)
-            self.ui.segmentSelector.setCurrentNode(seg)
-            self.ui.addSegmentButton.setEnabled(True)
+            with _suppress_vtk_warnings():
+                seg = self.logic.create_segmentation_for_volume(vol)
+                self.ui.segmentationNodeSelector.blockSignals(True)
+                self.ui.segmentationNodeSelector.setCurrentNode(seg)
+                self.ui.segmentationNodeSelector.blockSignals(False)
+                self.ui.segmentSelector.setCurrentNode(seg)
+                self.ui.addSegmentButton.setEnabled(True)
             if pn:
                 pn.SetNodeReferenceID(_SEGMENTATION, seg.GetID())
         if not seg:
@@ -882,24 +1012,30 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # Cache the active handler before creation, detach cleanly, then restore.
         # Suppress place-mode signals during creation so setCurrentNode calls inside
         # _set_prompt_nodes don't spuriously re-activate the wrong widget.
-        prev_stroke_cls    = type(self._active_handler) if isinstance(self._active_handler, StrokeHandler) else None
-        prev_prompt_widget = self._active_prompt_widget  if isinstance(self._active_handler, PointHandler)  else None
+        prev_was_point  = isinstance(self._active_handler, PointHandler)
+        prev_stroke_cls = type(self._active_handler) if isinstance(self._active_handler, StrokeHandler) else None
+        prev_prompt_widget = self._active_prompt_widget if prev_was_point else None
+        if prev_was_point and prev_prompt_widget is None:
+            raise RuntimeError('_onAddSegment: PointHandler active with no _active_prompt_widget')
         if self._active_handler is not None:
             self._active_handler.detach(self)
         self._suppressing_place_mode = True
         try:
-            new_id = self.logic.add_segment(seg)
-            if new_id:
-                self.ui.segmentSelector.setCurrentSegmentID(new_id)
+            with _suppress_vtk_warnings():
+                new_id = self.logic.add_segment(seg)
+                if new_id:
+                    self.ui.segmentSelector.setCurrentSegmentID(new_id)
         finally:
             self._suppressing_place_mode = False
             if prev_stroke_cls is not None:
                 prev_stroke_cls().attach(self)
-            elif prev_prompt_widget is not None:
+            elif prev_was_point:
                 for child in prev_prompt_widget.findChildren(qt.QWidget):
                     if hasattr(child, 'setPlaceModeEnabled'):
                         child.setPlaceModeEnabled(True)
                         break
+            else:
+                self._ensure_current_prompt_nodes()
 
     def _onRemoveSegment(self, *_):
         seg   = self.ui.segmentationNodeSelector.currentNode()
@@ -909,10 +1045,42 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             return
         next_id = self._segment_id_before(seg, segID)
         self._record_action('remove_segment')
-        self.logic.delete_segment_prompt_nodes(seg, segID)
-        self.logic.remove_segment(seg, segID)
-        if next_id:
-            self.ui.segmentSelector.setCurrentSegmentID(next_id)
+        # Cache the active handler, detach before node rewiring, then restore.
+        # Removing markup nodes from the scene while they are wired to the prompt
+        # widgets fires activeMarkupsFiducialPlaceModeChanged, which would
+        # otherwise install a PointHandler and discard whatever tool was active.
+        prev_was_point  = isinstance(self._active_handler, PointHandler)
+        prev_stroke_cls = type(self._active_handler) if isinstance(self._active_handler, StrokeHandler) else None
+        prev_prompt_widget = self._active_prompt_widget if prev_was_point else None
+        if prev_was_point and prev_prompt_widget is None:
+            raise RuntimeError('_onRemoveSegment: PointHandler active with no _active_prompt_widget')
+        if self._active_handler is not None:
+            self._active_handler.detach(self)
+        self._suppressing_place_mode = True
+        try:
+            with _suppress_vtk_warnings():
+                # Disconnect widgets before deleting the nodes.  If nodes are
+                # deleted while the widget still observes them, Slicer's C++
+                # qSlicerSimpleMarkupsWidget calls setPlaceModeEnabled(True)
+                # internally to "restart" placement — bypassing our Python
+                # suppression flag and activating the interaction node.
+                self._set_prompt_nodes(None, None)
+                self.logic.delete_segment_prompt_nodes(seg, segID)
+                self.logic.remove_segment(seg, segID)
+                if next_id:
+                    self.ui.segmentSelector.setCurrentSegmentID(next_id)
+        finally:
+            self._suppressing_place_mode = False
+            if prev_stroke_cls is not None:
+                prev_stroke_cls().attach(self)
+            elif prev_was_point:
+                if next_id:
+                    for child in prev_prompt_widget.findChildren(qt.QWidget):
+                        if hasattr(child, 'setPlaceModeEnabled'):
+                            child.setPlaceModeEnabled(True)
+                            break
+            else:
+                self._ensure_current_prompt_nodes()
 
     @staticmethod
     def _segment_id_before(seg_node, segment_id):
@@ -1094,11 +1262,11 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     @staticmethod
     def _segment_name(seg_node, segment_id):
-        try:
-            seg_obj = seg_node.GetSegmentation().GetSegment(segment_id)
-            return seg_obj.GetName() if seg_obj else str(segment_id)
-        except Exception:
-            return str(segment_id)
+        seg_obj = seg_node.GetSegmentation().GetSegment(segment_id)
+        if seg_obj is None:
+            raise RuntimeError(
+                f'_segment_name: segment {segment_id!r} not found in segmentation node')
+        return seg_obj.GetName()
 
     def _record_segment_created(self, seg_node, segment_id):
         if self._recorder.is_active and segment_id:
@@ -1150,11 +1318,8 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
     # ------------------------------------------------------------------ #
 
     def get_segment_editor(self):
-        """Return the shared qMRMLSegmentEditorWidget, or None."""
-        try:
-            return slicer.modules.segmenteditor.widgetRepresentation().self().editor
-        except Exception:
-            return None
+        """Return the shared qMRMLSegmentEditorWidget."""
+        return slicer.modules.segmenteditor.widgetRepresentation().self().editor
 
     def setup_editor_nodes(self, editor, vol, seg, segment_id=None):
         """Point the Segment Editor at vol/seg/segment_id.
@@ -1257,9 +1422,10 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
 
     def create_segmentation_for_volume(self, vol):
         """Create and return a new segmentation node linked to *vol*."""
-        seg = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLSegmentationNode')
-        seg.CreateDefaultDisplayNodes()
-        seg.SetReferenceImageGeometryParameterFromVolumeNode(vol)
+        with _suppress_vtk_warnings():
+            seg = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLSegmentationNode')
+            seg.CreateDefaultDisplayNodes()
+            seg.SetReferenceImageGeometryParameterFromVolumeNode(vol)
         return seg
 
     def add_segment(self, seg_node) -> str:
@@ -1276,24 +1442,24 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         # vtkMRMLSegmentationDisplayNode observes vtkSegmentation directly (VTK-level),
         # so StartModify doesn't suppress the transient "0 connections" warning that fires
         # when the 3D pipeline tries to render an empty segment during creation.
-        vtk.vtkObject.GlobalWarningDisplayOff()
-        mod = seg_node.StartModify()
-        try:
-            segmentation.AddEmptySegment(next_segment_name(existing_names))
-            # The new segment is the one whose ID wasn't in the pre-call set.
-            for i in range(segmentation.GetNumberOfSegments()):
-                sid = segmentation.GetNthSegmentID(i)
-                if sid not in existing_ids:
-                    self.create_segment_prompt_nodes(seg_node, sid)
-                    return sid
-            return ''
-        finally:
-            seg_node.EndModify(mod)
-            vtk.vtkObject.GlobalWarningDisplayOn()
+        with _suppress_vtk_warnings():
+            mod = seg_node.StartModify()
+            try:
+                segmentation.AddEmptySegment(next_segment_name(existing_names))
+                # The new segment is the one whose ID wasn't in the pre-call set.
+                for i in range(segmentation.GetNumberOfSegments()):
+                    sid = segmentation.GetNthSegmentID(i)
+                    if sid not in existing_ids:
+                        self.create_segment_prompt_nodes(seg_node, sid)
+                        return sid
+                return ''
+            finally:
+                seg_node.EndModify(mod)
 
     def remove_segment(self, seg_node, segment_id):
         """Remove *segment_id* from *seg_node*."""
-        seg_node.GetSegmentation().RemoveSegment(segment_id)
+        with _suppress_vtk_warnings():
+            seg_node.GetSegmentation().RemoveSegment(segment_id)
 
     # ------------------------------------------------------------------ #
     # Segment visibility                                                   #
@@ -1313,10 +1479,11 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         if not dn:
             return
         segmentation = seg_node.GetSegmentation()
-        for i in range(segmentation.GetNumberOfSegments()):
-            sid = segmentation.GetNthSegmentID(i)
-            if sid != exclude_id:
-                self._set_triplet_visibility(seg_node, dn, sid, visible)
+        with _suppress_vtk_warnings():
+            for i in range(segmentation.GetNumberOfSegments()):
+                sid = segmentation.GetNthSegmentID(i)
+                if sid != exclude_id:
+                    self._set_triplet_visibility(seg_node, dn, sid, visible)
 
     def set_segment_visibility(self, seg_node, segment_id, visible):
         """Set visibility of a single segment triplet."""
@@ -1324,7 +1491,8 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
             return
         dn = seg_node.GetDisplayNode()
         if dn:
-            self._set_triplet_visibility(seg_node, dn, segment_id, visible)
+            with _suppress_vtk_warnings():
+                self._set_triplet_visibility(seg_node, dn, segment_id, visible)
 
     # ------------------------------------------------------------------ #
     # Window / Level                                                       #
@@ -1396,24 +1564,20 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         Shape is ``(K, J, I)`` — zero-copy writable view into Slicer's buffer.
         Returns ``(None, None)`` on any failure.
         """
-        try:
-            lm = seg_node.GetBinaryLabelmapInternalRepresentation(segment_id)
-            if lm is None:
-                return None, None
-            img  = lm.GetImageData()
-            ext  = img.GetExtent()
-            if ext[0] != 0 or ext[2] != 0 or ext[4] != 0:
-                return None, None
-            dims = img.GetDimensions()
-            if dims[0] <= 1 or dims[1] <= 1 or dims[2] <= 1:
-                return None, None
-            flat = _vtk_ns.vtk_to_numpy(img.GetPointData().GetScalars())
-            if flat.max() > 1:
-                return None, None
-            return flat.reshape(dims[2], dims[1], dims[0]), img
-        except Exception as exc:
-            log.debug('[Logic._vtk_view] %s', exc)
+        lm = seg_node.GetBinaryLabelmapInternalRepresentation(segment_id)
+        if lm is None:
             return None, None
+        img  = lm.GetImageData()
+        ext  = img.GetExtent()
+        if ext[0] != 0 or ext[2] != 0 or ext[4] != 0:
+            return None, None
+        dims = img.GetDimensions()
+        if dims[0] <= 1 or dims[1] <= 1 or dims[2] <= 1:
+            return None, None
+        flat = _vtk_ns.vtk_to_numpy(img.GetPointData().GetScalars())
+        if flat.max() > 1:
+            return None, None
+        return flat.reshape(dims[2], dims[1], dims[0]), img
 
     # ------------------------------------------------------------------ #
     # Public read API                                                      #
@@ -1431,13 +1595,9 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         view, _ = self._vtk_view(seg_node, segment_id)
         if view is not None:
             return get_slice_from_volume(view, axis, slice_idx).copy()
-        try:
-            raw = slicer.util.arrayFromSegmentBinaryLabelmap(
-                seg_node, segment_id, volume_node)
-            return get_slice_from_volume(raw, axis, slice_idx).copy()
-        except Exception as exc:
-            log.debug('[Logic.segment_slice] fallback failed: %s', exc)
-            return None
+        raw = slicer.util.arrayFromSegmentBinaryLabelmap(
+            seg_node, segment_id, volume_node)
+        return get_slice_from_volume(raw, axis, slice_idx).copy()
 
     def segment_mask(self, seg_node, segment_id,
                      volume_node) -> 'np.ndarray | None':
@@ -1449,13 +1609,9 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         view, _ = self._vtk_view(seg_node, segment_id)
         if view is not None:
             return view.copy()
-        try:
-            raw = slicer.util.arrayFromSegmentBinaryLabelmap(
-                seg_node, segment_id, volume_node)
-            return raw.copy()
-        except Exception as exc:
-            log.debug('[Logic.segment_mask] fallback failed: %s', exc)
-            return None
+        raw = slicer.util.arrayFromSegmentBinaryLabelmap(
+            seg_node, segment_id, volume_node)
+        return raw.copy()
 
     def current_segment_slice(self, pn, view_name: str,
                                segment_id: str) -> 'tuple | None':
@@ -1475,6 +1631,13 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
             return None
         mask = self.segment_slice(seg, segment_id, vol, axis, slice_idx)
         return (mask, axis, slice_idx) if mask is not None else None
+
+
+def _ras_positions_close(a, b, tolerance=1e-4):
+    if a is None or b is None or len(a) < 3 or len(b) < 3:
+        return False
+    tol2 = float(tolerance) * float(tolerance)
+    return sum((float(a[i]) - float(b[i])) ** 2 for i in range(3)) <= tol2
 
 
 #

@@ -1,23 +1,24 @@
 from core._mouse_recorder import (
-    MOVE, PRESS, RELEASE, VIEW_CHANGED, POINT_DRAG_START, POINT_DRAG_MOVE,
-    POINT_DRAG_END, POINT_PLACED, POINT_REMOVED, METADATA, MouseEventRecorder,
-    _SliceRecordFilter,
+    MOVE, PRESS, RELEASE, VIEW_CHANGED, ACTION, POINT_DRAG_START, POINT_DRAG_MOVE,
+    POINT_DRAG_END, POINT_PLACED, POINT_REPLACED, POINT_REMOVED, METADATA,
+    BRUSH_PARAMETERS_CHANGED, MouseEventRecorder,
     _SliceRecordInteractorObserver,
+    _SliceRecordListener,
 )
 import datetime
 import core._mouse_recorder as recorder_mod
 
 
-def test_default_sample_rate_is_30_hz():
+def test_default_sample_rate_is_60_hz():
     recorder = MouseEventRecorder()
-    assert round(1000.0 / recorder._move_interval_ms) == 30
+    assert round(1000.0 / recorder._move_interval_ms) == 60
 
 
 def test_metadata_caches_initial_slice_visual_state(monkeypatch):
     monkeypatch.setattr(
         recorder_mod,
         '_all_slice_visual_state',
-        lambda: {'Red': {'view_name': 'Red', 'slice_offset': 12.0}},
+        lambda volume_node=None: {'Red': {'view_name': 'Red', 'slice_offset': 12.0}},
     )
     recorder = MouseEventRecorder()
 
@@ -30,23 +31,26 @@ def test_metadata_caches_initial_slice_visual_state(monkeypatch):
     }
 
 
-def test_metadata_records_non_annotative_movement_option(monkeypatch):
-    monkeypatch.setattr(
-        recorder_mod,
-        '_all_slice_visual_state',
-        lambda: {},
-    )
+def test_metadata_records_compact_move_thinning_policy(monkeypatch):
+    monkeypatch.setattr(recorder_mod, '_all_slice_visual_state', lambda volume_node=None: {})
     recorder = MouseEventRecorder()
 
-    recorder.start(
-        volume_node=None, segmentation_name=None,
-        record_non_annotative_movement=True)
+    recorder.start(volume_node=None, segmentation_name=None)
 
-    assert recorder.records[0].payload['record_non_annotative_movement'] is True
+    policy = recorder.records[0].payload['move_thinning']
+    assert policy == {
+        'mode': 'xy_to_ijk_scaled',
+        'ann_ijk': 0.5,
+        'hover_ijk': 2.0,
+        'ann_px': [1, 4],
+        'hover_px': [2, 12],
+        'ann_ms': 100,
+        'hover_ms': 250,
+    }
 
 
 def test_stop_does_not_append_second_metadata_or_session_stop(monkeypatch):
-    monkeypatch.setattr(recorder_mod, '_all_slice_visual_state', lambda: {})
+    monkeypatch.setattr(recorder_mod, '_all_slice_visual_state', lambda volume_node=None: {})
     recorder = MouseEventRecorder()
 
     recorder.start(volume_node=None, segmentation_name=None)
@@ -74,10 +78,11 @@ def test_event_ids_are_sequential_and_exported():
     exported = recorder.export_data()
     assert exported['type'] == 'SegmentHumanBody.annotation_process'
     assert [item['id'] for item in exported['events']] == [1, 2]
+    assert all('t_ms' not in item for item in exported['events'])
 
 
 def test_export_ids_start_at_one_after_metadata(monkeypatch):
-    monkeypatch.setattr(recorder_mod, '_all_slice_visual_state', lambda: {})
+    monkeypatch.setattr(recorder_mod, '_all_slice_visual_state', lambda volume_node=None: {})
     recorder = MouseEventRecorder()
 
     recorder.start(volume_node=None, segmentation_name=None)
@@ -90,10 +95,14 @@ def test_export_ids_start_at_one_after_metadata(monkeypatch):
 
 
 def test_visual_state_does_not_repeat_slice_view_dimensions(monkeypatch):
+    class _Matrix:
+        def GetElement(self, r, c): return 1.0 if r == c else 0.0
+
     class _SliceNode:
         def GetSliceOffset(self): return 12.0
         def GetFieldOfView(self): return [100.0, 100.0, 1.0]
         def GetDimensions(self): return [512, 512, 1]
+        def GetXYToRAS(self): return _Matrix()
 
     class _SliceWidget:
         def mrmlSliceNode(self): return _SliceNode()
@@ -108,10 +117,136 @@ def test_visual_state_does_not_repeat_slice_view_dimensions(monkeypatch):
 
     state = recorder_mod._visual_state('Red')
 
+    _identity = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+                 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
     assert state == {
         'slice_offset': 12.0,
         'field_of_view': [100.0, 100.0, 1.0],
+        'xy_to_ras': _identity,
     }
+
+
+def test_slice_device_xy_to_ijk_matrix_matches_dataprobe_path(monkeypatch):
+    class _Transform:
+        def TransformDoublePoint(self, xyz):
+            return [2.0 * xyz[0], 3.0 * xyz[1], xyz[2] + 5.0]
+
+    class _Layer:
+        def GetVolumeNode(self):
+            return volume
+
+        def GetXYToIJKTransform(self):
+            return _Transform()
+
+    class _SliceLogic:
+        def GetBackgroundLayer(self):
+            return _Layer()
+
+    class _SliceView:
+        def convertDeviceToXYZ(self, xy):
+            return [float(xy[0]) + 10.0, float(xy[1]) + 20.0, 7.0]
+
+    class _SliceWidget:
+        def sliceView(self):
+            return _SliceView()
+
+        def sliceLogic(self):
+            return _SliceLogic()
+
+    class _Layout:
+        def sliceWidget(self, view_name):
+            return _SliceWidget()
+
+    class _App:
+        def layoutManager(self):
+            return _Layout()
+
+    volume = object()
+    monkeypatch.setattr(recorder_mod.slicer, 'app', _App(), raising=False)
+
+    mat = recorder_mod._slice_device_xy_to_ijk_matrix('Red', volume)
+    ijk = recorder_mod._xy_to_ijk_from_matrix([4, 5], mat)
+
+    assert ijk == [28.0, 75.0, 12.0]
+
+
+def test_slice_device_xy_to_ijk_matrix_ignores_nonmatching_background_volume(monkeypatch):
+    class _Layer:
+        def GetVolumeNode(self):
+            return object()
+
+    class _SliceLogic:
+        def GetBackgroundLayer(self):
+            return _Layer()
+
+    class _SliceWidget:
+        def sliceView(self):
+            return object()
+
+        def sliceLogic(self):
+            return _SliceLogic()
+
+    class _Layout:
+        def sliceWidget(self, view_name):
+            return _SliceWidget()
+
+    class _App:
+        def layoutManager(self):
+            return _Layout()
+
+    monkeypatch.setattr(recorder_mod.slicer, 'app', _App(), raising=False)
+
+    assert recorder_mod._slice_device_xy_to_ijk_matrix('Red', object()) is None
+
+
+def test_export_annotates_events_with_ijk_when_ras_to_ijk_present():
+    # identity ras_to_ijk: RAS [x,y,z] -> IJK [x,y,z]
+    identity = [1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0]
+    recorder = MouseEventRecorder()
+    recorder._append(METADATA, None, {'volume': {'ras_to_ijk': identity}})
+    recorder._append(
+        MOVE, [1.0, 2.0, 3.0],
+        {'mouse_status': 'move', 'analysis_event_type': 'trajectory_event'},
+    )
+    recorder._append(
+        MOVE, [7.0, 8.0, 9.0],
+        {'mouse_status': 'move', 'analysis_event_type': 'trajectory_event'},
+    )
+
+    exported = recorder.export_data()['events']
+
+    assert exported[0]['ijk'] == [1, 2, 3]
+    assert exported[1]['ijk'] == [7, 8, 9]
+
+
+def test_export_omits_ijk_when_no_ras_to_ijk():
+    recorder = MouseEventRecorder()
+    recorder._append(
+        MOVE, [1.0, 2.0, 3.0],
+        {'mouse_status': 'move', 'analysis_event_type': 'trajectory_event'},
+    )
+
+    event = recorder.export_data()['events'][0]
+
+    assert 'ijk' not in event
+
+
+def test_export_omits_ijk_on_events_without_ras():
+    identity = [1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0]
+    recorder = MouseEventRecorder()
+    recorder._append(METADATA, None, {'volume': {'ras_to_ijk': identity}})
+    recorder._append(ACTION, None, {'name': 'undo'})
+
+    events = recorder.export_data()['events']
+    action_event = next(e for e in events if e['event'] == 'action')
+
+    assert 'ijk' not in action_event
 
 
 def test_clear_resets_event_ids():
@@ -173,20 +308,37 @@ def test_export_uses_numeric_pressed_state():
     assert all('button' not in event for event in exported)
 
 
-def test_export_preserves_point_name_for_verdict_events():
+def test_export_preserves_point_name_for_placed_verdict_events():
     recorder = MouseEventRecorder()
 
     recorder.record_point_placed(
         'seg-a', [1.0, 2.0, 3.0], False,
-        point_index=0, point_id='cp-0', point_name='Positive 1',
-        point_action='replace')
+        point_index=0, point_id='cp-0', point_name='Positive 1')
 
     event = recorder.export_data()['events'][0]
 
     assert event['event'] == 'point_placed'
-    assert event['point_action'] == 'replace'
+    assert event['point_action'] == 'place'
+    assert event['ras_source'] == 'markup_world'
     assert event['point'] == 'cp-0'
     assert event['point_name'] == 'Positive 1'
+
+
+def test_export_preserves_point_name_for_replaced_verdict_events():
+    recorder = MouseEventRecorder()
+    import datetime
+    recorder.record_point_drag(
+        'end', 'seg-a', [3.0, 4.0, 5.0], False,
+        view_name='Red', point_index=1, point_id='cp-1',
+        point_name='Positive 2')
+
+    event = recorder.export_data()['events'][0]
+
+    assert event['event'] == 'point_replaced'
+    assert event['point_action'] == 'replace'
+    assert event['ras_source'] == 'markup_world'
+    assert event['point'] == 'cp-1'
+    assert event['point_name'] == 'Positive 2'
 
 
 def test_export_suppresses_raw_mouse_companions_during_point_drag():
@@ -225,7 +377,7 @@ def test_export_suppresses_raw_mouse_companions_during_point_drag():
          }),
         (RELEASE, [4.0, 252.0, -1.0],
          {'mouse_status': 'release', 'analysis_event_type': 'boundary_event'}),
-        (POINT_PLACED, [3.0, 74.0, -1.0],
+        (POINT_REPLACED, [3.0, 74.0, -1.0],
          {
              'view_name': 'Red',
              'segment_id': 'seg-a',
@@ -233,6 +385,7 @@ def test_export_suppresses_raw_mouse_companions_during_point_drag():
              'point_id': 'cp-0',
              'point_name': 'Positive 1',
              'point_action': 'replace',
+             'ras_source': 'markup_world',
              'analysis_event_type': 'boundary_event',
          }),
     ]
@@ -248,7 +401,7 @@ def test_export_suppresses_raw_mouse_companions_during_point_drag():
 
     assert [event['id'] for event in exported] == [1, 2, 3]
     assert [event['event'] for event in exported] == [
-        POINT_DRAG_START, POINT_DRAG_MOVE, POINT_PLACED,
+        POINT_DRAG_START, POINT_DRAG_MOVE, POINT_REPLACED,
     ]
     assert [event['point_action'] for event in exported] == [
         'grab', 'move', 'replace',
@@ -256,72 +409,160 @@ def test_export_suppresses_raw_mouse_companions_during_point_drag():
     assert exported[-1]['ras'] == [3.0, 74.0, -1.0]
 
 
-def test_wheel_events_record_view_changed_by_slice_filter(monkeypatch):
-    class _QEvent:
-        MouseMove = object()
-        MouseButtonPress = object()
-        MouseButtonRelease = object()
-        Wheel = object()
+def test_start_uses_only_vtk_listener_when_interactor_is_available(monkeypatch):
+    class _Timer:
+        def connect(self, *args):
+            pass
 
-    class _Pos:
-        def x(self): return 10
-        def y(self): return 20
+        def start(self, *args):
+            pass
 
-    class _Delta:
-        def x(self): return 0
-        def y(self): return 120
+        def stop(self):
+            pass
 
-    class _Event:
-        def type(self):
-            return recorder_mod.qt.QEvent.Wheel
+    class _Interactor:
+        def __init__(self):
+            self.callbacks = {}
+            self.removed = []
 
-        def pos(self):
-            return _Pos()
+        def AddObserver(self, event_name, callback, priority=None):
+            self.callbacks[event_name] = callback
+            return event_name
 
-        def angleDelta(self):
-            return _Delta()
+        def RemoveObserver(self, tag):
+            self.removed.append(tag)
+
+    class _SliceView:
+        def __init__(self):
+            self._interactor = _Interactor()
+            self.filters = []
+            self.removed_filters = []
+
+        def interactor(self):
+            return self._interactor
+
+        def installEventFilter(self, filt):
+            self.filters.append(filt)
+
+        def removeEventFilter(self, filt):
+            self.removed_filters.append(filt)
+
+    view = _SliceView()
+    monkeypatch.setattr(
+        recorder_mod, '_slice_view',
+        lambda view_name: view if view_name == 'Red' else None)
+    monkeypatch.setattr(recorder_mod, '_left_button_is_down', lambda: False)
+    monkeypatch.setattr(recorder_mod, '_all_slice_visual_state', lambda volume_node=None: {})
+    monkeypatch.setattr(recorder_mod.qt, 'QTimer', _Timer, raising=False)
+
+    recorder = MouseEventRecorder()
+    recorder.start(volume_node=None)
+
+    assert len(recorder._listeners) == 1
+    assert recorder._listeners[0].backend == 'vtk_interactor'
+    assert view.filters == []
+    assert 'LeftButtonPressEvent' in view._interactor.callbacks
+
+    recorder.stop()
+
+    assert view.removed_filters == []
+    assert 'LeftButtonPressEvent' in view._interactor.removed
+
+
+def test_start_skips_slice_view_when_vtk_interactor_is_unavailable(monkeypatch):
+    class _Timer:
+        def connect(self, *args):
+            pass
+
+        def start(self, *args):
+            pass
+
+        def stop(self):
+            pass
+
+    class _SliceView:
+        def __init__(self):
+            self.filters = []
+            self.removed_filters = []
+
+        def interactor(self):
+            return None
+
+        def installEventFilter(self, filt):
+            self.filters.append(filt)
+
+        def removeEventFilter(self, filt):
+            self.removed_filters.append(filt)
+
+    view = _SliceView()
+    monkeypatch.setattr(
+        recorder_mod, '_slice_view',
+        lambda view_name: view if view_name == 'Red' else None)
+    monkeypatch.setattr(recorder_mod, '_left_button_is_down', lambda: False)
+    monkeypatch.setattr(recorder_mod, '_all_slice_visual_state', lambda volume_node=None: {})
+    monkeypatch.setattr(recorder_mod.qt, 'QTimer', _Timer, raising=False)
+
+    recorder = MouseEventRecorder()
+    recorder.start(volume_node=None)
+
+    assert recorder._listeners == []
+    assert view.filters == []
+
+    recorder.stop()
+
+    assert view.removed_filters == []
+
+
+def test_slice_record_listener_uses_one_backend_for_all_mouse_events(monkeypatch):
+    class _Interactor:
+        def __init__(self):
+            self.callbacks = {}
+            self.position = (0, 0)
+
+        def AddObserver(self, event_name, callback, priority=None):
+            self.callbacks[event_name] = callback
+            return event_name
+
+        def RemoveObserver(self, tag):
+            pass
+
+        def GetEventPosition(self):
+            return self.position
+
+    class _SliceView:
+        height = 200
+
+        def __init__(self):
+            self._interactor = _Interactor()
+            self.filters = []
+
+        def interactor(self):
+            return self._interactor
+
+        def installEventFilter(self, filt):
+            self.filters.append(filt)
 
     calls = []
-    monkeypatch.setattr(recorder_mod.qt, 'QEvent', _QEvent, raising=False)
-    filt = _SliceRecordFilter('Red', lambda *args: calls.append(args))
+    monkeypatch.setattr(recorder_mod, '_left_button_is_down', lambda: False)
+    view = _SliceView()
+    listener = _SliceRecordListener('Red', view, lambda *args: calls.append(args))
 
-    filt.eventFilter(None, _Event())
+    assert listener.install() is True
+    assert listener.backend == 'vtk_interactor'
+    assert view.filters == []
 
-    assert calls == [
-        ('Red', (10, 20), VIEW_CHANGED, {
-            'mouse_status': 'view',
-            'view_event': 'wheel',
-            'wheel_delta': [0, 120],
-            'analysis_event_type': 'trajectory_event',
-        }),
-    ]
+    view._interactor.position = (10, 20)
+    view._interactor.callbacks['LeftButtonPressEvent'](
+        view._interactor, 'LeftButtonPressEvent')
+    view._interactor.position = (11, 21)
+    view._interactor.callbacks['MouseMoveEvent'](
+        view._interactor, 'MouseMoveEvent')
+    view._interactor.position = (12, 22)
+    view._interactor.callbacks['LeftButtonReleaseEvent'](
+        view._interactor, 'LeftButtonReleaseEvent')
 
-
-def test_slice_filter_can_skip_mouse_move_when_vtk_captures_moves(monkeypatch):
-    class _QEvent:
-        MouseMove = object()
-
-    class _Pos:
-        def x(self): return 10
-        def y(self): return 20
-
-    class _Event:
-        def type(self):
-            return recorder_mod.qt.QEvent.MouseMove
-
-        def pos(self):
-            return _Pos()
-
-        def buttons(self):
-            return 0
-
-    calls = []
-    monkeypatch.setattr(recorder_mod.qt, 'QEvent', _QEvent, raising=False)
-    filt = _SliceRecordFilter(
-        'Red', lambda *args: calls.append(args), capture_moves=False)
-
-    assert filt.eventFilter(None, _Event()) is False
-    assert calls == []
+    assert [call[2] for call in calls] == [PRESS, MOVE, RELEASE]
+    assert {call[3]['input_source'] for call in calls} == {'vtk_interactor'}
 
 
 def test_vtk_interactor_observer_records_brush_path_events():
@@ -373,29 +614,69 @@ def test_vtk_interactor_observer_records_brush_path_events():
                for priority in view._interactor.priorities.values())
 
 
-def test_vtk_interactor_coordinates_are_flipped_to_slice_xy():
+def test_vtk_interactor_uses_dataprobe_device_xy(monkeypatch):
+    class _Point:
+        def __init__(self, x, y):
+            self._x = x
+            self._y = y
+
+        def x(self): return self._x
+        def y(self): return self._y
+
+    class _Interactor:
+        def __init__(self):
+            self.callbacks = {}
+            self.position = (10, 20)
+
+        def AddObserver(self, event_name, callback, priority=None):
+            self.callbacks[event_name] = callback
+            return event_name
+
+        def RemoveObserver(self, tag):
+            pass
+
+        def GetEventPosition(self):
+            return self.position
+
     class _SliceView:
         height = 200
 
-    assert recorder_mod._vtk_event_xy_to_slice_xy(_SliceView(), 10, 20) == (10, 179)
+        def __init__(self):
+            self._interactor = _Interactor()
 
+        def interactor(self):
+            return self._interactor
 
-def test_vtk_interactor_coordinates_prefer_render_window_height():
-    class _RenderWindow:
-        def GetSize(self): return (400, 400)
+        def mapFromGlobal(self, point):
+            return _Point(point.x() - 1000, point.y() - 2000)
 
-    class _SliceView:
-        height = 200
-        def renderWindow(self): return _RenderWindow()
+    class _Cursor:
+        @staticmethod
+        def pos():
+            return _Point(1368, 2131)
 
-    assert recorder_mod._vtk_event_xy_to_slice_xy(_SliceView(), 10, 20) == (10, 379)
+    class _QPoint:
+        def __init__(self, x, y):
+            self._x = x
+            self._y = y
 
+        def x(self): return self._x
+        def y(self): return self._y
 
-def test_vtk_interactor_coordinates_support_callable_qt_height():
-    class _SliceView:
-        def height(self): return 240
+    calls = []
+    view = _SliceView()
+    monkeypatch.setattr(recorder_mod.qt, 'QCursor', _Cursor, raising=False)
+    monkeypatch.setattr(recorder_mod.qt, 'QPoint', _QPoint, raising=False)
+    observer = _SliceRecordInteractorObserver(
+        'Red', view, lambda *args: calls.append(args))
+    observer.install()
 
-    assert recorder_mod._vtk_event_xy_to_slice_xy(_SliceView(), 10, 20) == (10, 219)
+    view._interactor.callbacks['MouseMoveEvent'](
+        view._interactor, 'MouseMoveEvent')
+
+    assert calls[0][1] == [10, 20]
+    assert calls[0][3]['xy_source'] == 'vtk_device'
+    assert calls[0][3]['xy_global'] == [1368, 2131]
 
 
 def test_event_payload_exposes_handler_and_params():
@@ -421,16 +702,13 @@ def test_press_and_release_are_recorded_even_inside_move_sample_window(monkeypat
     recorder = MouseEventRecorder(sample_rate_hz=12)
     recorder._active = True
     recorder._volume_node = object()
-    recorder.record_non_annotative_movement = True
     recorder.context_fn = lambda view_name=None: {
         'tool': 'brush',
         'axis': 0,
         'slice_idx': 3,
         'brush_radius_mm': 2.5,
     }
-    monkeypatch.setattr(recorder_mod, '_slice_xy_to_ras', lambda view, xy: [1.0, 2.0, 3.0])
-    monkeypatch.setattr(recorder_mod, '_ras_inside_volume', lambda volume, ras: True)
-    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view: {'view_name': view})
+    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view, volume_node=None: {'view_name': view})
 
     recorder._on_mouse(
         'Red', (10, 20), MOVE,
@@ -448,8 +726,10 @@ def test_press_and_release_are_recorded_even_inside_move_sample_window(monkeypat
 
     assert [r.event_type for r in recorder.records] == [MOVE, PRESS, RELEASE]
     assert recorder.records[0].payload['analysis_event_type'] == 'trajectory_event'
-    assert recorder.records[0].payload['trajectory_kind'] == 'non_annotation_move'
-    assert recorder.records[0].payload['trajectory_role'] == 'visualization_trajectory'
+    assert recorder.records[0].ras is None
+    assert recorder.records[0].payload['xy'] == [10, 20]
+    assert 'trajectory_kind' not in recorder.records[0].payload
+    assert 'trajectory_role' not in recorder.records[0].payload
     assert recorder.records[1].payload['mouse_status'] == 'press'
     assert recorder.records[1].payload['analysis_event_type'] == 'boundary_event'
     assert recorder.records[1].payload['handler'] == 'brush'
@@ -461,18 +741,8 @@ def test_move_sampling_uses_latest_position_without_duplicates(monkeypatch):
     recorder = MouseEventRecorder(sample_rate_hz=12)
     recorder._active = True
     recorder._volume_node = object()
-    recorder.record_non_annotative_movement = True
     recorder.context_fn = lambda view_name=None: {'tool': None}
-    ras_by_xy = {
-        (10, 20): [1.0, 2.0, 3.0],
-        (30, 40): [3.0, 4.0, 5.0],
-    }
-    monkeypatch.setattr(
-        recorder_mod, '_slice_xy_to_ras',
-        lambda view, xy: ras_by_xy[xy],
-    )
-    monkeypatch.setattr(recorder_mod, '_ras_inside_volume', lambda volume, ras: True)
-    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view: {'view_name': view})
+    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view, volume_node=None: {'view_name': view})
 
     recorder._on_mouse(
         'Red', (10, 20), MOVE,
@@ -486,30 +756,18 @@ def test_move_sampling_uses_latest_position_without_duplicates(monkeypatch):
     recorder._sample_pending_move()
 
     assert [r.event_type for r in recorder.records] == [MOVE]
-    assert recorder.records[0].ras == [3.0, 4.0, 5.0]
+    assert recorder.records[0].ras is None
+    assert recorder.records[0].payload['xy'] == [30, 40]
 
 
-def test_in_volume_move_is_kept_if_cursor_leaves_before_timer(monkeypatch):
+def test_latest_raw_move_is_kept_without_volume_conversion(monkeypatch):
     recorder = MouseEventRecorder(sample_rate_hz=12)
     recorder._active = True
     recorder._volume_node = object()
-    recorder.record_non_annotative_movement = True
     recorder.context_fn = lambda view_name=None: {'tool': None}
     inside_ts = datetime.datetime(2026, 1, 1, 12, 0, 0)
     outside_ts = inside_ts + datetime.timedelta(milliseconds=10)
-    ras_by_xy = {
-        (10, 20): [1.0, 2.0, 3.0],
-        (999, 999): [999.0, 999.0, 999.0],
-    }
-    monkeypatch.setattr(
-        recorder_mod, '_slice_xy_to_ras',
-        lambda view, xy: ras_by_xy[xy],
-    )
-    monkeypatch.setattr(
-        recorder_mod, '_ras_inside_volume',
-        lambda volume, ras: ras != [999.0, 999.0, 999.0],
-    )
-    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view: {'view_name': view})
+    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view, volume_node=None: {'view_name': view})
 
     recorder._capture_pending_move(
         inside_ts, 'Red', (10, 20),
@@ -522,26 +780,250 @@ def test_in_volume_move_is_kept_if_cursor_leaves_before_timer(monkeypatch):
     recorder._sample_pending_move()
 
     assert [r.event_type for r in recorder.records] == [MOVE]
-    assert recorder.records[0].ras == [1.0, 2.0, 3.0]
-    assert recorder.records[0].timestamp == inside_ts
+    assert recorder.records[0].ras is None
+    assert recorder.records[0].payload['xy'] == [999, 999]
+    assert recorder.records[0].timestamp == outside_ts
+
+
+def test_hot_path_drops_inactive_xy_before_raw_record_accumulates():
+    identity = [1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0]
+    recorder = MouseEventRecorder(sample_rate_hz=12)
+    recorder._active = True
+    recorder._active_region_gate = recorder_mod._ActiveRegionGate({
+        'volume': {
+            'dimensions': [5, 5, 5],
+            'ras_to_ijk': identity,
+        },
+        'initial_visual_state': {
+            'Red': {'xy_to_ras': identity, 'xy_to_ijk': identity},
+        },
+    })
+
+    recorder._on_mouse(
+        'Red', (-1, 1), MOVE,
+        {'mouse_status': 'move', 'analysis_event_type': 'trajectory_event'},
+    )
+    recorder._sample_pending_move()
+    recorder._on_mouse(
+        'Red', (1, 1), MOVE,
+        {'mouse_status': 'move', 'analysis_event_type': 'trajectory_event'},
+    )
+    recorder._sample_pending_move()
+
+    assert [r.payload['xy'] for r in recorder.records] == [[1, 1]]
+
+
+def test_active_region_gate_prefers_dataprobe_xy_to_ijk_for_bounds():
+    identity = [1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0]
+    outside_xy_to_ras = [100.0, 0.0, 0.0, 1000.0,
+                         0.0, 100.0, 0.0, 1000.0,
+                         0.0, 0.0, 1.0, 1000.0,
+                         0.0, 0.0, 0.0, 1.0]
+    inside_xy_to_ijk = [1.0, 0.0, 0.0, 0.0,
+                        0.0, 1.0, 0.0, 0.0,
+                        0.0, 0.0, 0.0, 2.0,
+                        0.0, 0.0, 0.0, 1.0]
+    gate = recorder_mod._ActiveRegionGate({
+        'volume': {
+            'dimensions': [20, 20, 5],
+            'ras_to_ijk': identity,
+        },
+        'initial_visual_state': {
+            'Red': {
+                'xy_to_ras': outside_xy_to_ras,
+                'xy_to_ijk': inside_xy_to_ijk,
+            },
+        },
+    })
+
+    assert gate.accepts_xy('Red', (10, 10)) is True
+    assert gate.accepts_xy('Red', (25, 10)) is False
+
+
+def test_hot_path_drops_inactive_boundary_but_updates_button_state(monkeypatch):
+    identity = [1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0]
+    recorder = MouseEventRecorder(sample_rate_hz=12)
+    recorder._active = True
+    recorder._active_region_gate = recorder_mod._ActiveRegionGate({
+        'volume': {
+            'dimensions': [5, 5, 5],
+            'ras_to_ijk': identity,
+        },
+        'initial_visual_state': {
+            'Red': {'xy_to_ras': identity, 'xy_to_ijk': identity},
+        },
+    })
+    monkeypatch.setattr(
+        recorder_mod, '_visual_state',
+        lambda view, volume_node=None: {'xy_to_ras': identity, 'xy_to_ijk': identity})
+
+    recorder._on_mouse(
+        'Red', (-1, 1), PRESS,
+        {'mouse_status': 'press', 'analysis_event_type': 'boundary_event'},
+    )
+    assert recorder.records == []
+    assert recorder._active_mouse_press is True
+
+    recorder._on_mouse(
+        'Red', (-1, 1), RELEASE,
+        {'mouse_status': 'release', 'analysis_event_type': 'boundary_event'},
+    )
+    assert recorder.records == []
+    assert recorder._active_mouse_press is False
+
+
+def test_released_hover_moves_are_thinned_by_pixel_and_time_threshold():
+    recorder = MouseEventRecorder(sample_rate_hz=30)
+    recorder._active = True
+    t0 = datetime.datetime(2026, 1, 1, 12, 0, 0)
+
+    recorder._capture_pending_move(
+        t0, 'Red', (10, 10),
+        {'mouse_status': 'move', 'left_button_down': False},
+    )
+    recorder._sample_pending_move()
+    recorder._capture_pending_move(
+        t0 + datetime.timedelta(milliseconds=30), 'Red', (11, 10),
+        {'mouse_status': 'move', 'left_button_down': False},
+    )
+    recorder._sample_pending_move()
+    recorder._capture_pending_move(
+        t0 + datetime.timedelta(milliseconds=60), 'Red', (13, 10),
+        {'mouse_status': 'move', 'left_button_down': False},
+    )
+    recorder._sample_pending_move()
+    recorder._capture_pending_move(
+        t0 + datetime.timedelta(milliseconds=320), 'Red', (14, 10),
+        {'mouse_status': 'move', 'left_button_down': False},
+    )
+    recorder._sample_pending_move()
+
+    assert [r.payload['xy'] for r in recorder.records] == [
+        [10, 10], [13, 10], [14, 10],
+    ]
+
+
+def test_pressed_annotation_moves_keep_one_pixel_changes():
+    recorder = MouseEventRecorder(sample_rate_hz=30)
+    recorder._active = True
+    t0 = datetime.datetime(2026, 1, 1, 12, 0, 0)
+
+    recorder._capture_pending_move(
+        t0, 'Red', (10, 10),
+        {'mouse_status': 'move', 'left_button_down': True},
+    )
+    recorder._sample_pending_move()
+    recorder._capture_pending_move(
+        t0 + datetime.timedelta(milliseconds=30), 'Red', (11, 10),
+        {'mouse_status': 'move', 'left_button_down': True},
+    )
+    recorder._sample_pending_move()
+
+    assert [r.payload['xy'] for r in recorder.records] == [[10, 10], [11, 10]]
+    assert [r.payload['mouse_button_state'] for r in recorder.records] == [
+        'pressed', 'pressed',
+    ]
+
+
+def test_move_pressed_state_change_is_kept_even_without_xy_change():
+    recorder = MouseEventRecorder(sample_rate_hz=30)
+    recorder._active = True
+    t0 = datetime.datetime(2026, 1, 1, 12, 0, 0)
+
+    recorder._capture_pending_move(
+        t0, 'Red', (10, 10),
+        {'mouse_status': 'move', 'left_button_down': False},
+    )
+    recorder._sample_pending_move()
+    recorder._capture_pending_move(
+        t0 + datetime.timedelta(milliseconds=30), 'Red', (10, 10),
+        {'mouse_status': 'move', 'left_button_down': True},
+    )
+    recorder._sample_pending_move()
+
+    assert [r.payload['xy'] for r in recorder.records] == [[10, 10], [10, 10]]
+    assert [r.payload['mouse_button_state'] for r in recorder.records] == [
+        'released', 'pressed',
+    ]
+
+
+def test_hover_move_threshold_scales_with_xy_to_ijk():
+    xy_to_ijk = [0.25, 0.0, 0.0, 0.0,
+                 0.0, 0.25, 0.0, 0.0,
+                 0.0, 0.0, 1.0, 0.0,
+                 0.0, 0.0, 0.0, 1.0]
+    recorder = MouseEventRecorder(sample_rate_hz=60)
+    recorder._active = True
+    recorder._active_region_gate = recorder_mod._ActiveRegionGate({
+        'volume': {
+            'dimensions': [100, 100, 100],
+            'ras_to_ijk': [1.0, 0.0, 0.0, 0.0,
+                           0.0, 1.0, 0.0, 0.0,
+                           0.0, 0.0, 1.0, 0.0,
+                           0.0, 0.0, 0.0, 1.0],
+        },
+        'initial_visual_state': {
+            'Red': {'xy_to_ijk': xy_to_ijk},
+        },
+    })
+    t0 = datetime.datetime(2026, 1, 1, 12, 0, 0)
+
+    for dt, xy in ((0, (10, 10)), (30, (16, 10)), (60, (18, 10))):
+        recorder._capture_pending_move(
+            t0 + datetime.timedelta(milliseconds=dt), 'Red', xy,
+            {'mouse_status': 'move', 'left_button_down': False},
+        )
+        recorder._sample_pending_move()
+
+    assert [r.payload['xy'] for r in recorder.records] == [[10, 10], [18, 10]]
+
+
+def test_pressed_move_threshold_scales_with_xy_to_ijk():
+    xy_to_ijk = [0.25, 0.0, 0.0, 0.0,
+                 0.0, 0.25, 0.0, 0.0,
+                 0.0, 0.0, 1.0, 0.0,
+                 0.0, 0.0, 0.0, 1.0]
+    recorder = MouseEventRecorder(sample_rate_hz=60)
+    recorder._active = True
+    recorder._active_region_gate = recorder_mod._ActiveRegionGate({
+        'volume': {
+            'dimensions': [100, 100, 100],
+            'ras_to_ijk': [1.0, 0.0, 0.0, 0.0,
+                           0.0, 1.0, 0.0, 0.0,
+                           0.0, 0.0, 1.0, 0.0,
+                           0.0, 0.0, 0.0, 1.0],
+        },
+        'initial_visual_state': {
+            'Red': {'xy_to_ijk': xy_to_ijk},
+        },
+    })
+    t0 = datetime.datetime(2026, 1, 1, 12, 0, 0)
+
+    for dt, xy in ((0, (10, 10)), (30, (11, 10)), (60, (12, 10))):
+        recorder._capture_pending_move(
+            t0 + datetime.timedelta(milliseconds=dt), 'Red', xy,
+            {'mouse_status': 'move', 'left_button_down': True},
+        )
+        recorder._sample_pending_move()
+
+    assert [r.payload['xy'] for r in recorder.records] == [[10, 10], [12, 10]]
 
 
 def test_pending_move_flushes_before_boundary(monkeypatch):
     recorder = MouseEventRecorder(sample_rate_hz=12)
     recorder._active = True
     recorder._volume_node = object()
-    recorder.record_non_annotative_movement = True
     recorder.context_fn = lambda view_name=None: {'tool': 'brush'}
-    ras_by_xy = {
-        (10, 20): [1.0, 2.0, 3.0],
-        (11, 21): [2.0, 3.0, 4.0],
-    }
-    monkeypatch.setattr(
-        recorder_mod, '_slice_xy_to_ras',
-        lambda view, xy: ras_by_xy[xy],
-    )
-    monkeypatch.setattr(recorder_mod, '_ras_inside_volume', lambda volume, ras: True)
-    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view: {'view_name': view})
+    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view, volume_node=None: {'view_name': view})
 
     recorder._on_mouse(
         'Red', (10, 20), MOVE,
@@ -553,94 +1035,23 @@ def test_pending_move_flushes_before_boundary(monkeypatch):
     )
 
     assert [r.event_type for r in recorder.records] == [MOVE, PRESS]
-    assert recorder.records[0].ras == [1.0, 2.0, 3.0]
-    assert recorder.records[1].ras == [2.0, 3.0, 4.0]
+    assert recorder.records[0].ras is None
+    assert recorder.records[0].payload['xy'] == [10, 20]
+    assert recorder.records[1].ras is None
+    assert recorder.records[1].payload['xy'] == [11, 21]
 
 
-def test_non_annotative_move_is_recorded_by_listener_when_option_is_off(monkeypatch):
+def test_brush_released_move_is_recorded(monkeypatch):
     recorder = MouseEventRecorder(sample_rate_hz=12)
     recorder._active = True
     recorder._volume_node = object()
-    recorder.record_non_annotative_movement = False
-    recorder.context_fn = lambda view_name=None: {'tool': None}
-    monkeypatch.setattr(recorder_mod, '_slice_xy_to_ras', lambda view, xy: [1.0, 2.0, 3.0])
-    monkeypatch.setattr(recorder_mod, '_ras_inside_volume', lambda volume, ras: True)
-    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view: {'view_name': view})
-
-    recorder._on_mouse(
-        'Red', (10, 20), MOVE,
-        {'mouse_status': 'move', 'analysis_event_type': 'trajectory_event'},
-    )
-    recorder._sample_pending_move()
-
-    assert [r.event_type for r in recorder.records] == [MOVE]
-    assert recorder.records[0].payload['trajectory_kind'] == 'non_annotation_move'
-
-
-def test_non_annotative_move_is_recorded_when_option_is_on(monkeypatch):
-    recorder = MouseEventRecorder(sample_rate_hz=12)
-    recorder._active = True
-    recorder._volume_node = object()
-    recorder.record_non_annotative_movement = True
-    recorder.context_fn = lambda view_name=None: {'tool': None}
-    monkeypatch.setattr(recorder_mod, '_slice_xy_to_ras', lambda view, xy: [1.0, 2.0, 3.0])
-    monkeypatch.setattr(recorder_mod, '_ras_inside_volume', lambda volume, ras: True)
-    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view: {'view_name': view})
-
-    recorder._on_mouse(
-        'Red', (10, 20), MOVE,
-        {'mouse_status': 'move', 'analysis_event_type': 'trajectory_event'},
-    )
-    recorder._sample_pending_move()
-
-    assert [r.event_type for r in recorder.records] == [MOVE]
-    assert recorder.records[0].payload['trajectory_kind'] == 'non_annotation_move'
-
-
-def test_brush_drag_move_records_when_non_annotative_option_is_off(monkeypatch):
-    recorder = MouseEventRecorder(sample_rate_hz=12)
-    recorder._active = True
-    recorder._volume_node = object()
-    recorder.record_non_annotative_movement = False
     recorder.context_fn = lambda view_name=None: {
         'tool': 'brush',
         'axis': 0,
         'slice_idx': 3,
         'brush_radius_mm': 2.5,
     }
-    monkeypatch.setattr(recorder_mod, '_slice_xy_to_ras', lambda view, xy: [1.0, 2.0, 3.0])
-    monkeypatch.setattr(recorder_mod, '_ras_inside_volume', lambda volume, ras: True)
-    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view: {'view_name': view})
-
-    recorder._on_mouse(
-        'Red', (10, 20), MOVE,
-        {
-            'mouse_status': 'move',
-            'left_button_down': True,
-            'analysis_event_type': 'trajectory_event',
-        },
-    )
-    recorder._sample_pending_move()
-
-    assert [r.event_type for r in recorder.records] == [PRESS, MOVE]
-    assert recorder.records[1].payload['mouse_button_state'] == 'pressed'
-    assert recorder.records[1].payload['trajectory_kind'] == 'annotation_move'
-
-
-def test_brush_released_move_is_recorded_by_listener_when_non_annotative_option_is_off(monkeypatch):
-    recorder = MouseEventRecorder(sample_rate_hz=12)
-    recorder._active = True
-    recorder._volume_node = object()
-    recorder.record_non_annotative_movement = False
-    recorder.context_fn = lambda view_name=None: {
-        'tool': 'brush',
-        'axis': 0,
-        'slice_idx': 3,
-        'brush_radius_mm': 2.5,
-    }
-    monkeypatch.setattr(recorder_mod, '_slice_xy_to_ras', lambda view, xy: [1.0, 2.0, 3.0])
-    monkeypatch.setattr(recorder_mod, '_ras_inside_volume', lambda volume, ras: True)
-    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view: {'view_name': view})
+    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view, volume_node=None: {'view_name': view})
 
     recorder._on_mouse(
         'Red', (10, 20), MOVE,
@@ -654,41 +1065,12 @@ def test_brush_released_move_is_recorded_by_listener_when_non_annotative_option_
 
     assert [r.event_type for r in recorder.records] == [MOVE]
     assert recorder.records[0].payload['mouse_button_state'] == 'released'
-    assert recorder.records[0].payload['trajectory_kind'] == 'non_annotation_move'
+    assert recorder.records[0].ras is None
+    assert recorder.records[0].payload['xy'] == [10, 20]
+    assert 'trajectory_kind' not in recorder.records[0].payload
 
 
-def test_brush_released_move_is_recorded_when_non_annotative_option_is_on(monkeypatch):
-    recorder = MouseEventRecorder(sample_rate_hz=12)
-    recorder._active = True
-    recorder._volume_node = object()
-    recorder.record_non_annotative_movement = True
-    recorder.context_fn = lambda view_name=None: {
-        'tool': 'brush',
-        'axis': 0,
-        'slice_idx': 3,
-        'brush_radius_mm': 2.5,
-    }
-    monkeypatch.setattr(recorder_mod, '_slice_xy_to_ras', lambda view, xy: [1.0, 2.0, 3.0])
-    monkeypatch.setattr(recorder_mod, '_ras_inside_volume', lambda volume, ras: True)
-    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view: {'view_name': view})
-
-    recorder._on_mouse(
-        'Red', (10, 20), MOVE,
-        {
-            'mouse_status': 'move',
-            'left_button_down': False,
-            'analysis_event_type': 'trajectory_event',
-        },
-    )
-    recorder._sample_pending_move()
-
-    assert [r.event_type for r in recorder.records] == [MOVE]
-    assert recorder.records[0].payload['mouse_button_state'] == 'released'
-    assert recorder.records[0].payload['trajectory_kind'] == 'non_annotation_move'
-    assert recorder.records[0].payload['trajectory_role'] == 'visualization_trajectory'
-
-
-def test_brush_drag_move_infers_missing_press_boundary(monkeypatch):
+def test_brush_drag_move_stays_raw_when_press_was_not_seen(monkeypatch):
     recorder = MouseEventRecorder(sample_rate_hz=12)
     recorder._active = True
     recorder._volume_node = object()
@@ -698,9 +1080,7 @@ def test_brush_drag_move_infers_missing_press_boundary(monkeypatch):
         'slice_idx': 3,
         'brush_radius_mm': 2.5,
     }
-    monkeypatch.setattr(recorder_mod, '_slice_xy_to_ras', lambda view, xy: [1.0, 2.0, 3.0])
-    monkeypatch.setattr(recorder_mod, '_ras_inside_volume', lambda volume, ras: True)
-    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view: {'view_name': view})
+    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view, volume_node=None: {'view_name': view})
 
     recorder._on_mouse(
         'Red', (10, 20), MOVE,
@@ -712,14 +1092,13 @@ def test_brush_drag_move_infers_missing_press_boundary(monkeypatch):
     )
     recorder._sample_pending_move()
 
-    assert [r.event_type for r in recorder.records] == [PRESS, MOVE]
-    assert recorder.records[0].payload['mouse_status'] == 'press'
-    assert recorder.records[0].payload['analysis_event_type'] == 'boundary_event'
-    assert recorder.records[0].payload['boundary_source'] == 'inferred_from_first_drag_sample'
-    assert recorder.records[1].payload['trajectory_role'] == 'annotation_trajectory'
+    assert [r.event_type for r in recorder.records] == [MOVE]
+    assert recorder.records[0].payload['left_button_down'] is True
+    assert recorder.records[0].payload['mouse_button_state'] == 'pressed'
+    assert recorder.records[0].ras is None
 
 
-def test_brush_release_infers_missing_press_boundary(monkeypatch):
+def test_brush_release_without_seen_press_stays_raw_release(monkeypatch):
     recorder = MouseEventRecorder(sample_rate_hz=12)
     recorder._active = True
     recorder._volume_node = object()
@@ -729,26 +1108,22 @@ def test_brush_release_infers_missing_press_boundary(monkeypatch):
         'slice_idx': 3,
         'brush_radius_mm': 2.5,
     }
-    monkeypatch.setattr(recorder_mod, '_slice_xy_to_ras', lambda view, xy: [1.0, 2.0, 3.0])
-    monkeypatch.setattr(recorder_mod, '_ras_inside_volume', lambda volume, ras: True)
-    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view: {'view_name': view})
+    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view, volume_node=None: {'view_name': view})
 
     recorder._on_mouse(
         'Red', (10, 20), RELEASE,
         {'mouse_status': 'release', 'analysis_event_type': 'boundary_event'},
     )
 
-    assert [r.event_type for r in recorder.records] == [PRESS, RELEASE]
-    assert recorder.records[0].payload['boundary_source'] == 'inferred_from_release'
-    assert recorder.records[1].payload['mouse_status'] == 'release'
+    assert [r.event_type for r in recorder.records] == [RELEASE]
+    assert recorder.records[0].payload['mouse_status'] == 'release'
+    assert recorder.records[0].payload['handler'] == 'brush'
 
 
 def test_visualization_trajectory_role_for_view_events(monkeypatch):
     recorder = MouseEventRecorder(sample_rate_hz=12)
     recorder._volume_node = object()
-    monkeypatch.setattr(recorder_mod, '_slice_xy_to_ras', lambda view, xy: [1.0, 2.0, 3.0])
-    monkeypatch.setattr(recorder_mod, '_ras_inside_volume', lambda volume, ras: True)
-    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view: {'view_name': view})
+    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view, volume_node=None: {'view_name': view})
 
     recorder._on_mouse(
         'Red', (10, 20), VIEW_CHANGED,
@@ -759,12 +1134,13 @@ def test_visualization_trajectory_role_for_view_events(monkeypatch):
         },
     )
 
-    assert recorder.records[0].payload['trajectory_role'] == 'visualization_trajectory'
+    assert recorder.records[0].payload['visual_state'] == {'view_name': 'Red'}
+    assert 'trajectory_role' not in recorder.records[0].payload
 
 
 def test_point_drag_records_boundary_and_non_annotation_trajectory(monkeypatch):
     recorder = MouseEventRecorder(sample_rate_hz=12)
-    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view: {'view_name': view})
+    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view, volume_node=None: {'view_name': view})
 
     recorder.record_point_drag(
         'start', 'seg-a', [1.0, 2.0, 3.0], False,
@@ -781,7 +1157,7 @@ def test_point_drag_records_boundary_and_non_annotation_trajectory(monkeypatch):
         point_name='Point 2')
 
     assert [r.event_type for r in recorder.records] == [
-        POINT_DRAG_START, POINT_DRAG_MOVE, 'point_placed',
+        POINT_DRAG_START, POINT_DRAG_MOVE, POINT_REPLACED,
     ]
     assert recorder.records[0].payload['analysis_event_type'] == 'boundary_event'
     assert recorder.records[0].payload['point_action'] == 'grab'
@@ -813,7 +1189,7 @@ def test_point_removed_is_boundary_event():
 
 def test_point_placement_is_single_release_boundary_event(monkeypatch):
     recorder = MouseEventRecorder(sample_rate_hz=12)
-    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view: {'view_name': view})
+    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view, volume_node=None: {'view_name': view})
 
     recorder.record_point_placed(
         'seg-a', [1.0, 2.0, 3.0], False,
@@ -835,9 +1211,7 @@ def test_raw_point_press_release_are_recorded_as_listener_events(monkeypatch):
     recorder._active = True
     recorder._volume_node = object()
     recorder.context_fn = lambda view_name=None: {'tool': 'point'}
-    monkeypatch.setattr(recorder_mod, '_slice_xy_to_ras', lambda view, xy: [1.0, 2.0, 3.0])
-    monkeypatch.setattr(recorder_mod, '_ras_inside_volume', lambda volume, ras: True)
-    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view: {'view_name': view})
+    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view, volume_node=None: {'view_name': view})
 
     recorder._on_mouse(
         'Red', (10, 20), PRESS,
@@ -853,30 +1227,24 @@ def test_raw_point_press_release_are_recorded_as_listener_events(monkeypatch):
     assert recorder.records[1].payload['handler'] == 'point'
 
 
-def test_point_held_move_records_non_annotation_when_non_annotative_option_is_off(monkeypatch):
+def test_mouse_listener_records_xy_without_coordinate_conversion(monkeypatch):
     recorder = MouseEventRecorder(sample_rate_hz=12)
     recorder._active = True
-    recorder._volume_node = object()
-    recorder.record_non_annotative_movement = False
-    recorder.context_fn = lambda view_name=None: {'tool': 'point'}
-    monkeypatch.setattr(recorder_mod, '_slice_xy_to_ras', lambda view, xy: [1.0, 2.0, 3.0])
-    monkeypatch.setattr(recorder_mod, '_ras_inside_volume', lambda volume, ras: True)
-    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view: {'view_name': view})
+    recorder.context_fn = lambda view_name=None: {'tool': 'brush'}
+    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view, volume_node=None: {'view_name': view})
 
     recorder._on_mouse(
         'Red', (10, 20), MOVE,
-        {
-            'mouse_status': 'move',
-            'left_button_down': True,
-            'analysis_event_type': 'trajectory_event',
-        },
+        {'mouse_status': 'move', 'analysis_event_type': 'trajectory_event'},
     )
     recorder._sample_pending_move()
+    recorder._on_mouse(
+        'Red', (11, 21), PRESS,
+        {'mouse_status': 'press', 'analysis_event_type': 'boundary_event'},
+    )
 
-    assert [r.event_type for r in recorder.records] == [MOVE]
-    assert recorder.records[0].payload['mouse_button_state'] == 'pressed'
-    assert recorder.records[0].payload['trajectory_kind'] == 'non_annotation_move'
-    assert recorder.records[0].payload['trajectory_role'] == 'visualization_trajectory'
+    assert [r.ras for r in recorder.records] == [None, None]
+    assert [r.payload['xy'] for r in recorder.records] == [[10, 20], [11, 21]]
 
 
 def test_point_drag_sampling_can_be_checked_before_node_work():
@@ -889,3 +1257,642 @@ def test_point_drag_sampling_can_be_checked_before_node_work():
     assert recorder.should_sample_point_drag('move') is False
     assert recorder.should_sample_point_drag('start') is True
     assert recorder.should_sample_point_drag('end') is True
+
+
+# ---------------------------------------------------------------------------
+# export_interpreted_data / export_raw_data
+# ---------------------------------------------------------------------------
+
+def test_interpreted_maps_annotation_move_to_brush_move():
+    recorder = MouseEventRecorder()
+    recorder._append(
+        MOVE, [1.0, 2.0, 3.0],
+        {'mouse_status': 'move', 'analysis_event_type': 'trajectory_event',
+         'trajectory_kind': 'annotation_move', 'handler': 'brush',
+         'segment_id': 'seg-1'},
+    )
+    events = recorder.export_interpreted_data()['events']
+    assert len(events) == 1
+    assert events[0]['event'] == 'brush_move'
+    assert 'pressed' not in events[0]
+    assert 'kind' not in events[0]
+    assert 'analysis' not in events[0]
+
+
+def test_interpreted_omits_non_annotation_move_from_cleaned_record():
+    recorder = MouseEventRecorder()
+    recorder._append(
+        MOVE, [1.0, 2.0, 3.0],
+        {'mouse_status': 'move', 'analysis_event_type': 'trajectory_event',
+         'trajectory_kind': 'non_annotation_move', 'handler': 'brush',
+         'segment_id': 'seg-1'},
+    )
+    events = recorder.export_interpreted_data()['events']
+    assert events == []
+
+
+def test_interpreted_infers_brush_move_from_raw_xy_and_cached_context():
+    identity = [1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0]
+    recorder = MouseEventRecorder()
+    recorder._append(METADATA, None, {
+        'volume': {
+            'dimensions': [10, 10, 10],
+            'ras_to_ijk': identity,
+        },
+        'initial_visual_state': {
+            'Red': {'xy_to_ras': identity, 'xy_to_ijk': identity},
+        },
+        'initial_handler_context': {
+            'Red': {
+                'view_name': 'Red',
+                'handler': 'brush',
+                'tool': 'brush',
+                'segment_id': 'seg-a',
+                'brush_radius_mm': 2.5,
+                'slice_idx': 4,
+            },
+        },
+    })
+    recorder._append(
+        MOVE, None,
+        {
+            'view_name': 'Red',
+            'xy': [3, 4],
+            'mouse_status': 'move',
+            'left_button_down': True,
+            'mouse_button_state': 'pressed',
+            'analysis_event_type': 'trajectory_event',
+        },
+    )
+
+    events = recorder.export_interpreted_data()['events']
+
+    assert events == [{
+        'id': 1,
+        'timestamp': recorder.records[1].timestamp.isoformat(timespec='milliseconds'),
+        'event': 'brush_move',
+        'ijk': [3, 4, 0],
+        'view': 'Red',
+        'segment': 'seg-a',
+        'tool': 'brush',
+        'brush_mm': 2.5,
+    }]
+
+
+def test_interpreted_prefers_dataprobe_xy_to_ijk_over_xy_to_ras():
+    identity = [1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0]
+    xy_to_ijk = [10.0, 0.0, 0.0, 0.0,
+                 0.0, 10.0, 0.0, 0.0,
+                 0.0, 0.0, 0.0, 5.0,
+                 0.0, 0.0, 0.0, 1.0]
+    recorder = MouseEventRecorder()
+    recorder._append(METADATA, None, {
+        'volume': {
+            'dimensions': [100, 100, 10],
+            'ras_to_ijk': identity,
+        },
+        'initial_visual_state': {
+            'Red': {
+                'xy_to_ras': identity,
+                'xy_to_ijk': xy_to_ijk,
+                'xy_coordinate_system': 'vtk_device',
+            },
+        },
+        'initial_handler_context': {
+            'Red': {
+                'view_name': 'Red',
+                'handler': 'brush',
+                'tool': 'brush',
+                'segment_id': 'seg-a',
+            },
+        },
+    })
+    recorder._append(
+        MOVE, None,
+        {
+            'view_name': 'Red',
+            'xy': [3, 4],
+            'mouse_status': 'move',
+            'left_button_down': True,
+            'mouse_button_state': 'pressed',
+            'analysis_event_type': 'trajectory_event',
+        },
+    )
+
+    events = recorder.export_interpreted_data()['events']
+
+    assert events[0]['ijk'] == [30, 40, 5]
+
+
+def test_interpreted_emits_brush_click_when_press_release_has_no_move():
+    identity = [1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0]
+    recorder = MouseEventRecorder()
+    recorder._append(METADATA, None, {
+        'volume': {
+            'dimensions': [10, 10, 10],
+            'ras_to_ijk': identity,
+        },
+        'initial_visual_state': {
+            'Red': {'xy_to_ras': identity, 'xy_to_ijk': identity},
+        },
+    })
+    recorder._append(
+        PRESS, None,
+        {
+            'view_name': 'Red',
+            'xy': [3, 4],
+            'mouse_status': 'press',
+            'analysis_event_type': 'boundary_event',
+            'handler': 'brush',
+            'tool': 'brush',
+            'segment_id': 'seg-a',
+            'brush_radius_mm': 2.5,
+            'visual_state': {'xy_to_ras': identity, 'xy_to_ijk': identity},
+        },
+    )
+    recorder._append(
+        RELEASE, None,
+        {
+            'view_name': 'Red',
+            'xy': [3, 4],
+            'mouse_status': 'release',
+            'analysis_event_type': 'boundary_event',
+        },
+    )
+
+    events = recorder.export_interpreted_data()['events']
+
+    assert events == [{
+        'id': 1,
+        'timestamp': recorder.records[2].timestamp.isoformat(timespec='milliseconds'),
+        'event': 'brush_click',
+        'ijk': [3, 4, 0],
+        'view': 'Red',
+        'segment': 'seg-a',
+        'tool': 'brush',
+        'brush_mm': 2.5,
+    }]
+    assert [event['event'] for event in recorder.export_raw_data()['events']] == [
+        PRESS, RELEASE,
+    ]
+
+
+def test_interpreted_does_not_emit_brush_click_when_pressed_move_was_recorded():
+    identity = [1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0]
+    recorder = MouseEventRecorder()
+    recorder._append(METADATA, None, {
+        'volume': {
+            'dimensions': [10, 10, 10],
+            'ras_to_ijk': identity,
+        },
+        'initial_visual_state': {
+            'Red': {'xy_to_ras': identity, 'xy_to_ijk': identity},
+        },
+    })
+    recorder._append(
+        PRESS, None,
+        {
+            'view_name': 'Red',
+            'xy': [3, 4],
+            'mouse_status': 'press',
+            'analysis_event_type': 'boundary_event',
+            'handler': 'brush',
+            'tool': 'brush',
+            'segment_id': 'seg-a',
+            'brush_radius_mm': 2.5,
+            'visual_state': {'xy_to_ras': identity, 'xy_to_ijk': identity},
+        },
+    )
+    recorder._append(
+        MOVE, None,
+        {
+            'view_name': 'Red',
+            'xy': [4, 4],
+            'mouse_status': 'move',
+            'left_button_down': True,
+            'mouse_button_state': 'pressed',
+            'analysis_event_type': 'trajectory_event',
+        },
+    )
+    recorder._append(
+        RELEASE, None,
+        {
+            'view_name': 'Red',
+            'xy': [4, 4],
+            'mouse_status': 'release',
+            'analysis_event_type': 'boundary_event',
+        },
+    )
+
+    events = recorder.export_interpreted_data()['events']
+
+    assert [event['event'] for event in events] == ['brush_move']
+
+
+def test_interpreted_skips_raw_xy_outside_volume():
+    identity = [1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0]
+    recorder = MouseEventRecorder()
+    recorder._append(METADATA, None, {
+        'volume': {'dimensions': [5, 5, 5], 'ras_to_ijk': identity},
+        'initial_visual_state': {'Red': {'xy_to_ras': identity, 'xy_to_ijk': identity}},
+    })
+    recorder._append(
+        MOVE, None,
+        {
+            'view_name': 'Red',
+            'xy': [100, 100],
+            'mouse_status': 'move',
+            'mouse_button_state': 'released',
+            'analysis_event_type': 'trajectory_event',
+        },
+    )
+
+    assert recorder.export_interpreted_data()['events'] == []
+
+
+def test_interpreted_uses_strict_ijk_bounds_for_active_region():
+    identity = [1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0]
+    recorder = MouseEventRecorder()
+    recorder._append(METADATA, None, {
+        'volume': {
+            'dimensions': [5, 5, 5],
+            'ras_to_ijk': identity,
+        },
+        'initial_visual_state': {
+            'Red': {'xy_to_ras': identity, 'xy_to_ijk': identity},
+        },
+        'initial_handler_context': {
+            'Red': {
+                'view_name': 'Red',
+                'handler': 'brush',
+                'tool': 'brush',
+                'segment_id': 'seg-a',
+            },
+        },
+    })
+    recorder._append(
+        MOVE, None,
+        {
+            'view_name': 'Red',
+            'xy': [-0.25, 1],
+            'mouse_status': 'move',
+            'left_button_down': True,
+            'mouse_button_state': 'pressed',
+            'analysis_event_type': 'trajectory_event',
+        },
+    )
+    recorder._append(
+        MOVE, None,
+        {
+            'view_name': 'Red',
+            'xy': [1, 1],
+            'mouse_status': 'move',
+            'left_button_down': True,
+            'mouse_button_state': 'pressed',
+            'analysis_event_type': 'trajectory_event',
+        },
+    )
+
+    events = recorder.export_interpreted_data()['events']
+
+    assert [event['ijk'] for event in events] == [[1, 1, 0]]
+
+
+def test_interpreted_skips_point_placement_outside_ijk_bounds():
+    identity = [1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0]
+    recorder = MouseEventRecorder()
+    recorder._append(METADATA, None, {
+        'volume': {
+            'dimensions': [5, 5, 5],
+            'ras_to_ijk': identity,
+        },
+    })
+    recorder.record_point_placed(
+        'seg-a', [-0.25, 1.0, 1.0], False,
+        point_index=0, point_id='cp-0', point_name='Pos-1')
+    recorder.record_point_placed(
+        'seg-a', [1.0, 1.0, 1.0], False,
+        point_index=1, point_id='cp-1', point_name='Pos-2')
+
+    events = recorder.export_interpreted_data()['events']
+
+    assert [event['point'] for event in events] == ['cp-1']
+    assert events[0]['ijk'] == [1, 1, 1]
+
+
+def test_raw_export_filters_mouse_events_outside_ijk_bounds():
+    identity = [1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0]
+    recorder = MouseEventRecorder()
+    recorder._append(METADATA, None, {
+        'volume': {
+            'dimensions': [5, 5, 5],
+            'ras_to_ijk': identity,
+        },
+        'initial_visual_state': {
+            'Red': {'xy_to_ras': identity, 'xy_to_ijk': identity},
+        },
+    })
+    recorder._append(
+        MOVE, None,
+        {
+            'view_name': 'Red',
+            'xy': [-0.25, 1],
+            'xy_global': [100, 200],
+            'mouse_button_state': 'released',
+        },
+    )
+    recorder._append(
+        MOVE, None,
+        {
+            'view_name': 'Red',
+            'xy': [1, 1],
+            'xy_global': [101, 201],
+            'mouse_button_state': 'released',
+        },
+    )
+
+    events = recorder.export_raw_data()['events']
+
+    assert [event['xy'] for event in events] == [[1, 1]]
+    assert 'ijk' not in events[0]
+
+
+def test_brush_parameter_changes_are_coalesced_until_release(monkeypatch):
+    recorder = MouseEventRecorder(sample_rate_hz=12)
+    recorder._append(METADATA, None, {'volume': {'spacing': [2.0, 4.0, 8.0]}})
+    recorder._active = True
+    state = {'brush_radius_mm': 2.5}
+    recorder.context_fn = lambda view_name=None: {
+        'tool': 'brush',
+        'segment_id': 'seg-a',
+        'view_name': view_name or 'Red',
+        'axis': 0,
+        'slice_idx': 7,
+        'brush_radius_mm': state['brush_radius_mm'],
+    }
+    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view, volume_node=None: {'view_name': view})
+
+    recorder._on_mouse(
+        'Red', (10, 20), PRESS,
+        {'mouse_status': 'press', 'analysis_event_type': 'boundary_event'},
+    )
+    state['brush_radius_mm'] = 3.0
+    recorder.record_brush_diameter_changed(6.0)
+    state['brush_radius_mm'] = 4.0
+    recorder.record_brush_diameter_changed(8.0)
+    recorder._on_mouse(
+        'Red', (11, 21), RELEASE,
+        {'mouse_status': 'release', 'analysis_event_type': 'boundary_event'},
+    )
+
+    raw_events = recorder.export_raw_data()['events']
+    raw_params = [
+        event for event in raw_events
+        if event['event'] == BRUSH_PARAMETERS_CHANGED
+    ]
+    clean_params = [
+        event for event in recorder.export_interpreted_data()['events']
+        if event['event'] == 'brush_parameters'
+    ]
+
+    assert [r.event_type for r in recorder.records if r.event_type != METADATA] == [
+        PRESS, BRUSH_PARAMETERS_CHANGED, RELEASE,
+    ]
+    assert len(raw_params) == 1
+    assert raw_params[0]['diameter_mm'] == 8.0
+    assert raw_params[0]['tool'] == 'brush'
+    assert len(clean_params) == 1
+    assert clean_params[0]['diameter_ijk'] == [4.0, 2.0, 1.0]
+    assert 'diameter_mm' not in clean_params[0]
+
+
+def test_release_context_records_silent_final_brush_parameter_change(monkeypatch):
+    recorder = MouseEventRecorder(sample_rate_hz=12)
+    recorder._append(METADATA, None, {'volume': {'spacing': [2.0, 4.0, 8.0]}})
+    recorder._active = True
+    state = {'brush_radius_mm': 2.5}
+    recorder.context_fn = lambda view_name=None: {
+        'tool': 'erase',
+        'segment_id': 'seg-a',
+        'view_name': view_name or 'Red',
+        'axis': 0,
+        'slice_idx': 7,
+        'brush_radius_mm': state['brush_radius_mm'],
+    }
+    monkeypatch.setattr(recorder_mod, '_visual_state', lambda view, volume_node=None: {'view_name': view})
+
+    recorder._on_mouse(
+        'Red', (10, 20), PRESS,
+        {'mouse_status': 'press', 'analysis_event_type': 'boundary_event'},
+    )
+    state['brush_radius_mm'] = 5.0
+    recorder._on_mouse(
+        'Red', (11, 21), RELEASE,
+        {'mouse_status': 'release', 'analysis_event_type': 'boundary_event'},
+    )
+
+    params = [
+        event for event in recorder.export_interpreted_data()['events']
+        if event['event'] == 'brush_parameters'
+    ]
+
+    assert [r.event_type for r in recorder.records if r.event_type != METADATA] == [
+        PRESS, BRUSH_PARAMETERS_CHANGED, RELEASE,
+    ]
+    assert params[0]['tool'] == 'erase'
+    assert params[0]['diameter_ijk'] == [5.0, 2.5, 1.25]
+
+
+def test_interpreted_suppresses_press_and_release():
+    recorder = MouseEventRecorder()
+    recorder._append(PRESS, [1.0, 2.0, 3.0],
+                     {'mouse_status': 'press', 'analysis_event_type': 'boundary_event'})
+    recorder._append(RELEASE, [1.0, 2.0, 3.0],
+                     {'mouse_status': 'release', 'analysis_event_type': 'boundary_event'})
+    events = recorder.export_interpreted_data()['events']
+    assert events == []
+
+
+def test_interpreted_maps_point_placed_to_point_placement():
+    recorder = MouseEventRecorder()
+    recorder.record_point_placed(
+        'seg-a', [1.0, 2.0, 3.0], False,
+        point_index=0, point_id='cp-0', point_name='Pos-1')
+    events = recorder.export_interpreted_data()['events']
+    assert len(events) == 1
+    ev = events[0]
+    assert ev['event'] == 'point_placement'
+    assert ev['point'] == 'cp-0'
+    assert ev['point_name'] == 'Pos-1'
+    assert 'ras_source' not in ev
+    assert 'mouse' not in ev
+
+
+def test_interpreted_maps_point_drag_end_to_point_move():
+    recorder = MouseEventRecorder()
+    recorder._active = True
+    recorder.record_point_drag(
+        'start', 'seg-a', [1.0, 2.0, 3.0], False,
+        point_index=0, point_id='cp-0', point_name='Pos-1')
+    recorder.record_point_drag(
+        'end', 'seg-a', [4.0, 5.0, 6.0], False,
+        point_index=0, point_id='cp-0', point_name='Pos-1')
+    events = recorder.export_interpreted_data()['events']
+    event_types = [e['event'] for e in events]
+    assert 'point_move' in event_types
+    assert 'point_drag_start' not in event_types
+    assert 'point_replaced' not in event_types
+
+
+def test_interpreted_uses_absolute_timestamps():
+    recorder = MouseEventRecorder()
+    recorder._append(
+        MOVE, [1.0, 2.0, 3.0],
+        {'mouse_status': 'move', 'analysis_event_type': 'trajectory_event',
+         'trajectory_kind': 'annotation_move', 'handler': 'brush'},
+    )
+    events = recorder.export_interpreted_data()['events']
+    ts = events[0]['timestamp']
+    assert 'T' in ts   # ISO-8601 format with date and time
+    assert 't_ms' not in events[0]
+
+
+def test_raw_includes_press_release_move():
+    recorder = MouseEventRecorder()
+    recorder._append(PRESS, [1.0, 2.0, 3.0],
+                     {'mouse_status': 'press', 'analysis_event_type': 'boundary_event',
+                      'view_name': 'Red', 'slice_idx': 7,
+                      'xy_global': [100, 200]})
+    recorder._append(
+        MOVE, [2.0, 3.0, 4.0],
+        {'mouse_status': 'move', 'analysis_event_type': 'trajectory_event',
+         'view_name': 'Red', 'mouse_button_state': 'pressed',
+         'trajectory_kind': 'annotation_move', 'slice_idx': 7,
+         'xy_global': [101, 201], 'handler': 'brush',
+         'segment_id': 'seg-a', 'brush_radius_mm': 2.5},
+    )
+    recorder._append(RELEASE, [3.0, 4.0, 5.0],
+                     {'mouse_status': 'release', 'analysis_event_type': 'boundary_event',
+                      'view_name': 'Red', 'slice_idx': 7,
+                      'xy_global': [102, 202]})
+    events = recorder.export_raw_data()['events']
+    assert [e['event'] for e in events] == ['press', 'move', 'release']
+    assert [e['pressed'] for e in events] == [1, 1, 0]
+    assert events[1]['view'] == 'Red'
+    assert events[1]['slice'] == 7
+    assert events[1]['xy_global'] == [101, 201]
+    assert all('ras' not in e for e in events)
+    assert all('ijk' not in e for e in events)
+    assert events[1]['tool'] == 'brush'
+    assert events[1]['segment'] == 'seg-a'
+    assert events[1]['diameter_mm'] == 5.0
+
+
+def test_raw_context_is_exported_as_deltas_not_repeated():
+    recorder = MouseEventRecorder()
+    recorder._append(METADATA, None, {
+        'initial_handler_context': {
+            'Red': {
+                'view_name': 'Red',
+                'handler': 'brush',
+                'segment_id': 'seg-a',
+                'brush_radius_mm': 2.5,
+                'slice_idx': 7,
+            },
+        },
+    })
+    recorder._append(
+        MOVE, None,
+        {
+            'view_name': 'Red',
+            'xy': [10, 20],
+            'xy_global': [100, 200],
+            'mouse_button_state': 'pressed',
+            'handler': 'brush',
+            'segment_id': 'seg-a',
+            'brush_radius_mm': 2.5,
+        },
+    )
+    recorder._append(
+        PRESS, None,
+        {
+            'view_name': 'Red',
+            'xy': [11, 21],
+            'xy_global': [101, 201],
+            'handler': 'brush',
+            'segment_id': 'seg-b',
+            'brush_radius_mm': 2.5,
+        },
+    )
+
+    events = recorder.export_raw_data()['events']
+
+    assert events[0] == {
+        'timestamp': recorder.records[1].timestamp.isoformat(timespec='milliseconds'),
+        'event': MOVE,
+        'view': 'Red',
+        'slice': 7,
+        'xy': [10, 20],
+        'xy_global': [100, 200],
+        'pressed': 1,
+    }
+    assert events[1]['segment'] == 'seg-b'
+    assert 'tool' not in events[1]
+    assert 'diameter_mm' not in events[1]
+
+
+def test_raw_excludes_semantic_events():
+    recorder = MouseEventRecorder()
+    recorder.record_point_placed(
+        'seg-a', [1.0, 2.0, 3.0], False,
+        point_index=0, point_id='cp-0', point_name='Pos-1')
+    events = recorder.export_raw_data()['events']
+    assert all(e['event'] not in ('point_placed', 'point_placement') for e in events)
+
+
+def test_raw_uses_absolute_timestamps():
+    recorder = MouseEventRecorder()
+    recorder._append(
+        PRESS, [1.0, 2.0, 3.0],
+        {'mouse_status': 'press', 'analysis_event_type': 'boundary_event'},
+    )
+    events = recorder.export_raw_data()['events']
+    ts = events[0]['timestamp']
+    assert 'T' in ts
+    assert 't_ms' not in events[0]
+
+
+def test_raw_type_is_raw_input():
+    recorder = MouseEventRecorder()
+    result = recorder.export_raw_data()
+    assert result['type'] == 'SegmentHumanBody.raw_input'
+
+
+def test_interpreted_type_is_annotation_process():
+    recorder = MouseEventRecorder()
+    result = recorder.export_interpreted_data()
+    assert result['type'] == 'SegmentHumanBody.annotation_process'

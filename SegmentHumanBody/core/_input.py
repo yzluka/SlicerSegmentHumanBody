@@ -28,13 +28,15 @@ log = logging.getLogger(__name__)
 class InputHandler:
     """Base class for interactive input modes."""
 
+    TOOL_NAME: str | None = None  # set by each subclass
+
     # ------------------------------------------------------------------ #
     # Guard helpers                                                        #
     # ------------------------------------------------------------------ #
 
     def _detach_current(self, widget) -> None:
         """Flush and detach the active handler."""
-        current = getattr(widget, '_active_handler', None)
+        current = widget._active_handler
         if current is not None and current is not self:
             current.detach(widget)
 
@@ -55,7 +57,7 @@ class InputHandler:
             seg = widget.ui.segmentationNodeSelector.currentNode()
         if not seg or seg.GetSegmentation().GetNumberOfSegments() == 0:
             widget._onAddSegment()
-        elif hasattr(widget, '_ensure_current_prompt_nodes'):
+        else:
             widget._ensure_current_prompt_nodes()
         return widget.ui.segmentSelector.currentSegmentID()
 
@@ -69,10 +71,14 @@ class InputHandler:
             slicer.util.warningDisplay('Please select a volume first.')
             self._on_attach_cancelled(widget)
             return
+        widget._attaching_handler = self
         self._detach_current(widget)
         self._ensure_segment(widget)
         widget._active_handler = self
         self._on_attach(widget)
+        widget._attaching_handler = None
+        widget._recorder.record_tool_selected(
+            self.TOOL_NAME, widget.ui.segmentSelector.currentSegmentID())
 
     def _on_attach(self, widget) -> None:
         """Override in subclasses to install tool-specific resources."""
@@ -83,8 +89,13 @@ class InputHandler:
     def detach(self, widget) -> None:
         """_on_detach → unregister.  Subclasses override _on_detach, not detach."""
         self._on_detach(widget)
-        if getattr(widget, '_active_handler', None) is self:
+        if widget._active_handler is self:
             widget._active_handler = None
+        # Only record "no tool" when deactivating without a replacement —
+        # _attaching_handler is set during a tool switch to suppress this.
+        if widget._attaching_handler is None:
+            widget._recorder.record_tool_selected(
+                None, widget.ui.segmentSelector.currentSegmentID())
 
     def _on_detach(self, widget) -> None:
         """Override in subclasses for tool-specific teardown."""
@@ -138,12 +149,14 @@ class BrushHandler(StrokeHandler):
     """Activates the Segment Editor Paint effect."""
     EFFECT = 'Paint'
     BUTTON_NAME = 'brushToolButton'
+    TOOL_NAME = 'brush'
 
 
 class EraseHandler(StrokeHandler):
     """Activates the Segment Editor Erase effect."""
     EFFECT = 'Erase'
     BUTTON_NAME = 'eraseToolButton'
+    TOOL_NAME = 'erase'
 
 
 class PointHandler(InputHandler):
@@ -152,20 +165,24 @@ class PointHandler(InputHandler):
     Actual placement is managed by qSlicerSimpleMarkupsWidget.  This handler
     exists so that entering point-placement mode runs the same unified
     segment-existence guard as brush and erase, ensuring every placed point
-    is immediately associated with a valid segment.  No extra setup is needed
-    beyond what the base class already provides.
+    is immediately associated with a valid segment.
+
+    widget._active_prompt_widget must be set to the source markup widget
+    BEFORE attach() is called.  Attaching without it is a programming error
+    and raises RuntimeError immediately so the broken call site is visible.
     """
 
+    TOOL_NAME = 'point'
+
     def _on_attach(self, widget) -> None:
-        if hasattr(widget, '_ensure_current_prompt_nodes'):
-            widget._ensure_current_prompt_nodes()
-        if hasattr(widget, '_set_prompt_widget_place_mode'):
-            widget._set_prompt_widget_place_mode(
-                getattr(widget, '_active_prompt_widget', None), True)
+        if widget._active_prompt_widget is None:
+            raise RuntimeError(
+                'PointHandler._on_attach: widget._active_prompt_widget is None. '
+                'Set _active_prompt_widget to the triggering markup widget '
+                'before calling PointHandler().attach().'
+            )
+        widget._set_prompt_widget_place_mode(widget._active_prompt_widget, True)
 
     def _on_detach(self, widget) -> None:
-        if hasattr(widget, '_set_prompt_widget_place_mode'):
-            widget._set_prompt_widget_place_mode(
-                getattr(widget, '_active_prompt_widget', None), False)
-        if hasattr(widget, '_deactivate_prompt_place_mode'):
-            widget._deactivate_prompt_place_mode()
+        widget._set_prompt_widget_place_mode(widget._active_prompt_widget, False)
+        widget._deactivate_prompt_place_mode()
