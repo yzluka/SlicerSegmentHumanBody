@@ -719,8 +719,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         node.GetNthControlPointPositionWorld(idx, ras)
         point_id = self._control_point_id(node, idx)
         point_name = self._control_point_name(node, idx)
-        key = (node.GetID(), bool(is_negative), idx)
-        self._pending_point_confirmations[key] = {
+        pend_key = (node.GetID(), point_id)
+        self._pending_point_confirmations[pend_key] = {
             'segment_id': seg_id,
             'ras': list(ras),
             'is_negative': bool(is_negative),
@@ -731,7 +731,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             'node': node,
         }
         if not (self._recorder._active_mouse_press or self._qt_left_button_is_down()):
-            self._confirm_pending_point(node, is_negative, idx)
+            self._confirm_pending_point(node, idx)
 
     def _onPromptPointDragForRecording(self, node, is_negative, phase, callData=None):
         if not self._recorder.is_active:
@@ -750,8 +750,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 # If start cannot identify a point, PointModifiedEvent can still
                 # auto-start once it reports a concrete control-point index.
                 return
-            pending_key = (node.GetID(), bool(is_negative), idx)
-            if pending_key in self._pending_point_confirmations:
+            pend_key = (node.GetID(), self._control_point_id(node, idx))
+            if pend_key in self._pending_point_confirmations:
                 # Just-created point: placement motion, not a relocation.
                 return
         else:
@@ -761,21 +761,22 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                     # carries integer point-index callData when observed correctly.
                     mouse_pressed = (self._recorder._active_mouse_press or
                                      self._qt_left_button_is_down())
-                    pending_key = (node.GetID(), bool(is_negative), idx)
+                    pend_key = (node.GetID(), self._control_point_id(node, idx))
                     if (mouse_pressed and
                             self._is_control_point_defined(node, idx) and
-                            pending_key not in self._pending_point_confirmations):
+                            pend_key not in self._pending_point_confirmations):
                         ras_start = [0.0, 0.0, 0.0]
                         node.GetNthControlPointPositionWorld(idx, ras_start)
                         self._active_point_drags[key] = {
                             'idx': idx,
+                            'point_id': self._control_point_id(node, idx),
                             'start_ras': list(ras_start),
                         }
                         # fall through to record this move
                     else:
                         return
                 elif phase == 'end':
-                    self._confirm_pending_point(node, is_negative, idx)
+                    self._confirm_pending_point(node, idx)
                     return
                 else:
                     return
@@ -799,6 +800,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if phase == 'start':
             self._active_point_drags[key] = {
                 'idx': idx,
+                'point_id': point_id,
                 'start_ras': list(ras),
             }
         elif phase == 'end':
@@ -808,33 +810,34 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 self._active_point_drags.pop(key, None)
                 return
         self._cache_recorded_prompt_point(
-            node, is_negative, idx, seg_id, ras, point_id, point_name)
+            node, seg_id, ras, point_id, point_name)
         self._recorder.record_point_drag(
             phase, seg_id, ras, is_negative, view_name=self.currentViewName,
             point_index=idx, point_id=point_id, point_name=point_name)
         if phase == 'end':
             self._active_point_drags.pop(key, None)
 
-    def _confirm_pending_point(self, node, is_negative, idx):
+    def _confirm_pending_point(self, node, idx):
         if idx < 0:
             idx = self._last_defined_control_point_index(node)
-        pending = self._pending_point_confirmations.pop(
-            (node.GetID(), bool(is_negative), idx), None)
-        if not pending:
-            return
-        if idx >= node.GetNumberOfControlPoints():
+        if idx < 0 or idx >= node.GetNumberOfControlPoints():
             return
         if not self._is_control_point_defined(node, idx):
+            return
+        point_id = self._control_point_id(node, idx)
+        pend_key = (node.GetID(), point_id)
+        pending = self._pending_point_confirmations.pop(pend_key, None)
+        if not pending:
             return
         ras = [0.0, 0.0, 0.0]
         node.GetNthControlPointPositionWorld(idx, ras)
         pending['ras'] = list(ras)
-        pending['point_id'] = self._control_point_id(node, idx)
+        pending['point_id'] = point_id
         pending['point_name'] = self._control_point_name(node, idx)
         self._cache_recorded_prompt_point(
-            node, is_negative, idx, pending['segment_id'], ras,
+            node, pending['segment_id'], ras,
             pending['point_id'], pending['point_name'], fresh_placement=True)
-        self._recently_placed[(node.GetID(), bool(is_negative), idx)] = True
+        self._recently_placed[(node.GetID(), point_id)] = True
         self._recorder.record_point_placed(
             pending['segment_id'], pending['ras'], pending['is_negative'],
             view_name=pending['view_name'], point_index=pending['point_index'],
@@ -851,44 +854,59 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             node = pending.get('node')
             if node is None:
                 continue
-            self._confirm_pending_point(
-                node, pending['is_negative'], pending['point_index'])
+            self._confirm_pending_point(node, pending['point_index'])
 
     def _onPromptPointRemovedForRecording(self, node, is_negative, callData=None):
         if not self._recorder.is_active:
             return
-        idx = self._control_point_index_from_call_data(node, callData)
-        if idx < 0 and callData is not None:
-            idx = int(str(callData))
-        cache_key = (node.GetID(), bool(is_negative), idx)
-        if cache_key in self._pending_point_confirmations:
-            self._pending_point_confirmations.pop(cache_key, None)
-            return
-        drag_key = (node.GetID(), bool(is_negative))
-        active_drag = self._active_point_drags.get(drag_key)
-        active_idx = (
-            active_drag.get('idx') if isinstance(active_drag, dict)
-            else active_drag
+        node_id = node.GetID()
+
+        # Identify the removed point by diffing the cache against the current node.
+        # PointRemovedEvent fires after removal+renumber, so callData's index maps
+        # to a survivor, not the deleted point. The diff is the only stable approach.
+        current_pt_ids = {
+            node.GetNthControlPointID(i)
+            for i in range(node.GetNumberOfControlPoints())
+        }
+        removed_pt_id = next(
+            (ptid for (nid, ptid) in self._recorded_prompt_point_cache
+             if nid == node_id and ptid not in current_pt_ids),
+            None,
         )
-        if active_idx == idx:
+        if removed_pt_id is None:
+            # Also check pending confirmations (point removed before being confirmed)
+            for pend_key in list(self._pending_point_confirmations):
+                if pend_key[0] == node_id and pend_key[1] not in current_pt_ids:
+                    self._pending_point_confirmations.pop(pend_key, None)
+                    return
             return
+
+        cache_key = (node_id, removed_pt_id)
+
+        # Suppress if this point is the subject of an active drag (null-tool
+        # remove+recreate, or PointStartInteractionEvent-tracked drag).
+        drag_key = (node_id, bool(is_negative))
+        active_drag = self._active_point_drags.get(drag_key)
+        if isinstance(active_drag, dict) and active_drag.get('point_id') == removed_pt_id:
+            return
+
         cached = self._recorded_prompt_point_cache.pop(cache_key, None)
         if not cached:
             return
+
         # Check the real Qt button state in addition to the VTK-event-based flag,
         # because Slicer's PointRemovedEvent can fire before the VTK
         # LeftButtonPressEvent reaches our observer priority.
         mouse_is_pressed = (self._recorder._active_mouse_press or
                             self._qt_left_button_is_down())
         if mouse_is_pressed:
-            # Record to raw log with mouse_pressed=True so TimeLogInterpreter
-            # can detect drag (remove+recreate path used in null-tool mode).
-            # Keep cache so interaction-event-based drag recording still works
-            # if PointStartInteractionEvent also fires for this drag.
+            # null-tool drag: Slicer removes then recreates the point.
+            # Re-insert cache so drag recording still works; record with flag so
+            # interpreter can suppress this from the compact log.
             self._recorded_prompt_point_cache[cache_key] = cached
             self._recorder.record_point_removed(
                 cached['segment_id'], cached.get('ras'), bool(is_negative),
-                view_name=self.currentViewName, point_index=idx,
+                view_name=self.currentViewName,
                 point_id=cached.get('point_id'),
                 point_name=cached.get('point_name'),
                 mouse_pressed=True)
@@ -900,14 +918,13 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             return
         self._recorder.record_point_removed(
             cached['segment_id'], cached.get('ras'), bool(is_negative),
-            view_name=self.currentViewName, point_index=idx,
+            view_name=self.currentViewName,
             point_id=cached.get('point_id'),
             point_name=cached.get('point_name'))
 
-    def _cache_recorded_prompt_point(self, node, is_negative, idx, segment_id,
-                                     ras, point_id, point_name=None,
-                                     fresh_placement=False):
-        cache_key = (node.GetID(), bool(is_negative), idx)
+    def _cache_recorded_prompt_point(self, node, segment_id, ras, point_id,
+                                     point_name=None, fresh_placement=False):
+        cache_key = (node.GetID(), point_id)
         self._recorded_prompt_point_cache[cache_key] = {
             'segment_id': segment_id,
             'ras': list(ras),

@@ -123,6 +123,11 @@ class TimeLogInterpreter:
                     events.append(ev)
 
             elif evt in _POINT_BOUNDARY_EVENTS:
+                # Suppress null-tool drag artifacts: PointRemovedEvent fires with
+                # mouse_pressed=True when Slicer internally removes+recreates a point
+                # during drag. The real semantic event will be point_replaced.
+                if evt == 'point_removed' and raw.get('mouse_pressed'):
+                    continue
                 pt_id = raw.get('point')
                 pt_name = raw.get('point_name')
                 ijk_start = None

@@ -299,12 +299,13 @@ class _FakeUI:
 class _FakePromptNode:
     def __init__(self, status):
         self._status = status
+        self._removed = False
 
     def GetID(self):
         return 'node-a'
 
     def GetNumberOfControlPoints(self):
-        return 1
+        return 0 if self._removed else 1
 
     def GetNthControlPointPositionStatus(self, index):
         return self._status
@@ -313,10 +314,18 @@ class _FakePromptNode:
         ras[:] = [1.0, 2.0, 3.0]
 
     def GetNthControlPointID(self, index):
-        return 'cp-0'
+        if not self._removed and index == 0:
+            return 'cp-0'
+        return None
 
     def GetNthControlPointLabel(self, index):
-        return 'P-0'
+        if not self._removed and index == 0:
+            return 'P-0'
+        return None
+
+    def simulate_removal(self):
+        """Put node in post-removal state, matching real Slicer when PointRemovedEvent fires."""
+        self._removed = True
 
 
 class _MovingPromptNode(_FakePromptNode):
@@ -579,6 +588,7 @@ def test_pending_point_remove_is_treated_as_unconfirmed_placement_cancel():
 
     SegmentHumanBodyWidget._onPromptPointDefinedForRecording(
         widget, node, False)
+    node.simulate_removal()
     SegmentHumanBodyWidget._onPromptPointRemovedForRecording(
         widget, node, False, '0')
 
@@ -607,6 +617,7 @@ def test_point_remove_during_active_drag_is_not_semantic_deletion():
         widget, node, False, 'end', '0')
     SegmentHumanBodyWidget._onPromptPointDragForRecording(
         widget, node, False, 'start', '0')
+    node.simulate_removal()
     SegmentHumanBodyWidget._onPromptPointRemovedForRecording(
         widget, node, False, '0')
     SegmentHumanBodyWidget._onPromptPointDragForRecording(
@@ -676,20 +687,21 @@ def test_point_removal_records_cached_control_point():
 
     SegmentHumanBodyWidget._onPromptPointDefinedForRecording(
         widget, node, True)
-    SegmentHumanBodyWidget._confirm_pending_point(widget, node, True, 0)
+    SegmentHumanBodyWidget._confirm_pending_point(widget, node, 0)
     # Arm the newly placed point for real deletion without relying on elapsed
     # time. This test verifies record_point_removed, not internal Slicer
     # remove/recreate suppression.
     SegmentHumanBodyWidget._arm_recorded_prompt_points_for_deletion(widget)
+    node.simulate_removal()
     SegmentHumanBodyWidget._onPromptPointRemovedForRecording(
         widget, node, True, '0')
 
     assert len(widget._recorder.removed_points) == 1
     args, kwargs = widget._recorder.removed_points[0]
     assert args[:3] == ('seg-a', [1.0, 2.0, 3.0], True)
-    assert kwargs['point_index'] == 0
     assert kwargs['point_id'] == 'cp-0'
     assert kwargs['point_name'] == 'P-0'
+    assert 'point_index' not in kwargs  # dropped: unreliable after removal+renumber
 
 
 def test_fresh_point_internal_remove_is_suppressed_until_next_press():
@@ -708,12 +720,13 @@ def test_fresh_point_internal_remove_is_suppressed_until_next_press():
 
     SegmentHumanBodyWidget._onPromptPointDefinedForRecording(
         widget, node, False)
-    SegmentHumanBodyWidget._confirm_pending_point(widget, node, False, 0)
+    SegmentHumanBodyWidget._confirm_pending_point(widget, node, 0)
+    node.simulate_removal()
     SegmentHumanBodyWidget._onPromptPointRemovedForRecording(
         widget, node, False, '0')
 
     assert widget._recorder.removed_points == []
-    assert (node.GetID(), False, 0) in widget._recorded_prompt_point_cache
+    assert (node.GetID(), 'cp-0') in widget._recorded_prompt_point_cache
 
     SegmentHumanBodyWidget._arm_recorded_prompt_points_for_deletion(widget)
     SegmentHumanBodyWidget._onPromptPointRemovedForRecording(
