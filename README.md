@@ -15,11 +15,11 @@ points use native markups nodes, and undo/redo use Slicer's native undo stack.
 The current focus is a mouse-centered annotation-process recorder:
 
 - records only Red/Green/Yellow slice-view mouse events inside the active volume;
-- resolves raw movement into in-volume RAS samples before timer sampling or annotation policy filtering;
+- stores raw device XY per event; IJK coordinates are derived offline by `TimeLogInterpreter` using stored per-view `xy_to_ijk` matrices;
 - assigns exported process events compact `id` values starting at 1; metadata is not an event;
 - exports a compact `{type, metadata, events}` process log;
-- uses RAS as the canonical coordinate; 3D IJK can be derived later from event RAS plus recorded volume metadata;
-- samples in-volume movement at 30 records/sec;
+- uses IJK as the canonical compact coordinate; point events carry world RAS from Slicer markups, converted to IJK via stored `ras_to_ijk`;
+- samples in-volume movement at 60 Hz, then adaptively thins by cached XY-to-IJK scale;
 - listens to both Qt slice-view events and high-priority, non-consuming VTK slice interactor events so native Segment Editor brush/erase input is captured before Paint/Erase can consume it;
 - records mouse status (`move`, `press`, `release`, `view`);
 - records active handler/tool plus only the parameters needed for reconstruction, such as brush radius;
@@ -32,8 +32,65 @@ The current focus is a mouse-centered annotation-process recorder:
 - infers a brush/erase `press` boundary if Slicer drops the initial press but a drag sample or release is observed;
 - records brush/erase press, release, held-button movement, and released-button hover as listener events inside the active volume;
 - records segment removal and segment rename, but not segment creation;
-- records existing-point relocation as `point_drag_start` grab, sampled `non_annotation_move` trajectory, and final `point_placed` replace;
+- records existing-point relocation as `point_drag_start` grab, sampled `non_annotation_move` trajectory, and final `point_replaced` replace;
 - records control-point deletion as `point_removed` with the last cached point location;
+
+Current module shortcuts:
+
+- `A` / `W`: next / previous loaded volume sequence.
+- `Z` / `C`: previous / next segment.
+- `Q`: show/hide the current segment.
+- `S`: show/hide saved/other segments.
+- `E`: reserved for future use.
+
+Volume and segment shortcuts wrap around at the ends. Volume sequence switching
+updates the source volume and slice views only.
+Segmentation selection is manual; switching sequences does not auto-match,
+auto-match, clear, or switch segmentation nodes. If the selected segmentation
+has a different voxel grid shape, spacing, or orientation than the target
+volume, the module asks whether to create a new empty segmentation for that
+volume, keep the current segmentation, or cancel the switch. Origin differences
+are ignored for this compatibility check. When a compatible target volume has a
+zero origin, the module copies the first compatible non-zero scene origin onto
+that volume. This scan runs when volumes are imported and again before display,
+so native Slicer slice offsets line up across CT and derived sequences. When a
+segment is explicitly created and no segmentation exists, the module creates a
+generic segmentation node for the current volume. The process recorder stores
+the explicit selected volume, segmentation, and segment identities instead of
+relying on filename conventions.
+
+The current workflow assumes a dragged folder contains one patient's compatible
+volume set. All loaded scalar volumes are checked as a group after import:
+shape, spacing, and orientation must match. Origin may differ and is normalized.
+If spacing/shape/orientation differs, the module shows one informational
+warning after the import stream settles, listing geometry-group statistics and
+filenames for all loaded volumes. Loading and sequence switching are still
+allowed.
+
+Recordings store the loaded volume sequence list in metadata, including each
+sequence index, node ID, and name. Volume switches are kept in the raw log and
+interpreted into compact `volume_change` events in the semantic annotation log.
+
+Use `Clear Loaded Volumes` to remove all scalar volume nodes from the scene.
+Segmentation nodes are intentionally left untouched for manual deletion.
+If a volume file is imported again from the same path, the newly loaded node
+replaces the older scalar volume node and uses the full storage filename,
+including suffix such as `.nii.gz`, instead of leaving a `_1` duplicate.
+
+Superpixel-grid display is deferred for now. The SPX implementation remains in
+the codebase as reusable infrastructure for later restoration.
+
+A second-stage summarizer, `SegmentHumanBody/core/TimeLogSummarizer.py`, converts
+the compact `annotation_process` log into a human-readable `annotation_summary`
+with higher-level activity spans (`stroke`, `click`, `volume_navigation`,
+`point_click_place`, `point_drag`, etc.), each carrying full volume/tool/segment
+context. Both `TimeLogInterpreter` and `TimeLogSummarizer` run offline with no
+Slicer dependency.
+
+A standalone audio recorder is available in `SegmentHumanBody/core/_audio_recorder.py`
+for future local Whisper transcription workflows. It records timestamped
+Whisper-friendly WAV chunks and metadata, but it is not connected to the module
+UI or process recorder yet.
 
 The model-family framework is still present. A placeholder `Default` family with
 an `Identity` variant is available as a template for future model integrations.

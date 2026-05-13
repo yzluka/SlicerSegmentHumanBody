@@ -53,7 +53,35 @@ class TimeLogSummarizer:
         }
 
     def export_text(self) -> str:
-        return '\n\n'.join(self.export()['text'])
+        export = self.export()
+        spans = export.get('spans', [])
+        texts = export.get('text', [])
+
+        meta = self._log.get('metadata') or {}
+        start_time = meta.get('start_time')
+        header = ''
+        if start_time:
+            try:
+                dt = datetime.datetime.fromisoformat(start_time)
+                header = f'Recording: {dt.strftime("%Y-%m-%d %H:%M:%S")}\n'
+                current_date = dt.strftime('%Y-%m-%d')
+            except ValueError:
+                header = f'Recording: {start_time}\n'
+                current_date = str(start_time)[:10]
+        else:
+            current_date = None
+
+        parts = []
+        for span, text in zip(spans, texts):
+            span_date = _date_of(span.get('start_time'))
+            if span_date and span_date != current_date:
+                if current_date is not None:
+                    parts.append(f'--- {span_date} ---')
+                current_date = span_date
+            parts.append(text)
+
+        body = '\n\n'.join(parts)
+        return (header + '\n' + body) if header else body
 
     def spans(self) -> list[dict]:
         spans = []
@@ -539,3 +567,13 @@ def _slice_from_ijk(ijk):
 
 def _join_chain(values):
     return f' {ARROW} '.join(str(v) for v in values if v is not None)
+
+
+def _date_of(timestamp):
+    if not timestamp:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(str(timestamp)).strftime('%Y-%m-%d')
+    except ValueError:
+        s = str(timestamp)
+        return s[:10] if len(s) >= 10 else None

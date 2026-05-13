@@ -19,34 +19,39 @@ process recording around it.
 - Default model family template:
   - `Default` / `Identity`.
 - Mouse-centered recorder scope:
-  - Each record gets a sequential `event_id`.
-  - Exported top-level schema is `event_id`, `timestamp`, `ras`, `event`,
-    `payload`; `ijk` is derived during export and screen-space XY is not
-    exported.
+  - Compact exported events have sequential `id` values starting at 1; metadata
+    is not an event.
+  - Raw log stores original device XY; IJK is derived offline by
+    `TimeLogInterpreter` from stored per-view `xy_to_ijk` matrices.
+  - IJK is the canonical compact coordinate; point events use world RAS from
+    Slicer markups converted via `ras_to_ijk`.
   - Records only slice-view events inside active volume.
-  - In-volume movement is sampled at 30 records/sec while skipping unchanged
-    samples.
+  - In-volume movement is sampled at 60 Hz and adaptively thinned by cached
+    XY-to-IJK scale.
   - The recorder is listener-first: raw press/release/move inside volume views
-    should be recorded before downstream annotative/non-annotative policy.
-  - Slice input is captured with Qt event filters plus VTK interactor observers;
-    Qt raw `MouseMove` is suppressed when VTK move capture is available.
+    are recorded before downstream annotative/non-annotative policy.
+  - Capture uses VTK interactor observers only (no Qt event filters); device XY
+    matches Slicer DataProbe's `GetEventPosition()`.
   - Wheel/view movement recorded as `view_changed` visual trajectory data.
   - Trajectory events are labeled by kind (`annotation_move`,
     `non_annotation_move`, `view_change`) and role (annotation or visualization
     trajectory).
-  - Initial slice visual state cached on one `metadata` event.
+  - Initial slice visual state cached on one `metadata` record.
   - Record count updated live as records are appended.
-  - Point placement recorded semantically as one `point_placed` release
-    boundary after interaction end/release.
+  - Point placement recorded semantically as one `place` boundary event.
   - New-point press/release drift is `non_annotation_move` trajectory and does
     not become point relocation.
-  - Existing-point relocation records grab/replace boundaries plus
-    `non_annotation_move` trajectory.
+  - Existing-point relocation records `point_drag_start` grab, sampled
+    `non_annotation_move` trajectory, and `replace` boundary.
+  - Point deletion records `remove` with last cached point location.
   - Point-drag move throttling happens before node/RAS work.
   - Point preview/pre-assignment hover movement is not recorded as point drag.
   - Segment selection changes are not standalone events.
   - Parameter-node-to-UI sync has a reentrancy guard to avoid selector feedback
     loops.
+  - `TimeLogSummarizer` converts the compact process log into an
+    `annotation_summary` with higher-level spans (stroke, click,
+    volume_navigation, point_click_place, point_drag, etc.).
 ## Priority 1 - Validate In Full GUI
 
 These behaviors need manual or full-GUI Slicer validation:

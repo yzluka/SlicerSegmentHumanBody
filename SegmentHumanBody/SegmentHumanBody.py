@@ -11,13 +11,82 @@ from slicer.ScriptedLoadableModule import (
 )
 from slicer.util import VTKObservationMixin
 
+import datetime
+import os
+import shutil
+import subprocess
+import sys
 import tempfile
 
 from core.utils import next_segment_name
 from core.modelFamilies import FAMILY_REGISTRY
 from core._mouse_recorder import get_recorder
 from core._input import StrokeHandler, BrushHandler, EraseHandler, PointHandler
-from core._audio_recorder import StandaloneAudioRecorder, merge_chunks_to_wav
+
+_MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+_AUDIO_SCRIPT = os.path.join(_MODULE_DIR, 'core', '_audio_subprocess.py')
+
+
+class _AudioSubprocess:
+    """Manages a per-session audio recording subprocess."""
+
+    def __init__(self, sample_rate: int = 22050, device=None):
+        self.sample_rate = sample_rate
+        self.device = device
+        self._proc = None
+        self._temp_dir: str | None = None
+        self._stop_file: str | None = None
+        self._result_file: str | None = None
+        self._wav_path: str | None = None
+
+    @property
+    def is_active(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    def start(self) -> None:
+        self._temp_dir = tempfile.mkdtemp(prefix='shb_audio_')
+        self._stop_file = os.path.join(self._temp_dir, '_stop')
+        self._result_file = os.path.join(self._temp_dir, '_result.json')
+        self._wav_path = os.path.join(self._temp_dir, 'recording.wav')
+        cmd = [sys.executable, _AUDIO_SCRIPT, self._wav_path,
+               '--sample-rate', str(self.sample_rate),
+               '--stop-file', self._stop_file,
+               '--result-file', self._result_file]
+        if self.device is not None:
+            cmd += ['--device', str(self.device)]
+        kw = {}
+        if sys.platform == 'win32':
+            kw['creationflags'] = subprocess.CREATE_NO_WINDOW
+        self._proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
+
+    def stop(self, timeout: float = 10.0) -> str | None:
+        """Signal stop, wait for process, return temp WAV path or None."""
+        if self._proc is None:
+            return self._wav_path if self._wav_path and os.path.exists(self._wav_path) else None
+        if self._stop_file:
+            open(self._stop_file, 'w').close()
+        try:
+            self._proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+            self._proc.wait()
+        self._proc = None
+        if self._wav_path and os.path.exists(self._wav_path):
+            return self._wav_path
+        return None
+
+    def kill(self) -> None:
+        if self._proc is not None:
+            self._proc.kill()
+            self._proc.wait()
+            self._proc = None
+
+    def cleanup(self) -> None:
+        self.kill()
+        if self._temp_dir and os.path.isdir(self._temp_dir):
+            shutil.rmtree(self._temp_dir, ignore_errors=True)
+        self._temp_dir = self._stop_file = self._result_file = self._wav_path = None
 
 log = logging.getLogger(__name__)
 
@@ -114,12 +183,9 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._volume_origin_scan_timer = None
         self._volume_geometry_warning_signature = None
         self._recording_saved = True
-        self._audio_recorder: StandaloneAudioRecorder | None = None
-        self._audio_temp_dir: str | None = None
-        self._audio_test_active: bool = False
-        self._audio_test_recorder: StandaloneAudioRecorder | None = None
-        self._audio_test_timer: qt.QTimer | None = None
-        self._audio_test_chunks: list | None = None
+        self._audio_recorder: _AudioSubprocess | None = None
+        self._audio_only_mode: bool = False
+        self._recording_start_time: datetime.datetime | None = None
 
     # ------------------------------------------------------------------ #
     # Lifecycle                                                            #
@@ -158,6 +224,9 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         qt.QTimer.singleShot(0, self._preloadSegmentEditor)
 
     def cleanup(self):
+        if self._audio_recorder is not None:
+            self._audio_recorder.cleanup()
+            self._audio_recorder = None
         self._recorder.context_fn = None
         self._recorder.on_record_appended = None
         self.removeObservers()
@@ -359,12 +428,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         ui.showCurrentSegmentCheckBox.connect('toggled(bool)', self._onToggleCurrentSegment)
         ui.showSegmentsCheckBox.connect('toggled(bool)', self._onToggleSavedSegments)
 
-        ui.recordButton.connect('clicked(bool)',            self.onRecord)
-        ui.recordEventOnlyButton.connect('clicked(bool)',  self.onRecordEventOnly)
-        ui.stopRecordButton.connect('clicked(bool)',        self.onStopRecord)
-        ui.exportRecordButton.connect('clicked(bool)',      self.onExportRecord)
-        ui.recordTestAudioButton.connect('clicked(bool)',  self.onRecordTestAudio)
-        ui.playTestAudioButton.connect('clicked(bool)',    self.onPlayTestAudio)
+        ui.recordToggleButton.connect('clicked(bool)', self.onRecordToggle)
+        ui.exportRecordButton.connect('clicked(bool)', self.onExportRecord)
         self._populate_audio_devices()
 
         # Record volume / seg changes when active.
@@ -727,36 +792,132 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     # Recording                                                            #
     # ------------------------------------------------------------------ #
 
-    def onRecord(self, *_):
-        if not self._prepare_recording_restart():
-            return
-        place_states = self._prompt_place_states()
+    def onRecordToggle(self, *_):
+        if self._recorder.is_active or self._audio_only_mode:
+            self._do_stop_recording()
+        else:
+            self._do_start_recording()
+
+    def _do_stop_recording(self):
         if self._recorder.is_active:
             self._recorder.stop()
-        self._recorder.clear()
-        vol = self._parameterNode.GetNodeReference(_INPUT_VOLUME) if self._parameterNode else None
-        seg = self._parameterNode.GetNodeReference(_SEGMENTATION) if self._parameterNode else None
-        self._recorder.start(
-            volume_node       = vol,
-            segmentation_name = seg.GetName() if seg else None,
-            volume_sequences  = self._volume_sequence_metadata(),
-        )
-        self._audio_temp_dir = tempfile.mkdtemp(prefix='shb_audio_')
-        self._audio_recorder = StandaloneAudioRecorder(
-            sample_rate_hz=44100, device=self._selected_audio_device())
-        try:
-            self._audio_recorder.start(self._audio_temp_dir, prefix='audio')
-        except Exception:
-            self._audio_recorder = None
+        if self._audio_only_mode:
+            self._lock_annotation_tools(False)
+            self._audio_only_mode = False
+        if self._audio_recorder is not None and self._audio_recorder.is_active:
+            self._audio_recorder.stop()
+        self._update_record_ui()
+
+    def _do_start_recording(self):
+        want_mouse = self.ui.recordMouseKeyCheckBox.isChecked()
+        want_audio = self.ui.recordAudioCheckBox.isChecked()
+
+        if not want_mouse and not want_audio:
+            slicer.util.warningDisplay('Please select at least one recording mode (Mouse+Key or Audio).')
+            return
+
+        audio_only = want_audio and not want_mouse
+
+        if audio_only:
+            if not self._confirm_audio_only_mode():
+                return
+        elif want_mouse and not want_audio:
+            result = self._prompt_enable_audio()
+            if result == 'cancel':
+                return
+            if result == 'enable':
+                want_audio = True
+                self.ui.recordAudioCheckBox.blockSignals(True)
+                self.ui.recordAudioCheckBox.setChecked(True)
+                self.ui.recordAudioCheckBox.blockSignals(False)
+
+        if not self._prepare_recording_restart():
+            return
+
+        self._recording_start_time = datetime.datetime.now()
+
+        if not audio_only:
+            place_states = self._prompt_place_states()
+            if self._recorder.is_active:
+                self._recorder.stop()
+            self._recorder.clear()
+            vol = self._parameterNode.GetNodeReference(_INPUT_VOLUME) if self._parameterNode else None
+            seg = self._parameterNode.GetNodeReference(_SEGMENTATION) if self._parameterNode else None
+            self._recorder.start(
+                volume_node       = vol,
+                segmentation_name = seg.GetName() if seg else None,
+                volume_sequences  = self._volume_sequence_metadata(),
+            )
+            self._set_prompt_place_states(place_states)
+
+        if want_audio:
+            if self._audio_recorder is not None:
+                self._audio_recorder.cleanup()
+            self._audio_recorder = _AudioSubprocess(device=self._selected_audio_device())
+            try:
+                self._audio_recorder.start()
+            except Exception:
+                self._audio_recorder.cleanup()
+                self._audio_recorder = None
+
+        if audio_only:
+            self._audio_only_mode = True
+            self._lock_annotation_tools(True)
+
         self._recording_saved = False
         self._update_record_ui()
-        self._set_prompt_place_states(place_states)
+
+    def _confirm_audio_only_mode(self) -> bool:
+        box = qt.QMessageBox()
+        box.setWindowTitle('Audio-Only Mode')
+        box.setText('No mouse or keyboard events will be recorded.')
+        box.setInformativeText(
+            'Annotation tools will be locked. Only view navigation and '
+            'segment/volume switching remain available.')
+        ok = box.addButton('Start Audio Recording', qt.QMessageBox.AcceptRole)
+        box.addButton('Cancel', qt.QMessageBox.RejectRole)
+        box.setDefaultButton(ok)
+        box.exec_()
+        return box.clickedButton() == ok
+
+    def _prompt_enable_audio(self) -> str:
+        box = qt.QMessageBox()
+        box.setWindowTitle('Enable Audio Recording?')
+        box.setText('Audio recording is not selected.')
+        box.setInformativeText('Do you also want to record microphone audio?')
+        enable = box.addButton('Enable Audio', qt.QMessageBox.YesRole)
+        no_audio = box.addButton('Continue without Audio', qt.QMessageBox.NoRole)
+        cancel = box.addButton('Cancel', qt.QMessageBox.RejectRole)
+        box.setDefaultButton(enable)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked == enable:
+            return 'enable'
+        if clicked == no_audio:
+            return 'continue'
+        return 'cancel'
+
+    def _lock_annotation_tools(self, locked: bool):
+        enabled = not locked
+        for name in ('brushToolButton', 'eraseToolButton',
+                     'addSegmentButton', 'removeSegmentButton',
+                     'positivePrompts', 'negativePrompts'):
+            w = getattr(self.ui, name, None)
+            if w is not None:
+                w.setEnabled(enabled)
+        if locked:
+            self._deactivateEffect()
 
     def _prepare_recording_restart(self):
-        if len(self._recorder) <= 0 or self._recording_saved:
+        has_unsaved = (len(self._recorder) > 0 or self._audio_recorder is not None) \
+                      and not self._recording_saved
+        if not has_unsaved:
             return True
         choice = self._prompt_unsaved_recording()
         if choice == 'discard':
+            if self._audio_recorder is not None:
+                self._audio_recorder.cleanup()
+                self._audio_recorder = None
             return True
         if choice == 'save':
             return self._save_recording_to_user_path()
@@ -832,109 +993,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 return idx
         return None
 
-    def onRecordEventOnly(self, *_):
-        if not self._prepare_recording_restart():
-            return
-        place_states = self._prompt_place_states()
-        if self._recorder.is_active:
-            self._recorder.stop()
-        self._recorder.clear()
-        vol = self._parameterNode.GetNodeReference(_INPUT_VOLUME) if self._parameterNode else None
-        seg = self._parameterNode.GetNodeReference(_SEGMENTATION) if self._parameterNode else None
-        self._recorder.start(
-            volume_node       = vol,
-            segmentation_name = seg.GetName() if seg else None,
-            volume_sequences  = self._volume_sequence_metadata(),
-        )
-        self._audio_recorder = None
-        self._audio_temp_dir = None
-        self._recording_saved = False
-        self._update_record_ui()
-        self._set_prompt_place_states(place_states)
-
-    def onStopRecord(self, *_):
-        if not self._recorder.is_active:
-            return
-        self._recorder.stop()
-        if self._audio_recorder is not None and self._audio_recorder.is_active:
-            self._audio_recorder.stop()
-        self._update_record_ui()
-
     def onExportRecord(self, *_):
         self._save_recording_to_user_path()
-
-    def onRecordTestAudio(self, *_):
-        if self._audio_test_active:
-            self._stop_audio_test()
-            return
-        self._audio_test_active = True
-        self._audio_test_recorder = StandaloneAudioRecorder(device=self._selected_audio_device())
-        test_dir = tempfile.mkdtemp(prefix='shb_audiotest_')
-        self._set_record_buttons_enabled(False)
-        self.ui.recordTestAudioButton.setText('Stop Recording')
-        self.ui.recordTestAudioButton.setEnabled(True)
-        self.ui.playTestAudioButton.setEnabled(False)
-        try:
-            self._audio_test_recorder.start(test_dir, prefix='test')
-        except Exception:
-            self._cleanup_audio_test()
-            slicer.util.warningDisplay('No microphone available for audio test.')
-            return
-
-    def onPlayTestAudio(self, *_):
-        if not self._audio_test_chunks:
-            return
-        try:
-            import wave as _wave
-            import sounddevice as sd
-            combined = bytearray()
-            sr = self._audio_test_chunks[0].sample_rate_hz
-            for chunk in self._audio_test_chunks:
-                with _wave.open(chunk.path, 'rb') as w:
-                    combined.extend(w.readframes(w.getnframes()))
-            if not combined:
-                slicer.util.warningDisplay('Test recording is empty — nothing to play.')
-                return
-            audio = np.frombuffer(bytes(combined), dtype='<i2').astype('float32') / 32768.0
-            log.info(f'Playing test audio: {len(audio)} samples at {sr} Hz '
-                     f'({len(audio)/sr:.1f}s)')
-            self.ui.playTestAudioButton.setEnabled(False)
-            sd.stop()
-            sd.play(audio, sr, blocking=False)
-            duration_ms = int(len(audio) / sr * 1000) + 500
-            timer = qt.QTimer()
-            timer.setSingleShot(True)
-            timer.timeout.connect(lambda: self.ui.playTestAudioButton.setEnabled(True))
-            timer.start(duration_ms)
-            self._audio_test_timer = timer
-        except Exception as exc:
-            slicer.util.warningDisplay(f'Audio playback failed:\n{exc}')
-            self.ui.playTestAudioButton.setEnabled(True)
-
-    def _stop_audio_test(self):
-        chunks = []
-        if self._audio_test_recorder is not None and self._audio_test_recorder.is_active:
-            chunks = self._audio_test_recorder.stop()
-        if self._audio_test_timer is not None:
-            self._audio_test_timer.stop()
-            self._audio_test_timer = None
-        self._audio_test_active = False
-        self._audio_test_recorder = None
-        if chunks:
-            self._audio_test_chunks = chunks
-        self.ui.recordTestAudioButton.setText('Record Test')
-        self._set_record_buttons_enabled(True)
-        self.ui.playTestAudioButton.setEnabled(bool(self._audio_test_chunks))
-        self._update_record_ui()
-
-    def _cleanup_audio_test(self):
-        self._audio_test_active = False
-        self._audio_test_recorder = None
-        self._audio_test_timer = None
-        self.ui.recordTestAudioButton.setText('Record Test')
-        self.ui.playTestAudioButton.setEnabled(bool(self._audio_test_chunks))
-        self._set_record_buttons_enabled(True)
-        self._update_record_ui()
 
     def _populate_audio_devices(self):
         cb = self.ui.audioDeviceComboBox
@@ -953,78 +1013,119 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         device = self.ui.audioDeviceComboBox.itemData(idx)
         return None if device == -1 else device
 
-    def _set_record_buttons_enabled(self, enabled: bool):
-        self.ui.recordButton.setEnabled(enabled)
-        self.ui.recordEventOnlyButton.setEnabled(enabled)
-        self.ui.stopRecordButton.setEnabled(enabled)
-        self.ui.exportRecordButton.setEnabled(enabled)
-        self.ui.recordTestAudioButton.setEnabled(enabled)
-        self.ui.playTestAudioButton.setEnabled(enabled and bool(self._audio_test_chunks))
-
     def _save_recording_to_user_path(self):
         if self._recorder.is_active:
             self._recorder.stop()
-            self._update_record_ui()
-        if self._audio_recorder is not None and self._audio_recorder.is_active:
-            self._audio_recorder.stop()
+        if self._audio_only_mode:
+            self._lock_annotation_tools(False)
+            self._audio_only_mode = False
+        self._update_record_ui()
+
+        audio_rec = self._audio_recorder
+        self._audio_recorder = None
+        wav_tmp = audio_rec.stop() if audio_rec is not None else None
+
+        ts_tag = (
+            self._recording_start_time.strftime('_%Y%m%dT%H%M%S%f')[:-3]
+            if self._recording_start_time is not None
+            else ''
+        )
+
+        audio_only = len(self._recorder) == 0 and wav_tmp is not None
+
+        if audio_only:
+            if not wav_tmp:
+                slicer.util.warningDisplay('No audio was recorded.')
+                if audio_rec is not None:
+                    audio_rec.cleanup()
+                return False
+            path = qt.QFileDialog.getSaveFileName(
+                None, 'Save Audio Recording', '', 'WAV files (*.wav)')
+            if not path:
+                if audio_rec is not None:
+                    audio_rec.cleanup()
+                return False
+            if path.endswith('.wav'):
+                path = path[:-4] + ts_tag + '.wav'
+            else:
+                path = path + ts_tag + '.wav'
+            try:
+                shutil.copy2(wav_tmp, path)
+                self._recording_saved = True
+                self._update_record_ui()
+                slicer.util.infoDisplay(f'Audio saved:\n  {path}')
+                return True
+            except Exception as exc:
+                slicer.util.warningDisplay(f'Failed to save audio:\n{exc}')
+                return False
+            finally:
+                if audio_rec is not None:
+                    audio_rec.cleanup()
+
         path = qt.QFileDialog.getSaveFileName(None, 'Save Recording', '', 'JSON files (*.json)')
         if not path:
+            if audio_rec is not None:
+                audio_rec.cleanup()
             return False
         if not path.endswith('.json'):
             path += '.json'
-        base = path[:-5] if path.endswith('.json') else path
+        base = path[:-5]
         try:
             self._recorder.save_to_file(path)
             self._recording_saved = True
             self._update_record_ui()
-            wav_saved = False
-            if self._audio_recorder is not None:
-                chunks = self._audio_recorder.chunks
-                if chunks:
-                    merge_chunks_to_wav(chunks, base + '.wav')
-                    wav_saved = True
-            msg = (
-                f'Recording saved:\n'
-                f'  {base}_raw.json\n'
-                f'  {base}.json\n'
-                f'  {base}_summary.txt'
-            )
-            if wav_saved:
-                msg += f'\n  {base}.wav'
-            slicer.util.infoDisplay(msg)
-            return True
         except Exception as exc:
             slicer.util.errorDisplay(f'Failed to save recording:\n{exc}')
+            if audio_rec is not None:
+                audio_rec.cleanup()
             return False
+        wav_saved = False
+        if wav_tmp:
+            wav_out = base + ts_tag + '.wav'
+            try:
+                shutil.copy2(wav_tmp, wav_out)
+                wav_saved = True
+            except Exception as exc:
+                slicer.util.warningDisplay(f'Failed to save audio:\n{exc}')
+        if audio_rec is not None:
+            audio_rec.cleanup()
+        msg = (
+            f'Recording saved:\n'
+            f'  {base}_raw.json\n'
+            f'  {base}.json\n'
+            f'  {base}_summary.txt'
+        )
+        if wav_saved:
+            msg += f'\n  {wav_out}'
+        slicer.util.infoDisplay(msg)
+        return True
 
     def _update_record_ui(self):
-        if self._audio_test_active:
-            return
-        ui         = self.ui
-        is_active  = self._recorder.is_active
-        has_events = len(self._recorder) > 0
+        ui          = self.ui
+        is_recording = self._recorder.is_active or self._audio_only_mode
+        has_events  = len(self._recorder) > 0
+        has_audio   = self._audio_recorder is not None
+        has_data    = has_events or has_audio
 
-        ui.recordButton.setVisible(True)
-        ui.recordButton.setEnabled(True)
-        ui.recordButton.setText('Restart (Evt+Audio)' if has_events else 'Event & Audio')
-        ui.recordEventOnlyButton.setVisible(True)
-        ui.recordEventOnlyButton.setEnabled(True)
-        ui.recordEventOnlyButton.setText('Restart (Evt)' if has_events else 'Event Only')
-        ui.stopRecordButton.setVisible(is_active)
-        ui.exportRecordButton.setEnabled(is_active or has_events)
-        ui.recordTestAudioButton.setEnabled(not is_active)
-        ui.recordTestAudioButton.setText('Record Test')
-        ui.playTestAudioButton.setEnabled(not is_active and bool(self._audio_test_chunks))
+        ui.recordToggleButton.setText('Stop Recording' if is_recording else 'Start Recording')
+        ui.recordMouseKeyCheckBox.setEnabled(not is_recording)
+        ui.recordAudioCheckBox.setEnabled(not is_recording)
+        ui.audioDeviceComboBox.setEnabled(not is_recording)
+        ui.exportRecordButton.setEnabled(not is_recording and has_data)
 
-        if is_active:
-            status = f'Recording... ({len(self._recorder)} events)'
+        if is_recording:
+            if self._audio_only_mode:
+                ui.recordStatusLabel.setText('Audio recording in progress...')
+            else:
+                ui.recordStatusLabel.setText(f'Recording: {len(self._recorder)} events')
         elif has_events:
-            status = f'Recorded: {len(self._recorder)} events'
+            saved_str = '' if self._recording_saved else ' (unsaved)'
+            ui.recordStatusLabel.setText(f'Recorded: {len(self._recorder)} events{saved_str}')
+        elif has_audio:
+            saved_str = '' if self._recording_saved else ' (unsaved)'
+            ui.recordStatusLabel.setText(f'Audio recorded{saved_str}')
         else:
-            status = ''
-        if has_events and not self._recording_saved:
-            status = f'{status} (unsaved)' if status else 'Unsaved recording'
-        ui.recordStatusLabel.setText(status)
+            ui.recordStatusLabel.setText('')
 
     def _recorder_context(self, view_name=None) -> dict:
         seg_id = self.ui.segmentSelector.currentSegmentID()

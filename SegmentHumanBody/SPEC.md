@@ -29,21 +29,34 @@ Handler mapping:
 | # | Action | Expected result |
 |---|---|---|
 | 1.1 | Select a volume with no segmentation | Segmentation can be created on first segment/tool action |
-| 1.2 | Select an existing segmentation | Display node is created if missing; selector is wired |
+| 1.2 | Select an existing segmentation | Display node is created if missing; selector is wired and Segment Editor follows the selected volume/segmentation |
 | 1.3 | Clear volume selector | Parameter node updates without crash |
-| 1.4 | Switch volume | Window/level controls sync from the new volume |
+| 1.4 | Switch volume | Window/level controls sync from the new volume and Red/Green/Yellow views show the selected volume |
+| 1.5 | Switch volume with an existing segmentation selected | Segmentation selection remains manual and unchanged |
+| 1.6 | Switch volume with mismatched selected segmentation grid shape, spacing, or orientation | User is asked to create a new empty segmentation, keep the current segmentation, or cancel the switch |
+| 1.7 | Import compatible CT-derived volumes where derived volumes have zero origin | The first compatible non-zero origin is copied onto zero-origin volumes |
+| 1.8 | Import volumes with inconsistent shape, spacing, or orientation | After import settles, user sees one informational warning with statistics and filenames for all geometry groups; loading and switching remain allowed |
+| 1.9 | Start recording with multiple loaded volumes | Metadata stores all loaded sequence indexes, node IDs, and names |
+| 1.10 | Switch volume while recording | Raw log stores `volume_changed`; semantic log stores compact `volume_change` |
+| 1.11 | Click `Clear Loaded Volumes` | All scalar volume nodes are removed; segmentation nodes remain for manual deletion |
+| 1.12 | Re-import the same scalar volume file | New node replaces the older node from the same path and uses the full filename with suffix rather than `_1` |
+| 1.13 | Create a segment when no segmentation exists | A generic segmentation is created for the current volume |
+| 1.14 | Record segment selection | The raw process log stores explicit volume, segmentation, and segment identities |
 
 ## 2. Segment Management
 
 | # | Action | Expected result |
 |---|---|---|
 | 2.1 | Press `+` | New segment is created and selected |
-| 2.2 | Press `A` | Same as `+` |
+| 2.2 | Press `A` | Select next loaded scalar volume sequence; does not create a segment or change segmentation selection |
 | 2.3 | Activate Brush/Erase/Point with no segment | Segment is created before the wrapped tool activates |
 | 2.4 | Press `-` on middle/later segment | Removed; selector switches to the immediate previous segment |
 | 2.5 | Press `-` on first segment | Removed; selector switches to the next segment if one exists |
 | 2.6 | Press `-` on only segment | Removed; selector is empty |
 | 2.7 | Remove segment | Its positive/negative prompt nodes are removed |
+| 2.8 | Press `W` | Select previous loaded scalar volume sequence, with wraparound |
+| 2.9 | Press `A` / `W` after moving/panning a slice | Selected sequence changes using normalized origins and native Slicer slice state |
+| 2.10 | Press `Z` / `C` | Select previous / next segment in the active segmentation, with wraparound |
 
 ## 3. Prompt Points
 
@@ -88,7 +101,7 @@ Recording is mouse-centered. It is not a general UI macro recorder.
 | 5.6 | Mouse status | Records include `move`, `press`, `release`, or `view` |
 | 5.7 | Handler state | Raw mouse records carry handler/tool context as deltas; compact export includes only parameters needed to reconstruct the semantic event, such as brush diameter |
 | 5.8 | Visualization state | Initial Red/Green/Yellow state is stored once in metadata; later snapshots are stored on infrequent boundary/view events so raw XY can be interpreted offline |
-| 5.9 | Points | Point markups source events are kept in `_raw.json`; new point placement becomes compact `point_placement`, relocation drag-end becomes compact `point_move`, and removal becomes compact `point_removed` during offline interpretation |
+| 5.9 | Points | Point markups source events are kept in `_raw.json`; new point placement becomes compact `place`, relocation drag-end becomes compact `replace`, and removal becomes compact `remove` during offline interpretation |
 | 5.10 | Hotkeys/actions | Only segmentation-changing actions should be semantic recording actions |
 | 5.11 | Segment creation | Segment creation is recorded as a raw source event, not as an annotation trajectory |
 | 5.12 | Segment removal/rename | Active-segmentation `SegmentRemoved` records raw `segment_removed` with last known segment name; name changes record raw `segment_renamed` with old/new names |
@@ -99,6 +112,12 @@ Recording is mouse-centered. It is not a general UI macro recorder.
 | 5.17 | Segment switching | Segment selection changes record raw `segment_selected`; mouse/tool events still carry active segment context as needed |
 | 5.18 | Brush/erase press fallback | If Slicer drops the initial press but a brush/erase drag sample or release is observed, a `press` boundary is inferred before that first sampled move/release |
 | 5.19 | Tool selection | Activating a tool records `tool_selected` with `tool: 'brush'`, `'erase'`, or `'point'` and the active `segment_id`. Explicitly deactivating a tool (toggle off without switching to another) records `tool_selected` with `tool: null`. Switching directly from one tool to another records only the activation event for the incoming tool. |
+| 5.20 | Recording UI | Row 1: single `Start/Stop Recording` toggle + `Mouse+Key` checkbox + `Audio` checkbox. Row 2: `Audio Device:` label + device dropdown + `Export` button. |
+| 5.21 | Recording modes | Both checked: mouse events + audio. Only `Mouse+Key`: prompt asks whether to also enable audio. Only `Audio`: audio-only mode (popup confirmation; annotation tools locked for the session; unlock on stop). Neither checked: warning, no recording started. |
+| 5.22 | Audio-only mode | No mouse recorder starts. Brush, erase, add/remove segment, and prompt-point widgets are disabled. Only view navigation and segment/volume switching remain available. `_lock_annotation_tools` is called on start and reversed on stop. |
+| 5.23 | Audio capture | `_AudioSubprocess` forks `core/_audio_subprocess.py` (CREATE_NO_WINDOW on Windows) at 22050 Hz mono. Stop is signalled via sentinel file; process drains 150 ms of buffered audio after stop. Missing `sounddevice` silently disables audio; mouse recording continues. |
+| 5.24 | WAV export filename | WAV is saved as `{base}_{YYYYMMDDTHHMMSSMMM}.wav` alongside the JSON. The timestamp is the recording start time with millisecond precision; no colons are written to filenames. In audio-only mode, the user's chosen base name gets the same timestamp postfix. |
+| 5.25 | Stop vs export | Clicking `Stop Recording` finalises the WAV (stops the subprocess) but keeps temp files. `Export` can be used at any time — it stops recorders if still active, then opens save dialogs. Starting a new recording while unsaved data exists triggers Save/Discard/Cancel. |
 
 Movement capture is staged before policy classification. Each raw move keeps the
 original VTK device XY and is kept only if cached DataProbe-style XY-to-IJK
@@ -217,11 +236,59 @@ Future families should follow this registry pattern:
 
 | # | Action | Expected result |
 |---|---|---|
-| 8.1 | Toggle current segment visibility | Only current segment triplet is affected |
-| 8.2 | Toggle saved segments | All non-current segments are affected |
+| 8.1 | Toggle current segment visibility (`Q`) | Only current segment triplet is affected |
+| 8.2 | Toggle saved/other segments (`S`) | All non-current segments are affected |
 | 8.3 | Switch segment | Incoming segment becomes visible |
 | 8.4 | Change W/L controls | Volume display node updates immediately |
 | 8.5 | Apply W/L | Same W/L values are explicitly written |
+
+Superpixel-grid display and any related shortcut are deferred while the active
+branch focuses on native Segment Editor wrapping and process recording.
+
+## 9. Audio Recording Infrastructure
+
+`core/_audio_subprocess.py` is the recording worker launched as a subprocess by
+`_AudioSubprocess` in the Slicer widget. `core/_audio_recorder.py` provides
+standalone chunk-based infrastructure reserved for future local Whisper use.
+
+### 9a. `_AudioSubprocess` (active UI path)
+
+| # | Requirement | Expected behavior |
+|---|---|---|
+| 9a.1 | Process isolation | Forked with `CREATE_NO_WINDOW` on Windows; stdout/stderr redirected to DEVNULL |
+| 9a.2 | Stop protocol | Writes a sentinel file; subprocess drains 150 ms of buffered audio after stop, then writes a result JSON and exits |
+| 9a.3 | Timeout | `stop()` waits up to 10 s, then kills the process and calls `wait()` to reap the zombie |
+| 9a.4 | Cleanup | `cleanup()` kills process + removes temp directory; called on export completion, widget teardown, and new-recording start |
+| 9a.5 | Missing sounddevice | Subprocess exits immediately with error; `start()` still returns; `is_active` becomes False; mouse recording continues unaffected |
+
+### 9b. `StandaloneAudioRecorder` (offline / Whisper path)
+
+| # | Requirement | Expected behavior |
+|---|---|---|
+| 9b.1 | Import | Does not require microphone dependencies |
+| 9b.2 | Start | Lazy-imports `sounddevice` and writes timestamped 16-bit PCM WAV chunks |
+| 9b.3 | Ingest | Converts caller-owned frames to PCM16 without using Slicer |
+| 9b.4 | Manifest | Writes chunk paths, start/end timestamps, sample rate, channel count, and duration |
+
+## 10. Annotation Summary (TimeLogSummarizer)
+
+`core/TimeLogSummarizer.py` is an offline second-stage summarizer. Input is the
+`SegmentHumanBody.annotation_process` JSON; output type is
+`SegmentHumanBody.annotation_summary`.
+
+| # | Requirement | Expected behavior |
+|---|---|---|
+| 10.1 | Input validation | Raises `ValueError` if `type` is not `SegmentHumanBody.annotation_process` |
+| 10.2 | Span grouping | Consecutive press/hold/release events are grouped into one `stroke` or `click` span |
+| 10.3 | Tool-change folding | A `tool_change` immediately followed by a `press` is folded into the resulting stroke span |
+| 10.4 | Point click-place | A `press`/`release`/`place` triplet on the point tool with matching IJK is emitted as a single `point_click_place` span |
+| 10.5 | Point drag | Consecutive `point_drag_move` events for the same point are grouped into one `point_drag` span |
+| 10.6 | Navigation spans | Consecutive `volume_change` events become `volume_navigation`; consecutive same-view `slice_change` events become `slice_navigation` |
+| 10.7 | Carried context | Each span includes the current volume, tool, segment, view, slice, and brush_mm derived from running state |
+| 10.8 | Text output | `export_text()` returns one human-readable line per span; strokes with trajectories append an indented trajectory line |
+| 10.9 | No Slicer dependency | Runs offline from the saved JSON file without importing Slicer, VTK, or Qt |
+| 10.10 | Date header | `export_text()` prepends `Recording: YYYY-MM-DD HH:MM:SS\n` derived from `metadata.start_time` when present |
+| 10.11 | Date-change markers | When consecutive spans cross midnight, `--- YYYY-MM-DD ---` is inserted between them; no marker is inserted before the first span |
 
 ## 8. Lifecycle
 

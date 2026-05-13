@@ -26,20 +26,34 @@ SlicerSegmentHumanBody/
 |   |-- Resources/UI/SegmentHumanBody.ui
 |   |-- core/
 |   |   |-- _input.py
-|   |   |-- _mouse_recorder.py
+|   |   |-- _logic.py
+|   |   |-- _state.py
+|   |   |-- _tracker.py
+|   |   |-- _deps.py
 |   |   |-- _point_log.py
+|   |   |-- _audio_recorder.py
+|   |   |-- _mouse_recorder.py
+|   |   |-- TimeLogInterpreter.py
+|   |   |-- TimeLogSummarizer.py
+|   |   |-- utils.py
 |   |   |-- modelFamilies.py
 |   |   |-- modelRegistry.py
 |   |   |-- models/default.py
 |   |   |-- models/spx.py
 |   |   `-- models/timed_annotator.py
 |   |-- tests/
+|   |   |-- conftest.py
 |   |   |-- test_families.py
-|   |   |-- test_mouse_recorder.py
-|   |   |-- test_segment_lifecycle_recording.py
 |   |   |-- test_registry.py
+|   |   |-- test_utils.py
+|   |   |-- test_deps.py
 |   |   |-- test_spx_models.py
-|   |   `-- test_utils.py
+|   |   |-- test_mouse_recorder.py
+|   |   |-- test_time_log_summarizer.py
+|   |   |-- test_segment_lifecycle_recording.py
+|   |   |-- test_navigation_shortcuts.py
+|   |   |-- test_audio_recorder.py
+|   |   `-- test_undo_widget.py
 |   `-- Testing/Python/SegmentHumanBodyTest.py
 `-- SegmentHumanBody/models/
     |-- sam/
@@ -61,9 +75,43 @@ The Slicer module entry point. It owns:
 - The default model-family placeholder: `Default` / `Identity`.
 - The process recorder singleton (`MouseEventRecorder`).
 - Recording/export button handlers.
+- Module-scoped keyboard shortcuts:
+  - `A` / `W`: next / previous loaded scalar volume sequence.
+  - `Z` / `C`: previous / next segment.
+  - `Q`: show/hide current segment.
+  - `S`: show/hide saved/other segments.
 
 Brush and erase delegate to Slicer's native Segment Editor effects. Undo and
 redo delegate to Slicer's native Segment Editor undo stack.
+
+Volume switching is intentionally independent from segmentation selection.
+Radiology folders may contain several sequences but only one intended
+segmentation, so `A`/`W` update the source volume and slice views without
+auto-matching, clearing, or switching segmentation nodes. If the target volume
+does not match the selected segmentation's voxel grid shape, spacing, or
+orientation, the user is asked whether to create a new empty segmentation, keep
+the current segmentation, or cancel the switch. Origin differences are ignored
+for this compatibility check. The widget observes scene volume imports and
+normalizes compatible zero-origin derived volumes by copying the first matching
+non-zero origin in the scene. The active workflow assumes one dragged folder is
+one patient set: all loaded scalar volumes are checked as one group, and
+inconsistent shape/spacing/orientation shows one informational warning after
+the import stream settles, with geometry-group statistics and filenames, while
+still allowing loading and switching. If a
+segment is explicitly created when no segmentation exists, a
+generic segmentation node is created for the active volume. Recording stores the
+explicit selected volume, segmentation, and segment identities instead of
+relying on naming conventions.
+
+`A`/`W` and `Z`/`C` wrap around at the ends. Volume switching preserves the
+current native Slicer slice view state and avoids refitting the views.
+Recordings store all loaded scalar volume sequences in metadata, and volume
+selector changes are interpreted as compact semantic `volume_change` events.
+The `Clear Loaded Volumes` button removes scalar volume nodes only; segmentation
+nodes remain manually controlled.
+Re-imported scalar volume files replace older nodes loaded from the same storage
+path and use the full storage filename, including suffix such as `.nii.gz`,
+instead of accumulating `_1` duplicates.
 
 ### `core/_input.py`
 
@@ -78,7 +126,22 @@ Defines the handler wrappers:
 Only one handler should be active at a time. A handler is considered a wrapper:
 detaching it must also disable the Slicer tool it wraps.
 
-### `core/_mouse_recorder.py` and `core/TimeLogInterpreter.py`
+### `core/_mouse_recorder.py`, `core/TimeLogInterpreter.py`, and `core/TimeLogSummarizer.py`
+
+Three-stage recording pipeline:
+
+1. **`_mouse_recorder.py`** captures raw device events and writes `*_raw.json`.
+2. **`TimeLogInterpreter.py`** converts `*_raw.json` → compact semantic `annotation_process` log (`*.json`).
+3. **`TimeLogSummarizer.py`** converts the `annotation_process` log → a human-readable `annotation_summary` with higher-level activity spans.
+
+`TimeLogSummarizer` groups consecutive low-level events into named spans
+(`stroke`, `click`, `volume_navigation`, `slice_navigation`, `point_click_place`,
+`point_drag`, etc.) and maintains running state (volume/tool/segment/view/slice)
+so each span carries full context. Output has both a structured `spans` array
+and a `text` array (one readable line per span).
+
+Both `TimeLogInterpreter` and `TimeLogSummarizer` are standalone — no Slicer
+dependency — and can run offline from the saved JSON files.
 
 Mouse-centered recorder plus offline raw-log interpreter.
 
@@ -144,6 +207,14 @@ still recomputes IJK bounds from stored metadata for consistency.
 Segment creation, removal, rename, and selection are observed as raw source
 events. They are not brush/point annotation trajectories.
 
+### `core/_audio_recorder.py`
+
+Standalone timestamped microphone/audio recorder for future local Whisper
+integration. It is not wired into the Slicer UI yet. It lazy-imports
+`sounddevice` only when microphone capture starts, writes Whisper-friendly
+16 kHz mono PCM WAV chunks by default, and produces chunk metadata with absolute
+start/end timestamps plus a JSON manifest helper.
+
 ### `core/modelFamilies.py` and `core/modelRegistry.py`
 
 The model-family framework is present but mostly hidden in the UI on this
@@ -156,6 +227,9 @@ branch. The current default template is:
 This provides a small template for future model-family integrations without
 changing current native-editor behavior.
 
+SPX code and tests remain as reusable infrastructure, but superpixel-grid
+display and any related shortcut are deferred on this branch.
+
 ## Tests
 
 ### Pure-Python Tests
@@ -166,8 +240,10 @@ Run from `SegmentHumanBody/`:
 PythonSlicer.exe -m pytest tests/ -q
 ```
 
-These cover model registry/families, utility functions, dependency checks, and
-mouse-recorder data formatting that can run outside a full Slicer GUI process.
+These cover model registry/families, utility functions, dependency checks,
+mouse-recorder data formatting, time-log summarizer spans, audio recorder
+metadata, segment lifecycle recording, and navigation shortcuts — all runnable
+outside a full Slicer GUI process.
 ### Slicer-Native Tests
 
 Run from the repo root:

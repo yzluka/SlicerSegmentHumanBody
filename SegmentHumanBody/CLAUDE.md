@@ -51,6 +51,72 @@ system for annotation-process analysis.
    avoid depending on Qt widgets unless the active branch has already placed the
    behavior in `SegmentHumanBodyWidget`.
 
+5. Keep volume sequence navigation separate from segmentation selection.
+
+   `A` / `W` move through loaded scalar volumes in MRML scene order and update
+   the Red/Green/Yellow slice views. They must not auto-match, clear, or switch
+   segmentation nodes. Segmentation selection is manual because a folder may
+   contain multiple radiology sequences but only one intended segmentation. If
+   the selected segmentation voxel grid shape, spacing, or orientation differs
+   from the target volume, ask whether to create a new empty segmentation, keep
+   the current segmentation, or cancel the switch. Origin differences are
+   ignored for this compatibility check. Observe scene volume imports and copy
+   the first compatible non-zero origin onto zero-origin derived volumes before
+   display. Treat one dragged folder as one patient volume set: all loaded
+   scalar volumes should have consistent shape, spacing, and orientation.
+   Inconsistent spacing/shape/orientation should show one informational warning
+   after the import stream settles, with geometry-group statistics and
+   filenames, but must not prevent loading or sequence switching. If the user
+   explicitly creates a segment while no
+   segmentation exists, create a generic segmentation for the current volume.
+   Record the selected volume, segmentation, and segment identities explicitly
+   instead of relying on naming conventions.
+   Recording metadata must include all loaded/involved volume sequences with
+   sequence index, node ID, and name. Volume switching should be present in raw
+   logs and interpreted as compact semantic `volume_change` events.
+   Volume node names should be normalized to the full storage filename,
+   including suffix such as `.nii.gz`. Re-importing the same scalar volume file
+   should replace the older node from the same storage path instead of keeping
+   Slicer's `_1` duplicate.
+   `A`/`W` and `Z`/`C` wrap around at the ends. Volume switching preserves the
+   native Slicer slice view state and should avoid `FitSliceToAll()` in the fast
+   path.
+
+6. Current shortcut map.
+
+   - `A` / `W`: next / previous loaded volume sequence.
+   - `Z` / `C`: previous / next segment.
+   - `Q`: show/hide current segment.
+   - `S`: show/hide saved/other segments.
+   - `E`: reserved; no binding.
+   - Superpixel-grid shortcut/functionality is deferred.
+
+7. Audio recording is wired to the recording UI via `_AudioSubprocess`.
+
+   The Recording section has two rows:
+   - Row 1: `Start/Stop Recording` toggle · `Mouse+Key` checkbox · `Audio` checkbox
+   - Row 2: `Audio Device:` label · device dropdown · `Export` button
+
+   Checking only `Audio` enters audio-only mode: no mouse events are recorded,
+   and all annotation tools are locked (read-only) for the session. A popup
+   confirms before starting. Unlocking happens automatically on stop.
+
+   Checking only `Mouse+Key` prompts whether to also enable audio.
+
+   Audio is captured via `_AudioSubprocess`, which forks `core/_audio_subprocess.py`
+   as a separate OS process (CREATE_NO_WINDOW on Windows). The subprocess records
+   through `sounddevice.InputStream` at 22050 Hz mono, polls a sentinel stop-file
+   every 50 ms, and drains 150 ms of buffered audio after stop. If `sounddevice`
+   is unavailable, audio silently skips and mouse recording continues unaffected.
+
+   On export, the WAV filename is `{base}_{YYYYMMDDTHHMMSSMMM}.wav`, where the
+   timestamp is the recording start time with millisecond precision. Colons are
+   never written to filenames.
+
+   `core/_audio_recorder.py` remains available as standalone chunk-based
+   infrastructure for future local Whisper transcription. It is not used by the
+   Slicer UI; keep it importable without `sounddevice`.
+
 ## Recording Contract
 
 `core/_mouse_recorder.py` records only events that occur in Red/Green/Yellow
@@ -60,6 +126,10 @@ Current schema is intentionally strict while this branch is under test:
 
 - Saving writes both a raw source log (`*_raw.json`) and a compact process log.
   The compact log must be derived from the raw log by `TimeLogInterpreter`.
+  A third-stage `TimeLogSummarizer` converts the compact process log into a
+  human-readable `annotation_summary` with higher-level activity spans.
+  Both `TimeLogInterpreter` and `TimeLogSummarizer` run offline with no Slicer
+  dependency.
 - The interpreted annotation-process export uses IJK as the compact coordinate
   for cursor-derived events. Mouse entries in the raw-input export intentionally
   omit RAS/IJK and store the original input facts: view, VTK device XY,

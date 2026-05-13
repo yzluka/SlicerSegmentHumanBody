@@ -132,6 +132,14 @@ class StandaloneAudioRecorder:
         if self._worker is not None:
             self._worker.join(timeout=5.0)
             self._worker = None
+        # drain any items the worker missed due to the _active=False race
+        while not self._queue.empty():
+            try:
+                ts, pcm, frame_count = self._queue.get_nowait()
+                if frame_count > 0:
+                    self._append_pcm(ts, pcm, frame_count)
+            except queue.Empty:
+                break
         self._flush_pending(self._clock())
         return list(self._chunks)
 

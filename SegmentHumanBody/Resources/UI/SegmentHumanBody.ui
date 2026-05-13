@@ -20,35 +20,34 @@
       <item>
        <layout class="QHBoxLayout">
         <item>
-         <widget class="QPushButton" name="recordButton">
-          <property name="text"><string>Event &amp; Audio</string></property>
-          <property name="toolTip"><string>Start recording mouse events and microphone audio</string></property>
+         <widget class="QPushButton" name="recordToggleButton">
+          <property name="text"><string>Start Recording</string></property>
+          <property name="toolTip"><string>Start or stop recording</string></property>
          </widget>
         </item>
         <item>
-         <widget class="QPushButton" name="recordEventOnlyButton">
-          <property name="text"><string>Event Only</string></property>
-          <property name="toolTip"><string>Start recording mouse events without audio</string></property>
+         <widget class="QCheckBox" name="recordMouseKeyCheckBox">
+          <property name="text"><string>Mouse+Key</string></property>
+          <property name="checked"><bool>true</bool></property>
+          <property name="toolTip"><string>Record mouse and keyboard events</string></property>
          </widget>
         </item>
         <item>
-         <widget class="QPushButton" name="stopRecordButton">
-          <property name="text"><string>Stop Record</string></property>
-          <property name="visible"><bool>false</bool></property>
-          <property name="toolTip"><string>Stop the current recording</string></property>
-         </widget>
-        </item>
-        <item>
-         <widget class="QPushButton" name="exportRecordButton">
-          <property name="text"><string>Export</string></property>
-          <property name="enabled"><bool>false</bool></property>
-          <property name="toolTip"><string>Save recording to file</string></property>
+         <widget class="QCheckBox" name="recordAudioCheckBox">
+          <property name="text"><string>Audio</string></property>
+          <property name="checked"><bool>true</bool></property>
+          <property name="toolTip"><string>Record microphone audio. Check only this box to test audio without event recording.</string></property>
          </widget>
         </item>
        </layout>
       </item>
       <item>
        <layout class="QHBoxLayout">
+        <item>
+         <widget class="QLabel" name="audioDeviceLabel">
+          <property name="text"><string>Audio Device:</string></property>
+         </widget>
+        </item>
         <item>
          <widget class="QComboBox" name="audioDeviceComboBox">
           <property name="toolTip"><string>Select microphone input device</string></property>
@@ -63,22 +62,10 @@
          </widget>
         </item>
         <item>
-         <widget class="QPushButton" name="recordTestAudioButton">
-          <property name="text"><string>Record Test</string></property>
-          <property name="toolTip"><string>Record 3 seconds of microphone audio</string></property>
-          <property name="sizePolicy">
-           <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
-            <horstretch>0</horstretch>
-            <verstretch>0</verstretch>
-           </sizepolicy>
-          </property>
-         </widget>
-        </item>
-        <item>
-         <widget class="QPushButton" name="playTestAudioButton">
-          <property name="text"><string>Play Test</string></property>
+         <widget class="QPushButton" name="exportRecordButton">
+          <property name="text"><string>Export</string></property>
           <property name="enabled"><bool>false</bool></property>
-          <property name="toolTip"><string>Play back the last test recording</string></property>
+          <property name="toolTip"><string>Save recording to file</string></property>
           <property name="sizePolicy">
            <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
             <horstretch>0</horstretch>

@@ -116,18 +116,37 @@ class _TextWidget:
 
 
 class _ComboBoxStub:
-    def currentIndex(self): return 0
+    currentIndex = 0
     def itemData(self, idx): return -1
+    def setEnabled(self, v): pass
+    def clear(self): pass
+    def addItem(self, text, data=None): pass
+
+
+class _CheckBoxStub:
+    def __init__(self, checked=True):
+        self._checked = checked
+        self.enabled = True
+
+    def isChecked(self):
+        return self._checked
+
+    def setChecked(self, v):
+        self._checked = v
+
+    def setEnabled(self, v):
+        self.enabled = v
+
+    def blockSignals(self, v):
+        pass
 
 
 class _RecordUI:
     def __init__(self):
-        self.recordButton = _TextWidget()
-        self.recordEventOnlyButton = _TextWidget()
-        self.stopRecordButton = _TextWidget()
+        self.recordToggleButton = _TextWidget()
+        self.recordMouseKeyCheckBox = _CheckBoxStub(checked=True)
+        self.recordAudioCheckBox = _CheckBoxStub(checked=True)
         self.exportRecordButton = _TextWidget()
-        self.recordTestAudioButton = _TextWidget()
-        self.playTestAudioButton = _TextWidget()
         self.recordStatusLabel = _TextWidget()
         self.audioDeviceComboBox = _ComboBoxStub()
 
@@ -147,10 +166,8 @@ def _record_widget(recorder):
     widget._recorder = recorder
     widget._recording_saved = False
     widget._parameterNode = None
-    widget._audio_test_active = False
-    widget._audio_test_chunks = None
     widget._audio_recorder = None
-    widget._audio_temp_dir = None
+    widget._audio_only_mode = False
     widget.ui = _RecordUI()
     widget._prompt_place_states = lambda: [False, False]
     widget._set_prompt_place_states = lambda states: None
@@ -172,11 +189,11 @@ def test_segment_added_event_creates_prompt_nodes_and_records_creation():
 
 
 def test_start_recording_cancels_restart_when_unsaved_record_is_kept():
-    recorder = _RestartRecorder(active=True, count=3)
+    recorder = _RestartRecorder(active=False, count=3)
     widget = _record_widget(recorder)
     widget._prompt_unsaved_recording = lambda: 'cancel'
 
-    widget.onRecord()
+    widget.onRecordToggle()
 
     assert recorder.stopped == 0
     assert recorder.cleared == 0
@@ -185,17 +202,17 @@ def test_start_recording_cancels_restart_when_unsaved_record_is_kept():
 
 
 def test_start_recording_discards_unsaved_record_and_restarts():
-    recorder = _RestartRecorder(active=True, count=3)
+    recorder = _RestartRecorder(active=False, count=3)
     widget = _record_widget(recorder)
     widget._prompt_unsaved_recording = lambda: 'discard'
 
-    widget.onRecord()
+    widget.onRecordToggle()
 
-    assert recorder.stopped == 1
+    assert recorder.stopped == 0
     assert recorder.cleared == 1
     assert recorder.started == 1
     assert widget._recording_saved is False
-    assert widget.ui.recordButton.text == 'Restart (Evt+Audio)'
+    assert widget.ui.recordToggleButton.text == 'Stop Recording'
 
 
 def test_start_recording_saves_unsaved_record_before_restart():
@@ -211,7 +228,7 @@ def test_start_recording_saves_unsaved_record_before_restart():
 
     widget._save_recording_to_user_path = _save
 
-    widget.onRecord()
+    widget.onRecordToggle()
 
     assert saved == [True]
     assert recorder.cleared == 1
@@ -225,7 +242,7 @@ def test_start_recording_does_not_restart_when_save_is_cancelled():
     widget._prompt_unsaved_recording = lambda: 'save'
     widget._save_recording_to_user_path = lambda: False
 
-    widget.onRecord()
+    widget.onRecordToggle()
 
     assert recorder.cleared == 0
     assert recorder.started == 0
@@ -238,8 +255,7 @@ def test_record_ui_marks_unsaved_recording():
 
     widget._update_record_ui()
 
-    assert widget.ui.recordButton.visible is True
-    assert widget.ui.recordButton.text == 'Restart (Evt+Audio)'
+    assert widget.ui.recordToggleButton.text == 'Start Recording'
     assert widget.ui.exportRecordButton.enabled is True
     assert widget.ui.recordStatusLabel.text == 'Recorded: 4 events (unsaved)'
 
