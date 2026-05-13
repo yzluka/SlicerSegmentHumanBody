@@ -263,6 +263,19 @@ def write_wav_pcm16(path, pcm: bytes, sample_rate_hz: int, channels: int) -> Non
         wav.writeframes(pcm)
 
 
+def merge_chunks_to_wav(chunks, output_path) -> None:
+    """Concatenate AudioChunk WAV files into a single output WAV."""
+    if not chunks:
+        return
+    combined = bytearray()
+    sample_rate = chunks[0].sample_rate_hz
+    channels = chunks[0].channels
+    for chunk in chunks:
+        with wave.open(chunk.path, 'rb') as w:
+            combined.extend(w.readframes(w.getnframes()))
+    write_wav_pcm16(output_path, bytes(combined), sample_rate, channels)
+
+
 def _safe_prefix(prefix: str) -> str:
     result = ''.join(c if c.isalnum() or c in ('-', '_') else '_' for c in prefix)
     return result.strip('_') or 'audio'

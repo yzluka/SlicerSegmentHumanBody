@@ -115,12 +115,21 @@ class _TextWidget:
         self.enabled = enabled
 
 
+class _ComboBoxStub:
+    def currentIndex(self): return 0
+    def itemData(self, idx): return -1
+
+
 class _RecordUI:
     def __init__(self):
         self.recordButton = _TextWidget()
+        self.recordEventOnlyButton = _TextWidget()
         self.stopRecordButton = _TextWidget()
         self.exportRecordButton = _TextWidget()
+        self.recordTestAudioButton = _TextWidget()
+        self.playTestAudioButton = _TextWidget()
         self.recordStatusLabel = _TextWidget()
+        self.audioDeviceComboBox = _ComboBoxStub()
 
 
 def _widget(seg_node, recorder=None):
@@ -138,6 +147,10 @@ def _record_widget(recorder):
     widget._recorder = recorder
     widget._recording_saved = False
     widget._parameterNode = None
+    widget._audio_test_active = False
+    widget._audio_test_chunks = None
+    widget._audio_recorder = None
+    widget._audio_temp_dir = None
     widget.ui = _RecordUI()
     widget._prompt_place_states = lambda: [False, False]
     widget._set_prompt_place_states = lambda states: None
@@ -182,7 +195,7 @@ def test_start_recording_discards_unsaved_record_and_restarts():
     assert recorder.cleared == 1
     assert recorder.started == 1
     assert widget._recording_saved is False
-    assert widget.ui.recordButton.text == 'Restart Record'
+    assert widget.ui.recordButton.text == 'Restart (Evt+Audio)'
 
 
 def test_start_recording_saves_unsaved_record_before_restart():
@@ -226,7 +239,7 @@ def test_record_ui_marks_unsaved_recording():
     widget._update_record_ui()
 
     assert widget.ui.recordButton.visible is True
-    assert widget.ui.recordButton.text == 'Restart Record'
+    assert widget.ui.recordButton.text == 'Restart (Evt+Audio)'
     assert widget.ui.exportRecordButton.enabled is True
     assert widget.ui.recordStatusLabel.text == 'Recorded: 4 events (unsaved)'
 

@@ -11,10 +11,13 @@ from slicer.ScriptedLoadableModule import (
 )
 from slicer.util import VTKObservationMixin
 
+import tempfile
+
 from core.utils import next_segment_name
 from core.modelFamilies import FAMILY_REGISTRY
 from core._mouse_recorder import get_recorder
 from core._input import StrokeHandler, BrushHandler, EraseHandler, PointHandler
+from core._audio_recorder import StandaloneAudioRecorder, merge_chunks_to_wav
 
 log = logging.getLogger(__name__)
 
@@ -111,6 +114,12 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._volume_origin_scan_timer = None
         self._volume_geometry_warning_signature = None
         self._recording_saved = True
+        self._audio_recorder: StandaloneAudioRecorder | None = None
+        self._audio_temp_dir: str | None = None
+        self._audio_test_active: bool = False
+        self._audio_test_recorder: StandaloneAudioRecorder | None = None
+        self._audio_test_timer: qt.QTimer | None = None
+        self._audio_test_chunks: list | None = None
 
     # ------------------------------------------------------------------ #
     # Lifecycle                                                            #
@@ -350,9 +359,13 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         ui.showCurrentSegmentCheckBox.connect('toggled(bool)', self._onToggleCurrentSegment)
         ui.showSegmentsCheckBox.connect('toggled(bool)', self._onToggleSavedSegments)
 
-        ui.recordButton.connect('clicked(bool)',       self.onRecord)
-        ui.stopRecordButton.connect('clicked(bool)',   self.onStopRecord)
-        ui.exportRecordButton.connect('clicked(bool)', self.onExportRecord)
+        ui.recordButton.connect('clicked(bool)',            self.onRecord)
+        ui.recordEventOnlyButton.connect('clicked(bool)',  self.onRecordEventOnly)
+        ui.stopRecordButton.connect('clicked(bool)',        self.onStopRecord)
+        ui.exportRecordButton.connect('clicked(bool)',      self.onExportRecord)
+        ui.recordTestAudioButton.connect('clicked(bool)',  self.onRecordTestAudio)
+        ui.playTestAudioButton.connect('clicked(bool)',    self.onPlayTestAudio)
+        self._populate_audio_devices()
 
         # Record volume / seg changes when active.
         ui.sourceVolumeSelector.connect(
@@ -728,6 +741,13 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             segmentation_name = seg.GetName() if seg else None,
             volume_sequences  = self._volume_sequence_metadata(),
         )
+        self._audio_temp_dir = tempfile.mkdtemp(prefix='shb_audio_')
+        self._audio_recorder = StandaloneAudioRecorder(
+            sample_rate_hz=44100, device=self._selected_audio_device())
+        try:
+            self._audio_recorder.start(self._audio_temp_dir, prefix='audio')
+        except Exception:
+            self._audio_recorder = None
         self._recording_saved = False
         self._update_record_ui()
         self._set_prompt_place_states(place_states)
@@ -812,19 +832,141 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 return idx
         return None
 
+    def onRecordEventOnly(self, *_):
+        if not self._prepare_recording_restart():
+            return
+        place_states = self._prompt_place_states()
+        if self._recorder.is_active:
+            self._recorder.stop()
+        self._recorder.clear()
+        vol = self._parameterNode.GetNodeReference(_INPUT_VOLUME) if self._parameterNode else None
+        seg = self._parameterNode.GetNodeReference(_SEGMENTATION) if self._parameterNode else None
+        self._recorder.start(
+            volume_node       = vol,
+            segmentation_name = seg.GetName() if seg else None,
+            volume_sequences  = self._volume_sequence_metadata(),
+        )
+        self._audio_recorder = None
+        self._audio_temp_dir = None
+        self._recording_saved = False
+        self._update_record_ui()
+        self._set_prompt_place_states(place_states)
+
     def onStopRecord(self, *_):
         if not self._recorder.is_active:
             return
         self._recorder.stop()
+        if self._audio_recorder is not None and self._audio_recorder.is_active:
+            self._audio_recorder.stop()
         self._update_record_ui()
 
     def onExportRecord(self, *_):
         self._save_recording_to_user_path()
 
+    def onRecordTestAudio(self, *_):
+        if self._audio_test_active:
+            self._stop_audio_test()
+            return
+        self._audio_test_active = True
+        self._audio_test_recorder = StandaloneAudioRecorder(device=self._selected_audio_device())
+        test_dir = tempfile.mkdtemp(prefix='shb_audiotest_')
+        self._set_record_buttons_enabled(False)
+        self.ui.recordTestAudioButton.setText('Stop Recording')
+        self.ui.recordTestAudioButton.setEnabled(True)
+        self.ui.playTestAudioButton.setEnabled(False)
+        try:
+            self._audio_test_recorder.start(test_dir, prefix='test')
+        except Exception:
+            self._cleanup_audio_test()
+            slicer.util.warningDisplay('No microphone available for audio test.')
+            return
+
+    def onPlayTestAudio(self, *_):
+        if not self._audio_test_chunks:
+            return
+        try:
+            import wave as _wave
+            import sounddevice as sd
+            combined = bytearray()
+            sr = self._audio_test_chunks[0].sample_rate_hz
+            for chunk in self._audio_test_chunks:
+                with _wave.open(chunk.path, 'rb') as w:
+                    combined.extend(w.readframes(w.getnframes()))
+            if not combined:
+                slicer.util.warningDisplay('Test recording is empty — nothing to play.')
+                return
+            audio = np.frombuffer(bytes(combined), dtype='<i2').astype('float32') / 32768.0
+            log.info(f'Playing test audio: {len(audio)} samples at {sr} Hz '
+                     f'({len(audio)/sr:.1f}s)')
+            self.ui.playTestAudioButton.setEnabled(False)
+            sd.stop()
+            sd.play(audio, sr, blocking=False)
+            duration_ms = int(len(audio) / sr * 1000) + 500
+            timer = qt.QTimer()
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda: self.ui.playTestAudioButton.setEnabled(True))
+            timer.start(duration_ms)
+            self._audio_test_timer = timer
+        except Exception as exc:
+            slicer.util.warningDisplay(f'Audio playback failed:\n{exc}')
+            self.ui.playTestAudioButton.setEnabled(True)
+
+    def _stop_audio_test(self):
+        chunks = []
+        if self._audio_test_recorder is not None and self._audio_test_recorder.is_active:
+            chunks = self._audio_test_recorder.stop()
+        if self._audio_test_timer is not None:
+            self._audio_test_timer.stop()
+            self._audio_test_timer = None
+        self._audio_test_active = False
+        self._audio_test_recorder = None
+        if chunks:
+            self._audio_test_chunks = chunks
+        self.ui.recordTestAudioButton.setText('Record Test')
+        self._set_record_buttons_enabled(True)
+        self.ui.playTestAudioButton.setEnabled(bool(self._audio_test_chunks))
+        self._update_record_ui()
+
+    def _cleanup_audio_test(self):
+        self._audio_test_active = False
+        self._audio_test_recorder = None
+        self._audio_test_timer = None
+        self.ui.recordTestAudioButton.setText('Record Test')
+        self.ui.playTestAudioButton.setEnabled(bool(self._audio_test_chunks))
+        self._set_record_buttons_enabled(True)
+        self._update_record_ui()
+
+    def _populate_audio_devices(self):
+        cb = self.ui.audioDeviceComboBox
+        cb.clear()
+        cb.addItem('Default Device', -1)
+        try:
+            import sounddevice as sd
+            for idx, dev in enumerate(sd.query_devices()):
+                if dev['max_input_channels'] > 0:
+                    cb.addItem(dev['name'], idx)
+        except Exception:
+            pass
+
+    def _selected_audio_device(self):
+        idx = self.ui.audioDeviceComboBox.currentIndex
+        device = self.ui.audioDeviceComboBox.itemData(idx)
+        return None if device == -1 else device
+
+    def _set_record_buttons_enabled(self, enabled: bool):
+        self.ui.recordButton.setEnabled(enabled)
+        self.ui.recordEventOnlyButton.setEnabled(enabled)
+        self.ui.stopRecordButton.setEnabled(enabled)
+        self.ui.exportRecordButton.setEnabled(enabled)
+        self.ui.recordTestAudioButton.setEnabled(enabled)
+        self.ui.playTestAudioButton.setEnabled(enabled and bool(self._audio_test_chunks))
+
     def _save_recording_to_user_path(self):
         if self._recorder.is_active:
             self._recorder.stop()
             self._update_record_ui()
+        if self._audio_recorder is not None and self._audio_recorder.is_active:
+            self._audio_recorder.stop()
         path = qt.QFileDialog.getSaveFileName(None, 'Save Recording', '', 'JSON files (*.json)')
         if not path:
             return False
@@ -835,25 +977,44 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self._recorder.save_to_file(path)
             self._recording_saved = True
             self._update_record_ui()
-            slicer.util.infoDisplay(
+            wav_saved = False
+            if self._audio_recorder is not None:
+                chunks = self._audio_recorder.chunks
+                if chunks:
+                    merge_chunks_to_wav(chunks, base + '.wav')
+                    wav_saved = True
+            msg = (
                 f'Recording saved:\n'
                 f'  {base}_raw.json\n'
                 f'  {base}.json\n'
-                f'  {base}_summary.txt')
+                f'  {base}_summary.txt'
+            )
+            if wav_saved:
+                msg += f'\n  {base}.wav'
+            slicer.util.infoDisplay(msg)
             return True
         except Exception as exc:
             slicer.util.errorDisplay(f'Failed to save recording:\n{exc}')
             return False
 
     def _update_record_ui(self):
-        ui        = self.ui
-        is_active = self._recorder.is_active
+        if self._audio_test_active:
+            return
+        ui         = self.ui
+        is_active  = self._recorder.is_active
         has_events = len(self._recorder) > 0
 
         ui.recordButton.setVisible(True)
-        ui.recordButton.setText('Restart Record' if has_events else 'Start Record')
+        ui.recordButton.setEnabled(True)
+        ui.recordButton.setText('Restart (Evt+Audio)' if has_events else 'Event & Audio')
+        ui.recordEventOnlyButton.setVisible(True)
+        ui.recordEventOnlyButton.setEnabled(True)
+        ui.recordEventOnlyButton.setText('Restart (Evt)' if has_events else 'Event Only')
         ui.stopRecordButton.setVisible(is_active)
         ui.exportRecordButton.setEnabled(is_active or has_events)
+        ui.recordTestAudioButton.setEnabled(not is_active)
+        ui.recordTestAudioButton.setText('Record Test')
+        ui.playTestAudioButton.setEnabled(not is_active and bool(self._audio_test_chunks))
 
         if is_active:
             status = f'Recording... ({len(self._recorder)} events)'
