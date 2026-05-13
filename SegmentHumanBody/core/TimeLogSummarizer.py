@@ -73,12 +73,19 @@ class TimeLogSummarizer:
                     self._state['tool'] = ev.get('tool')
                     if ev.get('segment') is not None:
                         self._state['segment'] = ev.get('segment')
-                    span, i = self._consume_stroke(i + 1, start_event=ev)
+                    if self._is_point_click_before_place(i + 1):
+                        span, i = self._consume_point_click_place(i + 1)
+                    elif self._is_point_drag_start(i + 1):
+                        span, i = self._consume_full_point_drag(i + 1)
+                    else:
+                        span, i = self._consume_stroke(i + 1, start_event=ev)
                 else:
                     span, i = self._consume_tool_change(i)
             elif kind == 'press':
                 if self._is_point_click_before_place(i):
                     span, i = self._consume_point_click_place(i)
+                elif self._is_point_drag_start(i):
+                    span, i = self._consume_full_point_drag(i)
                 else:
                     span, i = self._consume_stroke(i)
             elif kind == 'point_drag_move':
@@ -196,11 +203,13 @@ class TimeLogSummarizer:
         if slice_idx is not None:
             self._state['slice'] = slice_idx
 
+        tool = self._state.get('tool')
+        brush_mm = self._state.get('brush_mm') if tool in ('brush', 'erase') else None
         details = self._context_parts(
             segment=self._state.get('segment'),
             view=self._state.get('view'),
-            tool=self._state.get('tool'),
-            brush_mm=self._state.get('brush_mm'),
+            tool=tool,
+            brush_mm=brush_mm,
             slice_idx=slice_idx,
         )
         is_click = hold is None and _same_ijk(start_ijk, end_ijk)
@@ -217,8 +226,8 @@ class TimeLogSummarizer:
             'volume': self._state.get('volume'),
             'segment': self._state.get('segment'),
             'view': self._state.get('view'),
-            'tool': self._state.get('tool'),
-            'brush_mm': self._state.get('brush_mm'),
+            'tool': tool,
+            'brush_mm': brush_mm,
             'slice': slice_idx,
             'start': start_ijk,
             'end': end_ijk,
@@ -267,6 +276,75 @@ class TimeLogSummarizer:
             extra={'click': press.get('ijk')},
         ), i + 3
 
+    def _is_point_drag_start(self, i):
+        if i + 1 >= len(self._events):
+            return False
+        return (self._events[i].get('event') == 'press' and
+                self._events[i + 1].get('event') == 'point_drag_move')
+
+    def _consume_full_point_drag(self, i):
+        press = self._events[i]
+        if press.get('segment') is not None:
+            self._state['segment'] = press.get('segment')
+        if press.get('view') is not None:
+            self._state['view'] = press.get('view')
+
+        j = i + 1
+        drag_points = []
+        replace_ev = None
+        point_name = None
+        point_id = None
+
+        while j < len(self._events):
+            ev = self._events[j]
+            ek = ev.get('event')
+            if ek == 'point_drag_move':
+                if ev.get('ijk') is not None:
+                    drag_points.append(ev['ijk'])
+                if point_name is None:
+                    point_name = ev.get('point_name')
+                    point_id = ev.get('point')
+                    if ev.get('segment') is not None:
+                        self._state['segment'] = ev.get('segment')
+                    if ev.get('view') is not None:
+                        self._state['view'] = ev.get('view')
+                j += 1
+            elif ek in ('hold', 'release'):
+                j += 1
+            elif ek == 'replace':
+                replace_ev = ev
+                j += 1
+                break
+            else:
+                break
+
+        end_ev = replace_ev or self._events[j - 1]
+        if replace_ev is not None:
+            if replace_ev.get('segment') is not None:
+                self._state['segment'] = replace_ev.get('segment')
+            if replace_ev.get('view') is not None:
+                self._state['view'] = replace_ev.get('view')
+
+        segment = self._state.get('segment')
+        view = self._state.get('view')
+        details = self._context_parts(segment=segment, view=view)
+        details.append(f'Point drag={point_name or point_id}')
+        end_ijk = replace_ev.get('ijk') if replace_ev else (drag_points[-1] if drag_points else None)
+        if drag_points:
+            details.append(f'start={_fmt_ijk(drag_points[0])}')
+            details.append(f'end={_fmt_ijk(end_ijk)}')
+        text = f'({_time_range(press, end_ev)}: {", ".join(details)})'
+        return _span('point_drag', press, end_ev, text, {
+            'volume': self._state.get('volume'),
+            'segment': segment,
+            'view': view,
+            'point': point_id,
+            'point_name': point_name,
+            'start': drag_points[0] if drag_points else None,
+            'end': end_ijk,
+            'trajectory': drag_points if len(drag_points) > 1 else None,
+        }), j
+
     def _consume_point_drag(self, i):
         start = self._events[i]
         key = (start.get('segment'), start.get('point'), start.get('point_name'))
@@ -274,7 +352,11 @@ class TimeLogSummarizer:
         j = i
         while j < len(self._events):
             ev = self._events[j]
-            if ev.get('event') != 'point_drag_move':
+            ek = ev.get('event')
+            if ek == 'hold':
+                j += 1
+                continue
+            if ek != 'point_drag_move':
                 break
             ev_key = (ev.get('segment'), ev.get('point'), ev.get('point_name'))
             if ev_key != key:
