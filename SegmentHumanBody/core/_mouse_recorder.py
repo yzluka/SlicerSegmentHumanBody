@@ -266,7 +266,8 @@ class MouseEventRecorder:
     def is_active(self) -> bool:
         return self._active
 
-    def start(self, volume_node=None, segmentation_name: str | None = None):
+    def start(self, volume_node=None, segmentation_name: str | None = None,
+              volume_sequences: list | None = None):
         if self._active:
             return
         self._active = True
@@ -289,6 +290,7 @@ class MouseEventRecorder:
             initial_handler_context)
         metadata = {
             'volume': _volume_metadata(volume_node),
+            'volume_sequences': list(volume_sequences or []),
             'segmentation': segmentation_name,
             'sample_rate_hz': hz,
             'move_thinning': _move_thinning_metadata(),
@@ -362,12 +364,18 @@ class MouseEventRecorder:
         })
         self._append(SEGMENT_CREATED, None, payload)
 
-    def record_volume_changed(self, volume_name: str | None):
+    def record_volume_changed(self, volume_name: str | None,
+                              volume_id: str | None = None,
+                              sequence_index: int | None = None):
         payload = self._source_context_payload()
         payload.update({
             'volume': volume_name,
             'analysis_event_type': BOUNDARY_EVENT,
         })
+        if volume_id is not None:
+            payload['volume_id'] = volume_id
+        if sequence_index is not None:
+            payload['sequence_index'] = int(sequence_index)
         self._append(VOLUME_CHANGED, None, payload)
 
     def set_volume_node(self, volume_node):
@@ -590,10 +598,19 @@ class MouseEventRecorder:
 
     def save_to_file(self, path: str):
         base = path[:-5] if path.endswith('.json') else path
+        raw_data = self.export_raw_data()
+        from core.TimeLogInterpreter import TimeLogInterpreter
+        interpreted_data = TimeLogInterpreter(raw_data).export()
+        from core.TimeLogSummarizer import TimeLogSummarizer
+        summary_text = TimeLogSummarizer(interpreted_data).export_text()
         with open(base + '.json', 'w', encoding='utf-8') as f:
-            json.dump(self.export_interpreted_data(), f, indent=2)
+            json.dump(interpreted_data, f, indent=2)
         with open(base + '_raw.json', 'w', encoding='utf-8') as f:
-            json.dump(self.export_raw_data(), f, indent=2)
+            json.dump(raw_data, f, indent=2)
+        with open(base + '_summary.txt', 'w', encoding='utf-8') as f:
+            f.write(summary_text)
+            if summary_text:
+                f.write('\n')
 
     def _export_metadata_block(self):
         """Return (metadata_record, metadata_dict) with start_time already set."""
@@ -839,7 +856,7 @@ class MouseEventRecorder:
     def _raw_mouse_payload(self, view_name, xy_local, event_type, extra=None):
         payload = {'view_name': view_name}
         payload.update(self._bound_tool_payload())
-        if event_type == VIEW_CHANGED:
+        if event_type in (PRESS, RELEASE, VIEW_CHANGED):
             payload.update(self._view_change_payload(view_name))
         if extra:
             payload.update(extra)
@@ -1242,6 +1259,7 @@ class _RawExportContext:
     def __init__(self, metadata=None):
         self.slice_by_view = {}
         self.emitted_context_by_view = collections.defaultdict(dict)
+        self.ras_to_ijk = _ras_to_ijk_matrix(metadata)
         initial = (metadata or {}).get('initial_handler_context') or {}
         for view_name, payload in initial.items():
             self._prime_context(view_name, payload or {})
@@ -1581,6 +1599,8 @@ def _raw_event(record, context=None) -> dict | None:
     if slice_idx is not None:
         ev['slice'] = int(slice_idx)
         ev['z'] = int(slice_idx)
+    if context is not None:
+        context.note_slice(payload)
     if payload.get('xy') is not None:
         ev['xy'] = [int(v) for v in payload['xy']]
     if record.event_type in (PRESS, RELEASE, MOVE):
@@ -1597,6 +1617,12 @@ def _raw_event(record, context=None) -> dict | None:
             POINT_DRAG_START, POINT_DRAG_MOVE):
         ev.setdefault('event_type', BOUNDARY_EVENT)
         _copy_raw_payload_fields(ev, payload)
+        if record.event_type in (
+                POINT_PLACED, POINT_REPLACED, POINT_REMOVED,
+                POINT_DRAG_START, POINT_DRAG_MOVE):
+            _event_add_ijk(
+                ev, record,
+                context.ras_to_ijk if context is not None else None)
         return ev
     if record.event_type == VIEW_CHANGED:
         ev.setdefault('event_type', TRAJECTORY_EVENT)
@@ -1703,9 +1729,14 @@ def _copy_raw_payload_fields(ev, payload):
     field_map = (
         ('segment_id', 'segment'),
         ('seg_name', 'seg_name'),
+        ('volume_id', 'volume_id'),
+        ('volume_name', 'volume_name'),
+        ('segmentation_id', 'segmentation_id'),
+        ('segmentation_name', 'segmentation_name'),
         ('old_name', 'old_name'),
         ('new_name', 'new_name'),
         ('volume', 'volume'),
+        ('sequence_index', 'sequence_index'),
         ('family', 'family'),
         ('variant', 'variant'),
         ('point_id', 'point'),

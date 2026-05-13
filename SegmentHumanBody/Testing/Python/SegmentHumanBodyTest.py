@@ -14,7 +14,7 @@ These tests require a live Slicer process and exercise:
   - Point placement workflow: _onPointConfirmed, positive/negative SPX selection, undo.
   - Manual point deletion: _onPointRemoved reverses the mask without Ctrl+Z.
   - Mixed-action undo: brush + point in one session, LIFO across action types.
-  - Segment visibility: onToggleCurrentSegment (V), onToggleSavedSegments (checkbox),
+  - Segment visibility: current segment (Q), saved/other segments (S checkbox),
     _apply_saved_segments_visibility isolation, multi-segment scenarios.
   - Window / Level: apply_window_level clipping and normalization, logic integration,
     W/L applied to model input before point placement and expansion.
@@ -1936,8 +1936,8 @@ def _make_ct_volume():
 class SegmentVisibilityTest(unittest.TestCase):
     """Tests for the two-checkbox segment visibility system.
 
-    showCurrentSegmentCheckBox / V hotkey — controls the segment being edited.
-    showSegmentsCheckBox                  — controls all other (saved) segments.
+    showCurrentSegmentCheckBox / Q hotkey - controls the segment being edited.
+    showSegmentsCheckBox / S hotkey       - controls all other (saved) segments.
 
     Each test uses a real vtkMRMLSegmentationNode with a real display node so
     that SetSegmentVisibility / GetSegmentVisibility reflect actual MRML state.
@@ -2001,7 +2001,7 @@ class SegmentVisibilityTest(unittest.TestCase):
         self.assertTrue(w._current_segment_visible)
 
     def test_toggle_current_flips_on_each_call(self):
-        """visible=None (V hotkey path) alternates between hidden and shown."""
+        """visible=None (Q hotkey path) alternates between hidden and shown."""
         from SegmentHumanBody import SegmentHumanBodyWidget
         w = self._w(self._segID_A)
         dn = self._segNode.GetDisplayNode()

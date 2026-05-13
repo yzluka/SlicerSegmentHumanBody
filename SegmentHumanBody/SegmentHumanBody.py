@@ -34,6 +34,7 @@ def _suppress_vtk_warnings():
 # MRML parameter-node reference keys
 _INPUT_VOLUME = 'InputVolume'
 _SEGMENTATION = 'Segmentation'
+_GEOMETRY_SIGNATURE_ATTR = 'SegmentHumanBody.referenceGeometrySignature'
 
 # Segment tag keys — store the markup node IDs per segment natively
 _POS_TAG = 'SegmentHumanBody.posNodeID'
@@ -104,6 +105,11 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._recorded_prompt_point_cache = {}
         self._recently_placed = {}
         self._syncing_parameter_node_to_ui = False
+        self._reverting_source_volume = False
+        self._last_source_volume_node = None
+        self._volume_origin_scan_pending = False
+        self._volume_origin_scan_timer = None
+        self._volume_geometry_warning_signature = None
         self._recording_saved = True
 
     # ------------------------------------------------------------------ #
@@ -135,6 +141,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._set_prompt_nodes(None, None)  # configure placement mode; nodes wired later
 
         self._connectSignals(uiWidget)
+        self._observeVolumeImports()
         self.initializeParameterNode()
         self._update_record_ui()
         self._recorder.context_fn = self._recorder_context
@@ -159,6 +166,46 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if slicer.modules.segmenteditor.widgetRepresentation() is None:
             slicer.util.selectModule('SegmentEditor')
             slicer.util.selectModule(self.moduleName)
+
+    def _observeVolumeImports(self):
+        for event_name in ('NodeAddedEvent', 'EndImportEvent', 'EndBatchProcessEvent'):
+            event = getattr(slicer.vtkMRMLScene, event_name, None)
+            if event is not None:
+                self.addObserver(slicer.mrmlScene, event, self._schedule_volume_origin_scan)
+        self._schedule_volume_origin_scan()
+
+    def _schedule_volume_origin_scan(self, *_):
+        self._volume_origin_scan_pending = True
+        if self._volume_origin_scan_timer is None:
+            timer = qt.QTimer()
+            timer.setSingleShot(True)
+            timer.connect('timeout()', self._normalize_loaded_volume_origins)
+            self._volume_origin_scan_timer = timer
+        self._volume_origin_scan_timer.start(1500)
+
+    def _normalize_loaded_volume_origins(self):
+        self._volume_origin_scan_pending = False
+        self.logic.normalize_scalar_volume_names_from_filenames()
+        current = self.ui.sourceVolumeSelector.currentNode()
+        current_key = self.logic.volume_storage_key(current)
+        replacements = self.logic.replace_duplicate_scalar_volume_nodes()
+        if current_key in replacements:
+            self.ui.sourceVolumeSelector.setCurrentNode(replacements[current_key])
+        stats = self.logic.scene_volume_geometry_statistics()
+        if stats['group_count'] > 1:
+            warning_signature = stats['signature']
+            if warning_signature != self._volume_geometry_warning_signature:
+                self._volume_geometry_warning_signature = warning_signature
+                slicer.util.warningDisplay(
+                    'Loaded volumes have inconsistent geometry.\n\n'
+                    f'{stats["summary"]}\n\n'
+                    'Loading is allowed. Origin differences are ignored and '
+                    'compatible zero-origin volumes will still be normalized, '
+                    'but shape, spacing, or orientation differences may not '
+                    'align as one sequence set.')
+        elif stats['group_count'] == 1:
+            self._volume_geometry_warning_signature = None
+        self.logic.normalize_compatible_scene_volume_origins()
 
     @staticmethod
     def _configureUnlimitedPlacement(markups_widget):
@@ -284,13 +331,14 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def _connectSignals(self, uiWidget):
         ui = self.ui
         ui.sourceVolumeSelector.connect('currentNodeChanged(vtkMRMLNode*)',
-                                        self._onNodeSelectorChanged)
+                                        self._onSourceVolumeSelectorChanged)
         ui.segmentationNodeSelector.connect('currentNodeChanged(vtkMRMLNode*)',
-                                            self._onNodeSelectorChanged)
+                                            self._onSegmentationSelectorChanged)
         ui.segmentSelector.connect('currentSegmentChanged(QString)',
                                    self._onSegmentIDChanged)
         ui.addSegmentButton.connect('clicked(bool)', self._onAddSegment)
         ui.removeSegmentButton.connect('clicked(bool)', self._onRemoveSegment)
+        ui.clearVolumesButton.connect('clicked(bool)', self._onClearLoadedVolumes)
         ui.brushToolButton.connect('toggled(bool)', self._onBrushToggled)
         ui.eraseToolButton.connect('toggled(bool)', self._onEraseToggled)
         ui.overwriteModeDropdown.connect('currentIndexChanged(int)', self._onOverwriteModeChanged)
@@ -331,9 +379,18 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         sc = qt.QShortcut
         sc(qt.QKeySequence('Ctrl+Z'),       uiWidget).connect('activated()', self._onUndo)
         sc(qt.QKeySequence('Ctrl+Shift+Z'), uiWidget).connect('activated()', self._onRedo)
-        sc(qt.QKeySequence('V'), uiWidget).connect(
-            'activated()', lambda: ui.showCurrentSegmentCheckBox.toggle())
-        sc(qt.QKeySequence('A'), uiWidget).connect('activated()', self._onAddSegment)
+        sc(qt.QKeySequence('A'), uiWidget).connect(
+            'activated()', lambda: self._select_relative_volume(1))
+        sc(qt.QKeySequence('W'), uiWidget).connect(
+            'activated()', lambda: self._select_relative_volume(-1))
+        sc(qt.QKeySequence('Z'), uiWidget).connect(
+            'activated()', lambda: self._select_relative_segment(-1))
+        sc(qt.QKeySequence('C'), uiWidget).connect(
+            'activated()', lambda: self._select_relative_segment(1))
+        sc(qt.QKeySequence('Q'), uiWidget).connect(
+            'activated()', self._toggle_current_segment_visibility)
+        sc(qt.QKeySequence('S'), uiWidget).connect(
+            'activated()', self._toggle_saved_segments_visibility)
 
     # ------------------------------------------------------------------ #
     # Parameter node                                                       #
@@ -356,6 +413,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def _onParameterNodeModified(self, *_):
         if not self._parameterNode:
             return
+        if not hasattr(self, 'ui'):
+            return
         if self._syncing_parameter_node_to_ui:
             return
         self._syncing_parameter_node_to_ui = True
@@ -368,6 +427,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 self.ui.segmentSelector.setCurrentNode(seg)
             self.ui.addSegmentButton.setEnabled(vol is not None)
             self._syncWLFromVolume(vol)
+            self._sync_selected_nodes_to_views()
+            self._last_source_volume_node = vol
             self.ui.showCurrentSegmentCheckBox.blockSignals(True)
             self.ui.showCurrentSegmentCheckBox.setChecked(True)
             self.ui.showCurrentSegmentCheckBox.blockSignals(False)
@@ -385,25 +446,169 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         finally:
             self._syncing_parameter_node_to_ui = False
 
-    def _onNodeSelectorChanged(self, *_):
+    def _set_parameter_node_reference(self, role, node):
+        if not self._parameterNode:
+            return
+        self._syncing_parameter_node_to_ui = True
+        try:
+            self._parameterNode.SetNodeReferenceID(
+                role, node.GetID() if node else '')
+            self._parameterNode.Modified()
+        finally:
+            self._syncing_parameter_node_to_ui = False
+
+    def _onSourceVolumeSelectorChanged(self, *_):
         if self._syncing_parameter_node_to_ui:
             return
         if not self._parameterNode:
             return
+        if self._reverting_source_volume:
+            return
+        previous_vol = self._last_source_volume_node
         vol = self.ui.sourceVolumeSelector.currentNode()
+        mismatch_action = self._resolve_geometry_mismatch_for_volume(vol)
+        if mismatch_action == 'cancel':
+            self._reverting_source_volume = True
+            try:
+                self.ui.sourceVolumeSelector.setCurrentNode(self._last_source_volume_node)
+            finally:
+                self._reverting_source_volume = False
+            return
+        self._set_parameter_node_reference(_INPUT_VOLUME, vol)
+        self.ui.addSegmentButton.setEnabled(vol is not None)
+        self._syncWLFromVolume(vol)
+        if vol is not None:
+            self.logic.normalize_volume_origin_from_compatible_scene_volume(vol)
+            self.logic.show_volume_in_slice_views(vol, fit=False, propagate=False)
+        self._last_source_volume_node = vol
+        if mismatch_action == 'create':
+            self._create_and_select_segmentation_for_volume(vol)
+
+    def _onSegmentationSelectorChanged(self, *_):
+        if self._syncing_parameter_node_to_ui:
+            return
+        if not self._parameterNode:
+            return
         seg = self.ui.segmentationNodeSelector.currentNode()
         # Externally loaded segmentation nodes may have no display node, which
         # causes qMRMLSegmentsModel to warn. Ensure one exists before the
         # segment selector tries to render the segment list.
         if seg and not seg.GetDisplayNode():
             seg.CreateDefaultDisplayNodes()
-        self._parameterNode.SetNodeReferenceID(
-            _INPUT_VOLUME, vol.GetID() if vol else '')
-        self._parameterNode.SetNodeReferenceID(
-            _SEGMENTATION, seg.GetID() if seg else '')
-        self._parameterNode.Modified()
-        self._syncWLFromVolume(vol)
+        self._set_parameter_node_reference(_SEGMENTATION, seg)
         self._rewire_segmentation_observer(seg)
+        self._sync_selected_nodes_to_views()
+
+    def _onNodeSelectorChanged(self, *_):
+        """Compatibility path for tests or external callers using the old hook."""
+        if self._syncing_parameter_node_to_ui:
+            return
+        self._onSourceVolumeSelectorChanged()
+        self._onSegmentationSelectorChanged()
+
+    def _onClearLoadedVolumes(self, *_):
+        count = self.logic.clear_scalar_volume_nodes()
+        self._last_source_volume_node = None
+        self._volume_geometry_warning_signature = None
+        if self._parameterNode:
+            self._set_parameter_node_reference(_INPUT_VOLUME, None)
+        self.ui.sourceVolumeSelector.setCurrentNode(None)
+        self.ui.addSegmentButton.setEnabled(False)
+        if count:
+            slicer.util.infoDisplay(f'Removed {count} loaded volume(s).')
+        else:
+            slicer.util.infoDisplay('No loaded volumes to remove.')
+
+    def _resolve_geometry_mismatch_for_volume(self, vol):
+        seg = self.ui.segmentationNodeSelector.currentNode()
+        if vol is None or seg is None:
+            return 'keep'
+        if self.logic.segmentation_matches_volume_geometry(seg, vol):
+            return 'keep'
+
+        box = qt.QMessageBox()
+        box.setIcon(qt.QMessageBox.Warning)
+        box.setWindowTitle('Geometry mismatch')
+        box.setText(
+            'The selected segmentation uses a different reference geometry '
+            'than the selected volume.')
+        box.setInformativeText(
+            'Create a new empty segmentation for this volume, keep the current '
+            'segmentation, or cancel the volume switch?')
+        create_button = box.addButton('Create New Segmentation', qt.QMessageBox.AcceptRole)
+        keep_button = box.addButton('Keep Current Segmentation', qt.QMessageBox.DestructiveRole)
+        cancel_button = box.addButton('Cancel Switch', qt.QMessageBox.RejectRole)
+        box.setDefaultButton(create_button)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is create_button:
+            return 'create'
+        if clicked is cancel_button:
+            return 'cancel'
+        return 'keep'
+
+    def _create_and_select_segmentation_for_volume(self, vol):
+        if vol is None:
+            return None
+        with _suppress_vtk_warnings():
+            seg = self.logic.create_segmentation_for_volume(vol)
+            self.ui.segmentationNodeSelector.setCurrentNode(seg)
+            self.ui.segmentSelector.setCurrentNode(seg)
+        return seg
+
+    # ------------------------------------------------------------------ #
+    # View / selection sync                                                #
+    # ------------------------------------------------------------------ #
+
+    def _sync_selected_nodes_to_views(self, sync_editor=True, fit=False, propagate=False):
+        vol = self.ui.sourceVolumeSelector.currentNode()
+        seg = self.ui.segmentationNodeSelector.currentNode()
+        if vol is not None:
+            self.logic.show_volume_in_slice_views(vol, fit=fit, propagate=propagate)
+        if seg is not None and not seg.GetDisplayNode():
+            seg.CreateDefaultDisplayNodes()
+        if sync_editor and vol is not None and seg is not None:
+            editor = self.logic.get_segment_editor()
+            seg_id = self.ui.segmentSelector.currentSegmentID()
+            self.logic.setup_editor_nodes(editor, vol, seg, seg_id)
+
+    def _select_relative_volume(self, offset):
+        nodes = self.logic.scalar_volume_nodes()
+        if not nodes:
+            slicer.util.warningDisplay('No source volumes are loaded.')
+            return
+        current = self.ui.sourceVolumeSelector.currentNode()
+        current_id = current.GetID() if current is not None else None
+        node_ids = [node.GetID() for node in nodes]
+        if current_id in node_ids:
+            idx = node_ids.index(current_id)
+            target = nodes[(idx + offset) % len(nodes)]
+        else:
+            target = nodes[0 if offset >= 0 else -1]
+        self.ui.sourceVolumeSelector.setCurrentNode(target)
+
+    def _select_relative_segment(self, offset):
+        seg = self.ui.segmentationNodeSelector.currentNode()
+        if not seg:
+            slicer.util.warningDisplay('No segmentation selected.')
+            return
+        ids = self.logic.segment_ids(seg)
+        if not ids:
+            slicer.util.warningDisplay('No segments are available.')
+            return
+        current = self.ui.segmentSelector.currentSegmentID()
+        if current in ids:
+            idx = ids.index(current)
+            target = ids[(idx + offset) % len(ids)]
+        else:
+            target = ids[0 if offset >= 0 else -1]
+        self.ui.segmentSelector.setCurrentSegmentID(target)
+
+    def _toggle_current_segment_visibility(self):
+        self.ui.showCurrentSegmentCheckBox.toggle()
+
+    def _toggle_saved_segments_visibility(self):
+        self.ui.showSegmentsCheckBox.toggle()
 
     # ------------------------------------------------------------------ #
     # Segment lifecycle sync                                               #
@@ -521,6 +726,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._recorder.start(
             volume_node       = vol,
             segmentation_name = seg.GetName() if seg else None,
+            volume_sequences  = self._volume_sequence_metadata(),
         )
         self._recording_saved = False
         self._update_record_ui()
@@ -570,8 +776,41 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if not self._recorder.is_active:
             return
         self._recorder.set_volume_node(node)
-        self._recorder.record_volume_changed(node.GetName() if node else None)
+        self._recorder.record_volume_changed(
+            node.GetName() if node else None,
+            volume_id=node.GetID() if node else None,
+            sequence_index=self._volume_sequence_index(node),
+        )
         qt.QTimer.singleShot(0, self._recorder.refresh_visual_state)
+
+    def _volume_sequence_metadata(self):
+        if not hasattr(self, 'logic') or not hasattr(self.logic, 'scalar_volume_nodes'):
+            return []
+        result = []
+        for idx, node in enumerate(self.logic.scalar_volume_nodes()):
+            item = {
+                'index': idx,
+                'id': node.GetID(),
+                'name': node.GetName(),
+            }
+            origin = self.logic.volume_origin(node)
+            if origin is not None:
+                item['origin'] = list(origin)
+            image = node.GetImageData()
+            if image is not None:
+                item['dimensions'] = list(image.GetDimensions())
+            item['spacing'] = list(node.GetSpacing())
+            result.append(item)
+        return result
+
+    def _volume_sequence_index(self, node):
+        if node is None:
+            return None
+        node_id = node.GetID()
+        for idx, candidate in enumerate(self.logic.scalar_volume_nodes()):
+            if candidate.GetID() == node_id:
+                return idx
+        return None
 
     def onStopRecord(self, *_):
         if not self._recorder.is_active:
@@ -597,7 +836,10 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self._recording_saved = True
             self._update_record_ui()
             slicer.util.infoDisplay(
-                f'Recording saved:\n  {base}.json\n  {base}_raw.json')
+                f'Recording saved:\n'
+                f'  {base}_raw.json\n'
+                f'  {base}.json\n'
+                f'  {base}_summary.txt')
             return True
         except Exception as exc:
             slicer.util.errorDisplay(f'Failed to save recording:\n{exc}')
@@ -636,8 +878,13 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # Resolve active slice so exported records have the active view context.
         pn = self._parameterNode
         vol = pn.GetNodeReference(_INPUT_VOLUME) if pn else None
+        seg = self.ui.segmentationNodeSelector.currentNode()
         active_view = view_name or self.currentViewName
         axis, slice_idx = self.logic.active_slice_info(active_view, vol)
+        seg_name = None
+        if seg is not None and seg_id:
+            seg_obj = seg.GetSegmentation().GetSegment(seg_id)
+            seg_name = seg_obj.GetName() if seg_obj is not None else None
         if tool in ('brush', 'erase'):
             editor = self.logic.get_segment_editor()
             pn_ed  = editor.mrmlSegmentEditorNode() if editor else None
@@ -647,6 +894,11 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             brush_radius_mm = None
         return {
             'segment_id':      seg_id,
+            'seg_name':        seg_name,
+            'volume_id':       vol.GetID() if vol is not None else None,
+            'volume_name':     vol.GetName() if vol is not None else None,
+            'segmentation_id': seg.GetID() if seg is not None else None,
+            'segmentation_name': seg.GetName() if seg is not None else None,
             'tool':            tool,
             'view_name':       active_view,
             'axis':            axis,
@@ -1361,6 +1613,292 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         super().__init__()
 
     # ------------------------------------------------------------------ #
+    # Scene / view helpers                                                 #
+    # ------------------------------------------------------------------ #
+
+    def scalar_volume_nodes(self):
+        nodes = []
+        collection = slicer.mrmlScene.GetNodesByClass('vtkMRMLScalarVolumeNode')
+        collection.UnRegister(None)
+        for i in range(collection.GetNumberOfItems()):
+            nodes.append(collection.GetItemAsObject(i))
+        return nodes
+
+    def clear_scalar_volume_nodes(self):
+        nodes = list(self.scalar_volume_nodes())
+        for node in nodes:
+            slicer.mrmlScene.RemoveNode(node)
+        return len(nodes)
+
+    def replace_duplicate_scalar_volume_nodes(self):
+        """Keep the newest node for each loaded file path and remove older duplicates."""
+        by_key = {}
+        replacements = {}
+        for node in self.scalar_volume_nodes():
+            key = self.volume_storage_key(node)
+            if key is None:
+                continue
+            by_key.setdefault(key, []).append(node)
+        for key, nodes in by_key.items():
+            if len(nodes) < 2:
+                continue
+            keep = nodes[-1]
+            preserved_name = self.volume_filename(keep) or self.volume_filename(nodes[0]) or nodes[0].GetName()
+            for old in nodes[:-1]:
+                slicer.mrmlScene.RemoveNode(old)
+            keep.SetName(preserved_name)
+            replacements[key] = keep
+        return replacements
+
+    def normalize_scalar_volume_names_from_filenames(self):
+        for node in self.scalar_volume_nodes():
+            filename = self.volume_filename(node)
+            if filename:
+                node.SetName(filename)
+
+    @staticmethod
+    def volume_storage_key(vol):
+        if vol is None:
+            return None
+        storage = vol.GetStorageNode()
+        if storage is None:
+            return None
+        filename = storage.GetFileName()
+        if not filename:
+            return None
+        return filename.replace('\\', '/').lower()
+
+    @staticmethod
+    def volume_filename(vol):
+        if vol is None:
+            return None
+        storage = vol.GetStorageNode()
+        if storage is None:
+            return None
+        filename = storage.GetFileName()
+        if not filename:
+            return None
+        return filename.replace('\\', '/').rsplit('/', 1)[-1]
+
+    def volume_geometry_signature(self, vol):
+        if vol is None:
+            return None
+        image = vol.GetImageData()
+        dims = image.GetDimensions() if image is not None else None
+        spacing = tuple(round(float(value), 4) for value in vol.GetSpacing())
+        matrix = vtk.vtkMatrix4x4()
+        vol.GetIJKToRASMatrix(matrix)
+        orientation = []
+        for col in range(3):
+            length = sum(matrix.GetElement(row, col) ** 2 for row in range(3)) ** 0.5
+            if length == 0:
+                orientation.extend([0.0, 0.0, 0.0])
+            else:
+                orientation.extend(
+                    round(float(matrix.GetElement(row, col) / length), 4)
+                    for row in range(3)
+                )
+        return repr((dims, spacing, tuple(orientation)))
+
+    def volume_reference_geometry_string(self, vol):
+        if vol is None:
+            return None
+        try:
+            return slicer.vtkSlicerSegmentationsModuleLogic.GetReferenceImageGeometryParameterFromVolumeNode(vol)
+        except Exception:
+            return None
+
+    def segmentation_reference_geometry_string(self, seg):
+        if seg is None:
+            return None
+        try:
+            name = slicer.vtkSegmentationConverter.GetReferenceImageGeometryParameterName()
+            return seg.GetSegmentation().GetConversionParameter(name)
+        except Exception:
+            return None
+
+    def segmentation_matches_volume_geometry(self, seg, vol):
+        if seg is None or vol is None:
+            return True
+        vol_sig = self.volume_geometry_signature(vol)
+        seg_sig = seg.GetAttribute(_GEOMETRY_SIGNATURE_ATTR)
+        if seg_sig and vol_sig:
+            return seg_sig == vol_sig
+
+        return True
+
+    def normalize_volume_origin_from_compatible_scene_volume(self, vol):
+        if vol is None:
+            return
+        current_origin = self.volume_origin(vol)
+        if current_origin is None or not self.origin_is_zero(current_origin):
+            return
+        signature = self.volume_geometry_signature(vol)
+        if signature is None:
+            return
+        reference = self.first_nonzero_origin_volume_for_signature(signature, vol)
+        if reference is None:
+            return
+        reference_origin = self.volume_origin(reference)
+        if reference_origin is None or self.origin_is_zero(reference_origin):
+            return
+        vol.SetOrigin(reference_origin)
+        vol.Modified()
+
+    def normalize_compatible_scene_volume_origins(self):
+        groups = {}
+        for node in self.scalar_volume_nodes():
+            signature = self.volume_geometry_signature(node)
+            if signature is None:
+                continue
+            groups.setdefault(signature, []).append(node)
+
+        for nodes in groups.values():
+            reference_origin = None
+            for node in nodes:
+                origin = self.volume_origin(node)
+                if origin is not None and not self.origin_is_zero(origin):
+                    reference_origin = origin
+                    break
+            if reference_origin is None:
+                continue
+            for node in nodes:
+                origin = self.volume_origin(node)
+                if origin is not None and self.origin_is_zero(origin):
+                    node.SetOrigin(reference_origin)
+                    node.Modified()
+
+    def scene_volume_geometry_statistics(self):
+        nodes = self.scalar_volume_nodes()
+        groups = {}
+        for node in nodes:
+            signature = self.volume_geometry_signature(node)
+            if signature is None:
+                continue
+            groups.setdefault(signature, []).append(node)
+        lines = []
+        warning_signature_parts = []
+        for idx, (signature, group_nodes) in enumerate(groups.items(), start=1):
+            origin_counts = self._origin_count_summary(group_nodes)
+            files = '; '.join(self.volume_display_path(node) for node in group_nodes)
+            geom = self.volume_geometry_summary(group_nodes[0], include_name=False)
+            lines.append(
+                f'Group {idx}: {len(group_nodes)} volume(s); {geom}; '
+                f'{origin_counts}; files: {files}')
+            warning_signature_parts.append(
+                f'{signature}:{",".join(node.GetID() for node in group_nodes)}')
+        return {
+            'group_count': len(groups),
+            'summary': '\n'.join(lines) if lines else 'No scalar volumes loaded.',
+            'signature': '|'.join(warning_signature_parts),
+        }
+
+    def _origin_count_summary(self, nodes):
+        zero_count = 0
+        nonzero_count = 0
+        for node in nodes:
+            origin = self.volume_origin(node)
+            if origin is None:
+                continue
+            if self.origin_is_zero(origin):
+                zero_count += 1
+            else:
+                nonzero_count += 1
+        return f'origins: {nonzero_count} non-zero, {zero_count} zero'
+
+    def volume_geometry_summary(self, vol, include_name=True):
+        if vol is None:
+            return '<none>'
+        image = vol.GetImageData()
+        dims = image.GetDimensions() if image is not None else None
+        spacing = tuple(round(float(value), 4) for value in vol.GetSpacing())
+        orientation = self.volume_orientation_summary(vol)
+        prefix = f'{vol.GetName()} ' if include_name else ''
+        return f'{prefix}shape={dims} spacing={spacing} orientation={orientation}'
+
+    def volume_display_path(self, vol):
+        if vol is None:
+            return '<none>'
+        storage = vol.GetStorageNode()
+        if storage is not None:
+            filename = storage.GetFileName()
+            if filename:
+                return filename
+        return vol.GetName()
+
+    def volume_orientation_summary(self, vol):
+        matrix = vtk.vtkMatrix4x4()
+        vol.GetIJKToRASMatrix(matrix)
+        columns = []
+        for col in range(3):
+            length = sum(matrix.GetElement(row, col) ** 2 for row in range(3)) ** 0.5
+            if length == 0:
+                columns.append((0.0, 0.0, 0.0))
+            else:
+                columns.append(tuple(
+                    round(float(matrix.GetElement(row, col) / length), 3)
+                    for row in range(3)
+                ))
+        return columns
+
+    def first_nonzero_origin_volume_for_signature(self, signature, exclude_node=None):
+        for node in self.scalar_volume_nodes():
+            if node is exclude_node:
+                continue
+            if self.volume_geometry_signature(node) != signature:
+                continue
+            origin = self.volume_origin(node)
+            if origin is not None and not self.origin_is_zero(origin):
+                return node
+        return None
+
+    @staticmethod
+    def volume_origin(vol):
+        if vol is None:
+            return None
+        try:
+            return tuple(float(value) for value in vol.GetOrigin())
+        except Exception:
+            return None
+
+    @staticmethod
+    def origin_is_zero(origin, tolerance=1e-4):
+        return all(abs(float(value)) <= tolerance for value in origin)
+
+    def show_volume_in_slice_views(self, vol, fit=False, propagate=False):
+        if vol is None:
+            return
+        app_logic = slicer.app.applicationLogic()
+        selection = app_logic.GetSelectionNode()
+        if selection is not None:
+            selection.SetReferenceActiveVolumeID(vol.GetID())
+        if propagate:
+            app_logic.PropagateVolumeSelection(0)
+
+        lm = slicer.app.layoutManager()
+        if lm is None:
+            return
+        for view_name in ('Red', 'Green', 'Yellow'):
+            widget = lm.sliceWidget(view_name)
+            if widget is None:
+                continue
+            composite = widget.mrmlSliceCompositeNode()
+            if composite is not None and composite.GetBackgroundVolumeID() != vol.GetID():
+                composite.SetBackgroundVolumeID(vol.GetID())
+            logic = widget.sliceLogic() if fit else None
+            if logic is not None:
+                logic.FitSliceToAll()
+
+    def segment_ids(self, seg_node):
+        if not seg_node:
+            return []
+        segmentation = seg_node.GetSegmentation()
+        return [
+            segmentation.GetNthSegmentID(i)
+            for i in range(segmentation.GetNumberOfSegments())
+        ]
+
+    # ------------------------------------------------------------------ #
     # Segment Editor access                                                #
     # ------------------------------------------------------------------ #
 
@@ -1470,9 +2008,14 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
     def create_segmentation_for_volume(self, vol):
         """Create and return a new segmentation node linked to *vol*."""
         with _suppress_vtk_warnings():
-            seg = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLSegmentationNode')
+            name = slicer.mrmlScene.GetUniqueNameByString('Segmentation')
+            seg = slicer.mrmlScene.AddNewNodeByClass(
+                'vtkMRMLSegmentationNode', name)
             seg.CreateDefaultDisplayNodes()
             seg.SetReferenceImageGeometryParameterFromVolumeNode(vol)
+            signature = self.volume_geometry_signature(vol)
+            if signature:
+                seg.SetAttribute(_GEOMETRY_SIGNATURE_ATTR, signature)
         return seg
 
     def add_segment(self, seg_node) -> str:

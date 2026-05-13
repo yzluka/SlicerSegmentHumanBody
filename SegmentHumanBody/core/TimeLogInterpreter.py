@@ -33,6 +33,7 @@ Compact output (SegmentHumanBody.annotation_process):
     brush_change:    {id, event:"brush_change",    timestamp, view, tool, brush_mm?, sphere?}
                      brush_mm and sphere present only when their respective value changed.
     segment_removed: {id, event:"segment_removed", timestamp, segment, seg_name?}
+    volume_change:   {id, event:"volume_change", timestamp, volume, volume_id?, sequence_index?}
 
   segment, tool, and brush_mm are written only on press (delta pattern).
   Idle/hover trajectory is omitted entirely.
@@ -43,10 +44,13 @@ EXPORT_TYPE = 'SegmentHumanBody.annotation_process'
 
 _ANNOTATION_TOOLS = frozenset(('brush', 'erase'))
 _POINT_BOUNDARY_EVENTS = frozenset(('point_placed', 'point_replaced', 'point_removed'))
+_POINT_DRAG_EVENTS = frozenset(('point_drag_start', 'point_drag_move'))
 _POINT_EVENT_MAP = {
     'point_placed': 'place',
     'point_replaced': 'replace',
     'point_removed': 'remove',
+    'point_drag_start': 'point_drag_start',
+    'point_drag_move': 'point_drag_move',
 }
 
 
@@ -65,14 +69,15 @@ class TimeLogInterpreter:
         self._view_mats = _load_view_matrices(meta)
         self._dims = _load_dims(meta)
         self._brush_mm = _load_brush_mm(meta)
+        self._volume_sequence_index = _load_volume_sequence_index(meta)
 
     def export(self) -> dict:
         raws = [e for e in (self._raw.get('events') or []) if isinstance(e, dict)]
-        companions = _find_point_companions(raws)
+        companions = set()
         events = []
         export_id = 1
         last_slice = {}       # view -> int
-        point_positions = {}  # ('id', pt_id) | ('name', pt_name) -> last known ijk
+        point_positions = {}  # ('id'|'name', segment, point key) -> last known ijk
 
         for i, raw in enumerate(raws):
             if i in companions:
@@ -128,25 +133,42 @@ class TimeLogInterpreter:
                 # during drag. The real semantic event will be point_replaced.
                 if evt == 'point_removed' and raw.get('mouse_pressed'):
                     continue
+                segment = raw.get('segment')
                 pt_id = raw.get('point')
                 pt_name = raw.get('point_name')
                 ijk_start = None
                 if evt == 'point_replaced':
-                    ijk_start = (point_positions.get(('id', pt_id))
-                                 or point_positions.get(('name', pt_name)))
-                ev = self._from_point_event(raw, last_slice, ijk_start=ijk_start)
+                    ijk_start = _lookup_point_position(
+                        point_positions, segment, pt_id, pt_name)
+                preferred_ijk = None
+                if evt == 'point_removed':
+                    preferred_ijk = _lookup_point_position(
+                        point_positions, segment, pt_id, pt_name)
+                ev = self._from_point_event(
+                    raw, last_slice, ijk_start=ijk_start,
+                    preferred_ijk=preferred_ijk)
                 if ev is not None:
                     ev['id'] = export_id
                     export_id += 1
                     events.append(ev)
                     if ev.get('ijk') and evt in ('point_placed', 'point_replaced'):
-                        if pt_id:
-                            point_positions[('id', pt_id)] = ev['ijk']
-                        if pt_name:
-                            point_positions[('name', pt_name)] = ev['ijk']
+                        _store_point_position(
+                            point_positions, segment, pt_id, pt_name, ev['ijk'])
                     elif evt == 'point_removed':
-                        point_positions.pop(('id', pt_id), None)
-                        point_positions.pop(('name', pt_name), None)
+                        _remove_point_position(
+                            point_positions, segment, pt_id, pt_name)
+
+            elif evt in _POINT_DRAG_EVENTS:
+                ev = self._from_point_event(raw, last_slice)
+                if ev is not None:
+                    ev['id'] = export_id
+                    export_id += 1
+                    events.append(ev)
+                    if evt == 'point_drag_move' and ev.get('ijk'):
+                        _store_point_position(
+                            point_positions, raw.get('segment'),
+                            raw.get('point'), raw.get('point_name'),
+                            ev['ijk'])
 
             elif evt == 'segment_removed':
                 ev = {'id': export_id, 'event': 'segment_removed',
@@ -159,8 +181,15 @@ class TimeLogInterpreter:
                     ev['seg_name'] = seg_name
                 export_id += 1
                 events.append(ev)
+
+            elif evt == 'volume_changed':
+                ev = self._from_volume_changed(raw)
+                if ev is not None:
+                    ev['id'] = export_id
+                    export_id += 1
+                    events.append(ev)
             # point_drag_move, point_drag_start, segment_created/selected/renamed,
-            # volume_changed, etc.: not in annotation-process log
+            # etc.: not in annotation-process log
 
         return {
             'type': EXPORT_TYPE,
@@ -229,11 +258,13 @@ class TimeLogInterpreter:
                 yield ev
             # Other states (idle single boundary): omitted.
 
-    def _point_ijk(self, raw, last_slice=None):
+    def _point_ijk(self, raw, last_slice=None, preferred_ijk=None):
         """Derive IJK for a point event: prefer raw.ijk, fall back to mouse_boundary.xy."""
         ijk = raw.get('ijk')
         if ijk is not None:
             return ijk
+        if preferred_ijk is not None:
+            return preferred_ijk
         view = raw.get('view')
         mb = raw.get('mouse_boundary') or {}
         xy = mb.get('xy')
@@ -244,22 +275,49 @@ class TimeLogInterpreter:
             slice_idx = last_slice.get(view)
         return self._to_ijk(view, xy, slice_idx)
 
-    def _from_point_event(self, raw, last_slice=None, ijk_start=None):
-        ijk = self._point_ijk(raw, last_slice)
+    def _from_point_event(self, raw, last_slice=None, ijk_start=None,
+                          preferred_ijk=None):
+        ijk = self._point_ijk(raw, last_slice, preferred_ijk=preferred_ijk)
         view = raw.get('view')
-        if ijk is None:
+        if ijk is None and not (
+                raw.get('point') or raw.get('point_name') or raw.get('segment')):
             return None
 
         event_type = _POINT_EVENT_MAP.get(raw.get('event'), raw.get('event'))
-        ev = {'event': event_type, 'timestamp': raw.get('timestamp'), 'ijk': ijk}
+        ev = {'event': event_type, 'timestamp': raw.get('timestamp')}
+        if ijk is not None:
+            ev['ijk'] = ijk
         if view:
             ev['view'] = view
-        for key in ('segment', 'point', 'point_name', 'point_index', 'negative'):
+        for key in (
+                'segment', 'point', 'point_name', 'point_index', 'negative',
+                'point_action', 'point_drag_phase'):
             val = raw.get(key)
             if val is not None:
                 ev[key] = val
         if ijk_start is not None:
             ev['ijk_start'] = ijk_start
+        return ev
+
+    def _from_volume_changed(self, raw):
+        volume = raw.get('volume') or raw.get('volume_name')
+        if not volume or str(volume).startswith('seg:'):
+            return None
+        ev = {
+            'event': 'volume_change',
+            'timestamp': raw.get('timestamp'),
+            'volume': volume,
+        }
+        volume_id = raw.get('volume_id')
+        if volume_id:
+            ev['volume_id'] = volume_id
+        sequence_index = raw.get('sequence_index')
+        if sequence_index is None and volume_id:
+            sequence_index = self._volume_sequence_index.get(volume_id)
+        if sequence_index is None:
+            sequence_index = self._volume_sequence_index.get(volume)
+        if sequence_index is not None:
+            ev['sequence_index'] = int(sequence_index)
         return ev
 
     def _to_ijk(self, view, xy, slice_idx=None):
@@ -338,6 +396,32 @@ def _is_segment_creation_tool_select(raws, i):
     return False
 
 
+def _point_position_keys(segment, pt_id, pt_name):
+    keys = []
+    if pt_id:
+        keys.append(('id', segment, pt_id))
+    if pt_name:
+        keys.append(('name', segment, pt_name))
+    return keys
+
+
+def _lookup_point_position(point_positions, segment, pt_id, pt_name):
+    for key in _point_position_keys(segment, pt_id, pt_name):
+        if key in point_positions:
+            return point_positions[key]
+    return None
+
+
+def _store_point_position(point_positions, segment, pt_id, pt_name, ijk):
+    for key in _point_position_keys(segment, pt_id, pt_name):
+        point_positions[key] = ijk
+
+
+def _remove_point_position(point_positions, segment, pt_id, pt_name):
+    for key in _point_position_keys(segment, pt_id, pt_name):
+        point_positions.pop(key, None)
+
+
 # ── Matrix / coordinate helpers ───────────────────────────────────────────────
 
 def _apply_mat(mat, xy, dims, slice_idx=None):
@@ -391,6 +475,19 @@ def _load_brush_mm(meta):
     return result
 
 
+def _load_volume_sequence_index(meta):
+    result = {}
+    for idx, item in enumerate(meta.get('volume_sequences') or []):
+        if not isinstance(item, dict):
+            continue
+        sequence_index = item.get('index', idx)
+        if item.get('id'):
+            result[item['id']] = sequence_index
+        if item.get('name'):
+            result[item['name']] = sequence_index
+    return result
+
+
 def _apply_brush_update(brush_mm, raw):
     view = raw.get('view')
     if view is None:
@@ -439,4 +536,6 @@ def _compact_metadata(meta):
         }
     if meta.get('move_thinning'):
         out['move_thinning'] = meta['move_thinning']
+    if meta.get('volume_sequences'):
+        out['volume_sequences'] = list(meta['volume_sequences'])
     return out

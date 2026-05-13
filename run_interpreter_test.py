@@ -28,4 +28,4 @@ for ev in result["events"]:
     if ev.get("point_name"):
         extra += " pt={}".format(ev["point_name"])
     print("{:3}  {}  {!s:22}  {:7} {} {!s:6}{}".format(
-        eid, ts, ijk, mouse, kind, tool, extra))
+        eid, ts, ijk, str(mouse or ''), kind, str(tool or ''), extra))

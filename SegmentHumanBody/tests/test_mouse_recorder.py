@@ -6,7 +6,9 @@ from core._mouse_recorder import (
     _SliceRecordListener,
 )
 import datetime
+import json
 import core._mouse_recorder as recorder_mod
+from core.TimeLogInterpreter import TimeLogInterpreter
 
 
 def test_default_sample_rate_is_60_hz():
@@ -47,6 +49,21 @@ def test_metadata_records_compact_move_thinning_policy(monkeypatch):
         'ann_ms': 100,
         'hover_ms': 250,
     }
+
+
+def test_metadata_records_loaded_volume_sequences(monkeypatch):
+    monkeypatch.setattr(recorder_mod, '_all_slice_visual_state', lambda volume_node=None: {})
+    sequences = [
+        {'index': 0, 'id': 'vol-ct', 'name': 'CT'},
+        {'index': 1, 'id': 'vol-t1', 'name': 'T1'},
+    ]
+    recorder = MouseEventRecorder()
+
+    recorder.start(volume_node=None, segmentation_name=None,
+                   volume_sequences=sequences)
+    metadata = recorder.export_raw_data()['metadata']
+
+    assert metadata['volume_sequences'] == sequences
 
 
 def test_stop_does_not_append_second_metadata_or_session_stop(monkeypatch):
@@ -1099,6 +1116,76 @@ def test_view_changed_records_boundary_z_without_repeating_visual_state(monkeypa
     assert events[1]['z'] == 42
 
 
+def test_press_after_stale_wheel_uses_fresh_slice_context():
+    recorder = MouseEventRecorder(sample_rate_hz=12)
+    recorder._active = True
+    slices = iter([10, 11])
+
+    def context(view_name=None):
+        return {
+            'tool': 'brush',
+            'view_name': view_name or 'Red',
+            'slice_idx': next(slices),
+            'segment_id': 'seg-a',
+        }
+
+    recorder.context_fn = context
+    recorder._on_mouse(
+        'Red', (10, 20), VIEW_CHANGED,
+        {
+            'mouse_status': 'view',
+            'view_event': 'wheel',
+            'analysis_event_type': 'trajectory_event',
+        },
+    )
+    recorder._on_mouse(
+        'Red', (10, 20), PRESS,
+        {
+            'input_source': 'vtk_interactor',
+            'analysis_event_type': 'boundary_event',
+        },
+    )
+
+    events = recorder.export_raw_data()['events']
+
+    assert events[0]['event'] == VIEW_CHANGED
+    assert events[0]['slice'] == 10
+    assert events[1]['event'] == 'mouse'
+    assert events[1]['mouse_state'] == 'press'
+    assert events[1]['slice'] == 11
+
+
+def test_move_after_volume_change_uses_volume_change_slice_context():
+    recorder = MouseEventRecorder(sample_rate_hz=12)
+    recorder._append(METADATA, None, {
+        'initial_handler_context': {
+            'Red': {'slice_idx': 448},
+        },
+    })
+    recorder._append(recorder_mod.VOLUME_CHANGED, None, {
+        'view_name': 'Red',
+        'slice_idx': 447,
+        'volume': 'tissuerange.nii.gz',
+        'volume_id': 'vtkMRMLScalarVolumeNode5',
+        'sequence_index': 2,
+        'analysis_event_type': 'boundary_event',
+    })
+    recorder._append(MOVE, None, {
+        'view_name': 'Red',
+        'xy': [334, 259],
+        'mouse_button_state': 'released',
+        'analysis_event_type': 'trajectory_event',
+    })
+
+    events = recorder.export_raw_data()['events']
+
+    assert events[0]['event'] == recorder_mod.VOLUME_CHANGED
+    assert events[0]['slice'] == 447
+    assert events[1]['event'] == 'mouse'
+    assert events[1]['mouse_state'] == 'idle'
+    assert events[1]['slice'] == 447
+
+
 def test_point_drag_records_boundary_and_non_annotation_trajectory(monkeypatch):
     recorder = MouseEventRecorder(sample_rate_hz=12)
     monkeypatch.setattr(recorder_mod, '_visual_state', lambda view, volume_node=None: {'view_name': view})
@@ -1379,14 +1466,26 @@ def test_raw_export_filters_mouse_events_outside_ijk_bounds():
     assert 'ijk' not in events[0]
 
 
-def test_interpreted_suppresses_press_and_release():
+def test_interpreted_includes_press_and_release():
+    identity = [1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0]
     recorder = MouseEventRecorder()
+    recorder._append(METADATA, None, {
+        'volume': {'dimensions': [10, 10, 10], 'ras_to_ijk': identity},
+        'initial_visual_state': {'Red': {'xy_to_ijk': identity}},
+    })
     recorder._append(PRESS, [1.0, 2.0, 3.0],
-                     {'mouse_status': 'press', 'analysis_event_type': 'boundary_event'})
+                     {'mouse_status': 'press', 'analysis_event_type': 'boundary_event',
+                      'view_name': 'Red', 'xy': [1, 2], 'slice_idx': 3})
     recorder._append(RELEASE, [1.0, 2.0, 3.0],
-                     {'mouse_status': 'release', 'analysis_event_type': 'boundary_event'})
+                     {'mouse_status': 'release', 'analysis_event_type': 'boundary_event',
+                      'view_name': 'Red', 'xy': [1, 2], 'slice_idx': 3})
     events = recorder.export_interpreted_data()['events']
-    assert events == []
+    assert [event['event'] for event in events] == ['press', 'release']
+    assert events[0]['ijk'] == [1, 2, 3]
+    assert events[1]['ijk'] == [1, 2, 3]
 
 
 def test_interpreted_uses_absolute_timestamps():
@@ -1503,8 +1602,206 @@ def test_raw_context_is_exported_as_deltas_not_repeated():
     assert events[1]['diameter_mm'] == 5.0
 
 
-def test_raw_includes_markup_source_events_for_offline_interpretation():
+def test_raw_segment_selected_includes_explicit_volume_segmentation_pair():
     recorder = MouseEventRecorder()
+    recorder._active = True
+    recorder.context_fn = lambda view_name=None: {
+        'tool': None,
+        'segment_id': 'seg-a',
+        'seg_name': 'Femur',
+        'volume_id': 'vol-1',
+        'volume_name': 'T1 sequence',
+        'segmentation_id': 'seg-node-1',
+        'segmentation_name': 'Reader segmentation',
+    }
+
+    recorder.record_segment_selected('seg-a', 'Femur')
+    event = recorder.export_raw_data()['events'][0]
+
+    assert event['event'] == 'segment_selected'
+    assert event['segment'] == 'seg-a'
+    assert event['seg_name'] == 'Femur'
+    assert event['volume_id'] == 'vol-1'
+    assert event['volume_name'] == 'T1 sequence'
+    assert event['segmentation_id'] == 'seg-node-1'
+    assert event['segmentation_name'] == 'Reader segmentation'
+
+
+def test_raw_volume_changed_includes_sequence_index():
+    recorder = MouseEventRecorder()
+    recorder._active = True
+    recorder.context_fn = lambda view_name=None: {
+        'volume_id': 'vol-t1',
+        'volume_name': 'T1',
+    }
+
+    recorder.record_volume_changed('T1', volume_id='vol-t1', sequence_index=1)
+    event = recorder.export_raw_data()['events'][0]
+
+    assert event['event'] == 'volume_changed'
+    assert event['volume'] == 'T1'
+    assert event['volume_id'] == 'vol-t1'
+    assert event['sequence_index'] == 1
+
+
+def test_interpreted_volume_changed_is_compact_semantic_event():
+    raw_log = {
+        'type': 'SegmentHumanBody.raw_input',
+        'metadata': {
+            'volume_sequences': [
+                {'index': 0, 'id': 'vol-ct', 'name': 'CT'},
+                {'index': 1, 'id': 'vol-t1', 'name': 'T1'},
+            ],
+        },
+        'events': [{
+            'timestamp': '2026-05-13T12:00:00.000',
+            'event': 'volume_changed',
+            'volume': 'T1',
+            'volume_id': 'vol-t1',
+        }],
+    }
+
+    events = TimeLogInterpreter(raw_log).export()['events']
+
+    assert events == [{
+        'id': 1,
+        'event': 'volume_change',
+        'timestamp': '2026-05-13T12:00:00.000',
+        'volume': 'T1',
+        'volume_id': 'vol-t1',
+        'sequence_index': 1,
+    }]
+
+
+def test_point_removed_prefers_stored_point_position_by_segment_and_name():
+    identity = [1, 0, 0, 0,
+                0, 1, 0, 0,
+                0, 0, 1, 0,
+                0, 0, 0, 1]
+    raw_log = {
+        'type': 'SegmentHumanBody.raw_input',
+        'metadata': {
+            'volume': {'dimensions': [100, 100, 100]},
+            'initial_visual_state': {'Red': {'xy_to_ijk': identity}},
+        },
+        'events': [
+            {
+                'event': 'point_placed',
+                'timestamp': '2026-05-13T12:00:00.000',
+                'view': 'Red',
+                'slice': 4,
+                'segment': 'Segment_3',
+                'point_name': 'P-0',
+                'mouse_boundary': {'xy': [10, 20]},
+            },
+            {
+                'event': 'point_placed',
+                'timestamp': '2026-05-13T12:00:01.000',
+                'view': 'Red',
+                'slice': 8,
+                'segment': 'Segment_4',
+                'point_name': 'P-0',
+                'negative': True,
+                'mouse_boundary': {'xy': [30, 40]},
+            },
+            {
+                'event': 'point_removed',
+                'timestamp': '2026-05-13T12:00:02.000',
+                'view': 'Red',
+                'slice': 90,
+                'segment': 'Segment_4',
+                'point_name': 'P-0',
+                'negative': True,
+                'mouse_boundary': {'xy': [90, 91]},
+            },
+        ],
+    }
+
+    events = TimeLogInterpreter(raw_log).export()['events']
+
+    assert events[-1]['event'] == 'remove'
+    assert events[-1]['segment'] == 'Segment_4'
+    assert events[-1]['point_name'] == 'P-0'
+    assert events[-1]['negative'] is True
+    assert events[-1]['ijk'] == [30, 40, 8]
+
+
+def test_interpreted_includes_point_drag_move_from_raw_source_event():
+    raw_log = {
+        'type': 'SegmentHumanBody.raw_input',
+        'metadata': {
+            'volume': {'dimensions': [100, 100, 100]},
+        },
+        'events': [{
+            'event': 'point_drag_move',
+            'timestamp': '2026-05-13T12:00:00.000',
+            'view': 'Red',
+            'slice': 8,
+            'segment': 'Segment_4',
+            'point': 'cp-1',
+            'point_name': 'Segment_4-neg-1',
+            'negative': True,
+            'point_action': 'move',
+            'point_drag_phase': 'move',
+            'ijk': [30, 40, 8],
+        }],
+    }
+
+    events = TimeLogInterpreter(raw_log).export()['events']
+
+    assert events == [{
+        'id': 1,
+        'event': 'point_drag_move',
+        'timestamp': '2026-05-13T12:00:00.000',
+        'ijk': [30, 40, 8],
+        'view': 'Red',
+        'segment': 'Segment_4',
+        'point': 'cp-1',
+        'point_name': 'Segment_4-neg-1',
+        'negative': True,
+        'point_action': 'move',
+        'point_drag_phase': 'move',
+    }]
+
+
+def test_interpreted_keeps_legacy_point_event_without_coordinates():
+    raw_log = {
+        'type': 'SegmentHumanBody.raw_input',
+        'metadata': {},
+        'events': [{
+            'event': 'point_placed',
+            'timestamp': '2026-05-13T12:00:00.000',
+            'view': 'Red',
+            'segment': 'Segment_4',
+            'point': 'cp-1',
+            'point_name': 'Segment_4-neg-1',
+            'negative': True,
+        }],
+    }
+
+    events = TimeLogInterpreter(raw_log).export()['events']
+
+    assert events == [{
+        'id': 1,
+        'event': 'place',
+        'timestamp': '2026-05-13T12:00:00.000',
+        'view': 'Red',
+        'segment': 'Segment_4',
+        'point': 'cp-1',
+        'point_name': 'Segment_4-neg-1',
+        'negative': True,
+    }]
+
+
+def test_raw_includes_markup_source_events_for_offline_interpretation():
+    identity = [1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0]
+    recorder = MouseEventRecorder()
+    recorder._append(METADATA, None, {
+        'volume': {'dimensions': [10, 10, 10], 'ras_to_ijk': identity},
+    })
     recorder.record_point_placed(
         'seg-a', [1.0, 2.0, 3.0], False,
         point_index=0, point_id='cp-0', point_name='Pos-1')
@@ -1512,7 +1809,7 @@ def test_raw_includes_markup_source_events_for_offline_interpretation():
     assert events[0]['event'] == POINT_PLACED
     assert 'markup_ras' not in events[0]
     assert 'ras' not in events[0]
-    assert 'ijk' not in events[0]
+    assert events[0]['ijk'] == [1, 2, 3]
     assert events[0]['segment'] == 'seg-a'
     assert events[0]['point'] == 'cp-0'
 
@@ -1539,3 +1836,52 @@ def test_interpreted_type_is_annotation_process():
     recorder = MouseEventRecorder()
     result = recorder.export_interpreted_data()
     assert result['type'] == 'SegmentHumanBody.annotation_process'
+
+
+def test_save_to_file_writes_raw_semantic_and_summary(tmp_path):
+    identity = [1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0]
+    recorder = MouseEventRecorder()
+    recorder._append(METADATA, None, {
+        'volume': {
+            'name': 'tissuerange.nii.gz',
+            'dimensions': [10, 10, 10],
+            'ras_to_ijk': identity,
+        },
+        'initial_visual_state': {'Red': {'xy_to_ijk': identity}},
+    })
+    recorder._append(PRESS, None, {
+        'view_name': 'Red',
+        'xy': [1, 2],
+        'slice_idx': 3,
+        'mouse_status': 'press',
+        'analysis_event_type': 'boundary_event',
+        'handler': 'brush',
+        'segment_id': 'Segment_1',
+        'brush_radius_mm': 2.5,
+    })
+    recorder._append(RELEASE, None, {
+        'view_name': 'Red',
+        'xy': [1, 2],
+        'slice_idx': 3,
+        'mouse_status': 'release',
+        'analysis_event_type': 'boundary_event',
+    })
+    base_path = tmp_path / 'time_recording.json'
+    for suffix in ('', '_raw', '_summary'):
+        target = tmp_path / f'time_recording{suffix}{".txt" if suffix == "_summary" else ".json"}'
+        target.write_text('old', encoding='utf-8')
+
+    recorder.save_to_file(str(base_path))
+
+    raw_path = tmp_path / 'time_recording_raw.json'
+    semantic_path = tmp_path / 'time_recording.json'
+    summary_path = tmp_path / 'time_recording_summary.txt'
+    assert raw_path.read_text(encoding='utf-8') != 'old'
+    assert semantic_path.read_text(encoding='utf-8') != 'old'
+    assert summary_path.read_text(encoding='utf-8') != 'old'
+    assert json.loads(raw_path.read_text(encoding='utf-8'))['type'] == 'SegmentHumanBody.raw_input'
+    assert json.loads(semantic_path.read_text(encoding='utf-8'))['type'] == 'SegmentHumanBody.annotation_process'
+    assert 'click=(1,2,3)' in summary_path.read_text(encoding='utf-8')
