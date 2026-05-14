@@ -33,6 +33,16 @@
          </widget>
         </item>
         <item>
+         <widget class="QPushButton" name="pauseRecordButton">
+          <property name="text"><string>Pause</string></property>
+          <property name="toolTip"><string>Pause or resume the current recording</string></property>
+          <property name="enabled"><bool>false</bool></property>
+          <property name="sizePolicy">
+           <sizepolicy hsizetype="Minimum" vsizetype="Fixed"/>
+          </property>
+         </widget>
+        </item>
+        <item>
          <widget class="QCheckBox" name="recordMouseKeyCheckBox">
           <property name="text"><string>Mouse+Key</string></property>
           <property name="checked"><bool>true</bool></property>
