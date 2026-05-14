@@ -25,8 +25,6 @@ from core._input import StrokeHandler, BrushHandler, EraseHandler, PointHandler
 
 _MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 _AUDIO_SCRIPT = os.path.join(_MODULE_DIR, 'core', '_audio_subprocess.py')
-
-
 class _AudioSubprocess:
     """Manages a per-session audio recording subprocess."""
 
@@ -36,6 +34,7 @@ class _AudioSubprocess:
         self._proc = None
         self._temp_dir: str | None = None
         self._stop_file: str | None = None
+        self._ready_file: str | None = None
         self._result_file: str | None = None
         self._wav_path: str | None = None
 
@@ -43,14 +42,21 @@ class _AudioSubprocess:
     def is_active(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
+    @property
+    def is_ready(self) -> bool:
+        """True once the subprocess has opened the audio stream."""
+        return self._ready_file is not None and os.path.exists(self._ready_file)
+
     def start(self) -> None:
         self._temp_dir = tempfile.mkdtemp(prefix='shb_audio_')
         self._stop_file = os.path.join(self._temp_dir, '_stop')
+        self._ready_file = os.path.join(self._temp_dir, '_ready')
         self._result_file = os.path.join(self._temp_dir, '_result.json')
         self._wav_path = os.path.join(self._temp_dir, 'recording.wav')
         cmd = [sys.executable, _AUDIO_SCRIPT, self._wav_path,
                '--sample-rate', str(self.sample_rate),
                '--stop-file', self._stop_file,
+               '--ready-file', self._ready_file,
                '--result-file', self._result_file]
         if self.device is not None:
             cmd += ['--device', str(self.device)]
@@ -184,6 +190,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._volume_geometry_warning_signature = None
         self._recording_saved = True
         self._audio_recorder: _AudioSubprocess | None = None
+        self._audio_prewarm: _AudioSubprocess | None = None
         self._audio_only_mode: bool = False
         self._recording_start_time: datetime.datetime | None = None
 
@@ -213,6 +220,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # them — the user places points via the place button, not via the selector.
         self.ui.positivePrompts.setNodeSelectorVisible(False)
         self.ui.negativePrompts.setNodeSelectorVisible(False)
+        self.ui.positivePrompts.setMinimumWidth(0)
+        self.ui.negativePrompts.setMinimumWidth(0)
         self._set_prompt_nodes(None, None)  # configure placement mode; nodes wired later
 
         self._connectSignals(uiWidget)
@@ -222,8 +231,12 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._recorder.context_fn = self._recorder_context
         self._recorder.on_record_appended = self._onRecorderAppended
         qt.QTimer.singleShot(0, self._preloadSegmentEditor)
+        qt.QTimer.singleShot(0, self._prewarm_audio)
 
     def cleanup(self):
+        if self._audio_prewarm is not None:
+            self._audio_prewarm.cleanup()
+            self._audio_prewarm = None
         if self._audio_recorder is not None:
             self._audio_recorder.cleanup()
             self._audio_recorder = None
@@ -853,12 +866,23 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if want_audio:
             if self._audio_recorder is not None:
                 self._audio_recorder.cleanup()
-            self._audio_recorder = _AudioSubprocess(device=self._selected_audio_device())
-            try:
-                self._audio_recorder.start()
-            except Exception:
-                self._audio_recorder.cleanup()
-                self._audio_recorder = None
+            # Swap in the pre-warmed subprocess (stream already open and capturing).
+            if self._audio_prewarm is not None and self._audio_prewarm.is_active:
+                self._audio_recorder = self._audio_prewarm
+                self._audio_prewarm = None
+            else:
+                # Prewarm wasn't ready — fall back to a fresh subprocess.
+                if self._audio_prewarm is not None:
+                    self._audio_prewarm.cleanup()
+                    self._audio_prewarm = None
+                self._audio_recorder = _AudioSubprocess(device=self._selected_audio_device())
+                try:
+                    self._audio_recorder.start()
+                except Exception:
+                    self._audio_recorder.cleanup()
+                    self._audio_recorder = None
+            # Immediately start the next prewarm for the following session.
+            qt.QTimer.singleShot(0, self._prewarm_audio)
 
         if audio_only:
             self._audio_only_mode = True
@@ -866,6 +890,51 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         self._recording_saved = False
         self._update_record_ui()
+        self._wait_for_audio_ready()
+
+    def _prewarm_audio(self) -> None:
+        """Launch a standby audio subprocess so the mic is ready before Record is clicked."""
+        if self._audio_prewarm is not None and self._audio_prewarm.is_active:
+            return
+        if self._audio_prewarm is not None:
+            self._audio_prewarm.cleanup()
+        self._audio_prewarm = _AudioSubprocess(device=self._selected_audio_device())
+        try:
+            self._audio_prewarm.start()
+        except Exception:
+            self._audio_prewarm.cleanup()
+            self._audio_prewarm = None
+            return
+        self._lock_recording_section(True, 'Preparing microphone…')
+        self._poll_prewarm_ready()
+
+    def _poll_prewarm_ready(self) -> None:
+        timer = qt.QTimer()
+        timer.setInterval(200)
+
+        def _check():
+            pw = self._audio_prewarm
+            if pw is None or not pw.is_active:
+                timer.stop()
+                self._lock_recording_section(False)
+                return
+            if pw.is_ready:
+                timer.stop()
+                self._lock_recording_section(False)
+
+        timer.connect('timeout()', _check)
+        timer.start()
+
+    def _lock_recording_section(self, locked: bool, message: str = '') -> None:
+        self.ui.recordToggleButton.setEnabled(not locked)
+        if locked:
+            self.ui.recordStatusLabel.setText(message)
+        else:
+            self._update_record_ui()
+
+    def _wait_for_audio_ready(self) -> None:
+        """No-op: prewarm already ensures the stream is open before Record is reachable."""
+        pass
 
     def _confirm_audio_only_mode(self) -> bool:
         box = qt.QMessageBox()
@@ -1021,9 +1090,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self._audio_only_mode = False
         self._update_record_ui()
 
-        audio_rec = self._audio_recorder
-        self._audio_recorder = None
-        wav_tmp = audio_rec.stop() if audio_rec is not None else None
+        # Finalise audio. Cleanup happens only when a new recording starts or the widget is destroyed.
+        wav_tmp = self._audio_recorder.stop() if self._audio_recorder is not None else None
 
         ts_tag = (
             self._recording_start_time.strftime('_%Y%m%dT%H%M%S%f')[:-3]
@@ -1036,14 +1104,10 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if audio_only:
             if not wav_tmp:
                 slicer.util.warningDisplay('No audio was recorded.')
-                if audio_rec is not None:
-                    audio_rec.cleanup()
                 return False
             path = qt.QFileDialog.getSaveFileName(
                 None, 'Save Audio Recording', '', 'WAV files (*.wav)')
             if not path:
-                if audio_rec is not None:
-                    audio_rec.cleanup()
                 return False
             if path.endswith('.wav'):
                 path = path[:-4] + ts_tag + '.wav'
@@ -1058,14 +1122,9 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             except Exception as exc:
                 slicer.util.warningDisplay(f'Failed to save audio:\n{exc}')
                 return False
-            finally:
-                if audio_rec is not None:
-                    audio_rec.cleanup()
 
         path = qt.QFileDialog.getSaveFileName(None, 'Save Recording', '', 'JSON files (*.json)')
         if not path:
-            if audio_rec is not None:
-                audio_rec.cleanup()
             return False
         if not path.endswith('.json'):
             path += '.json'
@@ -1076,8 +1135,6 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self._update_record_ui()
         except Exception as exc:
             slicer.util.errorDisplay(f'Failed to save recording:\n{exc}')
-            if audio_rec is not None:
-                audio_rec.cleanup()
             return False
         wav_saved = False
         if wav_tmp:
@@ -1087,8 +1144,6 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 wav_saved = True
             except Exception as exc:
                 slicer.util.warningDisplay(f'Failed to save audio:\n{exc}')
-        if audio_rec is not None:
-            audio_rec.cleanup()
         msg = (
             f'Recording saved:\n'
             f'  {base}_raw.json\n'
@@ -1101,18 +1156,19 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         return True
 
     def _update_record_ui(self):
-        ui          = self.ui
+        ui           = self.ui
         is_recording = self._recorder.is_active or self._audio_only_mode
-        has_events  = len(self._recorder) > 0
-        has_audio   = self._audio_recorder is not None
-        has_data    = has_events or has_audio
+        has_events   = len(self._recorder) > 0
+        has_audio    = self._audio_recorder is not None
+        has_data     = has_events or has_audio
 
-        ui.recordToggleButton.setText('Stop Recording' if is_recording else 'Start Recording')
+        ui.recordToggleButton.setText('Stop' if is_recording else 'Record')
         ui.recordMouseKeyCheckBox.setEnabled(not is_recording)
         ui.recordAudioCheckBox.setEnabled(not is_recording)
         ui.audioDeviceComboBox.setEnabled(not is_recording)
         ui.exportRecordButton.setEnabled(not is_recording and has_data)
 
+        audio_tag = ' [audio cached]' if has_audio else ''
         if is_recording:
             if self._audio_only_mode:
                 ui.recordStatusLabel.setText('Audio recording in progress...')
@@ -1120,7 +1176,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 ui.recordStatusLabel.setText(f'Recording: {len(self._recorder)} events')
         elif has_events:
             saved_str = '' if self._recording_saved else ' (unsaved)'
-            ui.recordStatusLabel.setText(f'Recorded: {len(self._recorder)} events{saved_str}')
+            ui.recordStatusLabel.setText(
+                f'Recorded: {len(self._recorder)} events{saved_str}{audio_tag}')
         elif has_audio:
             saved_str = '' if self._recording_saved else ' (unsaved)'
             ui.recordStatusLabel.setText(f'Audio recorded{saved_str}')

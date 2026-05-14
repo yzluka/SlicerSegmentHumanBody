@@ -145,7 +145,7 @@ class _RecordUI:
     def __init__(self):
         self.recordToggleButton = _TextWidget()
         self.recordMouseKeyCheckBox = _CheckBoxStub(checked=True)
-        self.recordAudioCheckBox = _CheckBoxStub(checked=True)
+        self.recordAudioCheckBox = _CheckBoxStub(checked=False)
         self.exportRecordButton = _TextWidget()
         self.recordStatusLabel = _TextWidget()
         self.audioDeviceComboBox = _ComboBoxStub()
@@ -171,6 +171,8 @@ def _record_widget(recorder):
     widget.ui = _RecordUI()
     widget._prompt_place_states = lambda: [False, False]
     widget._set_prompt_place_states = lambda states: None
+    widget._prompt_enable_audio = lambda: 'skip'
+    widget._wait_for_audio_ready = lambda: None
     return widget
 
 
@@ -212,7 +214,7 @@ def test_start_recording_discards_unsaved_record_and_restarts():
     assert recorder.cleared == 1
     assert recorder.started == 1
     assert widget._recording_saved is False
-    assert widget.ui.recordToggleButton.text == 'Stop Recording'
+    assert widget.ui.recordToggleButton.text == 'Stop'
 
 
 def test_start_recording_saves_unsaved_record_before_restart():
@@ -255,7 +257,7 @@ def test_record_ui_marks_unsaved_recording():
 
     widget._update_record_ui()
 
-    assert widget.ui.recordToggleButton.text == 'Start Recording'
+    assert widget.ui.recordToggleButton.text == 'Record'
     assert widget.ui.exportRecordButton.enabled is True
     assert widget.ui.recordStatusLabel.text == 'Recorded: 4 events (unsaved)'
 

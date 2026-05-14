@@ -23,12 +23,14 @@ def main():
     ap.add_argument('--channels', type=int, default=1)
     ap.add_argument('--device', type=int, default=None)
     ap.add_argument('--stop-file', required=True)
+    ap.add_argument('--ready-file', required=True)
     ap.add_argument('--result-file', required=True)
     args = ap.parse_args()
 
     wav_path = Path(args.wav_path)
     wav_path.parent.mkdir(parents=True, exist_ok=True)
     stop_path = Path(args.stop_file)
+    ready_path = Path(args.ready_file)
     result_path = Path(args.result_file)
 
     audio_q: queue.Queue = queue.Queue()
@@ -62,6 +64,7 @@ def main():
         wav_file.setframerate(args.sample_rate)
 
         with sd.InputStream(**stream_kw):
+            ready_path.touch()  # signal to parent that stream is open and capturing
             while not stop_path.exists():
                 time.sleep(0.05)
                 frames_written += _drain(wav_file)

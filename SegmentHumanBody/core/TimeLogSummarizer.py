@@ -35,7 +35,7 @@ class TimeLogSummarizer:
         ]
         meta = semantic_log.get('metadata') or {}
         self._state = {
-            'volume': ((meta.get('volume') or {}).get('name')),
+            'volume': (meta.get('initial_volume') or (meta.get('volume') or {}).get('name')),
             'tool': None,
             'segment': None,
             'view': None,

@@ -534,6 +534,16 @@ def _compact_metadata(meta):
             for k in ('name', 'dimensions', 'spacing', 'ijk_to_ras', 'ras_to_ijk')
             if k in vol
         }
+    # initial_volume: the volume actually in view at recording start, from
+    # initial_handler_context (set by context_fn at start() time).  This is
+    # authoritative when it differs from metadata.volume.name, which can be
+    # stale if set_volume_node() was called after start() and then reverted.
+    ctx = meta.get('initial_handler_context') or {}
+    for view_key in ('Red', 'Green', 'Yellow'):
+        v = (ctx.get(view_key) or {}).get('volume_name')
+        if v:
+            out['initial_volume'] = v
+            break
     if meta.get('move_thinning'):
         out['move_thinning'] = meta['move_thinning']
     if meta.get('volume_sequences'):
