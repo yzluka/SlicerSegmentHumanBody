@@ -1,0 +1,11 @@
+{
+  "\\bkidni\\b":       "kidney",
+  "\\bkidnies\\b":     "kidneys",
+  "\\bsplin\\b":       "spleen",
+  "\\bspline\\b":      "spleen",
+  "\\blivor\\b":       "liver",
+  "\\bpancres\\b":     "pancreas",
+  "\\barota\\b":       "aorta",
+  "\\btrombus\\b":     "thrombus",
+  "\\btrombosis\\b":   "thrombosis"
+}

@@ -1,0 +1,17 @@
+{
+  "\\bbrushing it\\b":        "BRUSHING",
+  "\\bbrushing\\b":           "BRUSHING",
+  "\\bpainting it\\b":        "BRUSHING",
+  "\\bpainting\\b":           "BRUSHING",
+  "\\berasing it\\b":         "ERASING",
+  "\\berasing\\b":            "ERASING",
+  "\\bmarking it\\b":         "MARKING",
+  "\\bmarking\\b":            "MARKING",
+  "\\bscrolling\\b":          "SCROLLING",
+  "\\bswitching volume\\b":   "SWITCHING VOLUME",
+  "\\bswitching segment\\b":  "SWITCHING SEGMENT",
+  "\\bswitching\\b":          "SWITCHING",
+  "\\bplacing point\\b":      "PLACING POINT",
+  "\\bmoving point\\b":       "MOVING POINT",
+  "\\bremoving point\\b":     "REMOVING POINT"
+}
