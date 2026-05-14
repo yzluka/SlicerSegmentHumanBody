@@ -15,6 +15,21 @@ import re
 from pathlib import Path
 from typing import Callable
 
+from cleaner import clean_phrases  # type: ignore[import]
+
+# TimeLogSummarizer lives in SegmentHumanBody/core/ — pure Python, no Slicer dep.
+# Import it so annotation_process JSON gets the same rich spans as _summary.txt.
+import sys as _sys
+_core = Path(__file__).parent.parent.parent / 'SegmentHumanBody' / 'core'
+if _core.exists() and str(_core) not in _sys.path:
+    _sys.path.insert(0, str(_core))
+try:
+    from TimeLogInterpreter import TimeLogInterpreter as _Interpreter  # type: ignore[import]
+    from TimeLogSummarizer import TimeLogSummarizer as _Summarizer  # type: ignore[import]
+    _HAS_SUMMARIZER = True
+except ImportError:
+    _HAS_SUMMARIZER = False
+
 
 # ---------------------------------------------------------------------------
 # Timestamp helpers
@@ -59,28 +74,27 @@ def load_annotation_json(json_path: str) -> dict:
 
 
 def get_spans(data: dict) -> list[dict]:
-    """Return span-like dicts with start_time/end_time from annotation JSON.
+    """Return rich spans from annotation JSON.
 
-    Handles both annotation_summary (has ``spans``) and annotation_process
-    (has ``events`` — converts them to minimal span dicts).
+    annotation_summary  → spans used directly (already have formatted text).
+    annotation_process  → run TimeLogSummarizer inline to produce the same
+                          rich spans as _summary.txt (coordinates, volume,
+                          tool, segment). No file is written.
     """
     dtype = data.get('type', '')
     if dtype == 'SegmentHumanBody.annotation_summary':
         return [s for s in (data.get('spans') or []) if isinstance(s, dict)]
 
     if dtype == 'SegmentHumanBody.annotation_process':
-        events = [e for e in (data.get('events') or []) if isinstance(e, dict)]
-        return [
-            {
-                'type': e.get('event', 'event'),
-                'start_time': _first_timestamp(e),
-                'end_time': _first_timestamp(e),
-                'text': e.get('event', ''),
-                'tool': e.get('tool'),
-                'segment': e.get('segment'),
-            }
-            for e in events
-        ]
+        if _HAS_SUMMARIZER:
+            export = _Summarizer(data).export()
+            return [s for s in (export.get('spans') or []) if isinstance(s, dict)]
+
+    if dtype == 'SegmentHumanBody.annotation_raw':
+        if _HAS_SUMMARIZER:
+            process = _Interpreter(data).export()
+            export = _Summarizer(process).export()
+            return [s for s in (export.get('spans') or []) if isinstance(s, dict)]
 
     return []
 
@@ -94,16 +108,17 @@ def transcribe(
     model_size: str = 'base',
     device: str = 'auto',
     language: str | None = None,
+    initial_prompt: str | None = None,
+    temperature: float = 0.0,
     progress_cb: Callable[[str], None] | None = None,
 ) -> tuple[list[dict], dict]:
-    """Transcribe *wav_path* with faster-whisper.
+    """Transcribe *wav_path* with faster-whisper at word-level granularity.
 
-    Returns ``(segments, info)`` where each segment is
-    ``{start, end, text, words?}``.
+    Returns ``(words, info)`` where each word is
+    ``{start, end, word, probability}``.
     """
     from faster_whisper import WhisperModel  # type: ignore[import]
 
-    # Resolve device/compute_type
     if device == 'auto':
         try:
             import torch  # type: ignore[import]
@@ -122,17 +137,30 @@ def transcribe(
         progress_cb('Transcribing…')
 
     lang_arg = language if language and language != 'auto' else None
-    raw_segments, info = model.transcribe(wav_path, language=lang_arg, beam_size=5)
+    raw_segments, info = model.transcribe(
+        wav_path,
+        language=lang_arg,
+        initial_prompt=initial_prompt or None,
+        temperature=temperature,
+        beam_size=5,
+        word_timestamps=True,
+        condition_on_previous_text=False,
+    )
 
-    segments: list[dict] = []
+    words: list[dict] = []
     for seg in raw_segments:
-        text = seg.text.strip()
-        if not text:
-            continue
-        entry: dict = {'start': round(seg.start, 3), 'end': round(seg.end, 3), 'text': text}
-        segments.append(entry)
-        if progress_cb:
-            progress_cb(f'  [{seg.start:6.1f}s]  {text}')
+        for w in (seg.words or []):
+            word_text = w.word.strip()
+            if not word_text:
+                continue
+            words.append({
+                'start': round(w.start, 3),
+                'end':   round(w.end,   3),
+                'word':  word_text,
+                'probability': round(w.probability, 3),
+            })
+            if progress_cb:
+                progress_cb(f'  [{w.start:6.1f}s]  {word_text}')
 
     info_dict = {
         'language': info.language,
@@ -141,11 +169,73 @@ def transcribe(
     }
     if progress_cb:
         progress_cb(
-            f'Done — language: {info.language} '
+            f'Done — {len(words)} words, language: {info.language} '
             f'(p={info.language_probability:.2f}), '
             f'duration: {info.duration:.1f}s'
         )
-    return segments, info_dict
+    return words, info_dict
+
+
+# ---------------------------------------------------------------------------
+# Word → phrase merging
+# ---------------------------------------------------------------------------
+
+def merge_words_to_phrases(
+    words: list[dict],
+    spans: list[dict],
+    audio_start: datetime.datetime,
+    audio_offset: float = 0.0,
+    silence_gap: float = 0.35,
+) -> list[dict]:
+    """Group words into phrases using silence gaps and annotation boundaries.
+
+    A split is inserted between word[i] and word[i+1] when:
+    - the silence between them is >= silence_gap seconds, OR
+    - any annotation span starts or ends within that inter-word gap.
+
+    Returns segments with ``{start, end, text, words}``.
+    """
+    if not words:
+        return []
+
+    # Collect all annotation event boundary times as audio-relative seconds
+    event_times: list[float] = []
+    for span in spans:
+        for key in ('start_time', 'end_time'):
+            t = _parse_iso(span.get(key))
+            if t is not None:
+                rel = (t - audio_start).total_seconds() + audio_offset
+                event_times.append(rel)
+
+    phrases: list[list[dict]] = []
+    current: list[dict] = [words[0]]
+
+    for i in range(1, len(words)):
+        gap_start = words[i - 1]['end']
+        gap_end   = words[i]['start']
+
+        split = (gap_end - gap_start) >= silence_gap or any(
+            gap_start < et < gap_end for et in event_times
+        )
+
+        if split:
+            phrases.append(current)
+            current = [words[i]]
+        else:
+            current.append(words[i])
+
+    if current:
+        phrases.append(current)
+
+    return [
+        {
+            'start': round(g[0]['start'], 3),
+            'end':   round(g[-1]['end'],  3),
+            'text':  ' '.join(w['word'] for w in g),
+            'words': g,
+        }
+        for g in phrases
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +252,7 @@ def _overlaps(span: dict, abs_start: datetime.datetime, abs_end: datetime.dateti
 
 def _span_summary(span: dict) -> dict:
     out: dict = {}
-    for key in ('type', 'text', 'tool', 'segment', 'view', 'start_time', 'end_time'):
+    for key in ('type', 'text', 'tool', 'segment', 'view', 'start_time', 'end_time', 'trajectory'):
         if span.get(key) is not None:
             out[key] = span[key]
     return out
@@ -203,17 +293,20 @@ def process(
     model_size: str = 'base',
     device: str = 'auto',
     language: str | None = None,
+    initial_prompt: str | None = None,
+    temperature: float = 0.0,
     audio_offset: float = 0.0,
+    silence_gap: float = 0.35,
+    corrections_dir: str | None = None,
     progress_cb: Callable[[str], None] | None = None,
 ) -> dict:
-    """Full pipeline: load → transcribe → align → return result dict."""
+    """Full pipeline: load → transcribe → save whisper JSON → merge → clean → align."""
     _log = progress_cb or (lambda _: None)
 
     _log('Loading annotation data…')
     data = load_annotation_json(json_path)
     meta = data.get('metadata') or {}
 
-    # Determine audio start time (prefer filename timestamp, fallback to JSON metadata)
     audio_start = parse_audio_start_from_wav_name(wav_path)
     if audio_start is None:
         audio_start = _parse_iso(meta.get('start_time'))
@@ -224,9 +317,31 @@ def process(
     spans = get_spans(data)
     _log(f'Loaded {len(spans)} annotation spans.')
 
-    segments, info = transcribe(wav_path, model_size, device, language, _log)
+    words, info = transcribe(wav_path, model_size, device, language,
+                             initial_prompt, temperature, _log)
 
-    _log(f'Aligning {len(segments)} transcript segments to spans…')
+    # Save raw whisper word output as an intermediate file so phrase merging
+    # can be re-run with different settings without re-running the model.
+    wav_stem = Path(wav_path).stem
+    whisper_json_path = Path(json_path).parent / f'whisper_{wav_stem}.json'
+    whisper_data = {
+        'type': 'SegmentHumanBody.whisper_words',
+        'transcription_info': info,
+        'audio_start_time': audio_start.isoformat(),
+        'source_wav': str(wav_path),
+        'words': words,
+    }
+    with open(whisper_json_path, 'w', encoding='utf-8') as _f:
+        json.dump(whisper_data, _f, indent=2, ensure_ascii=False)
+    _log(f'Saved whisper words → {whisper_json_path}')
+
+    _log(f'Merging {len(words)} words into phrases (silence_gap={silence_gap}s)…')
+    segments = merge_words_to_phrases(words, spans, audio_start, audio_offset, silence_gap)
+    segments = clean_phrases(segments, corrections_dir)
+    flagged = sum(1 for s in segments if s.get('needs_review'))
+    _log(f'{len(segments)} phrases formed; {flagged} flagged for review.')
+
+    _log(f'Aligning phrases to spans…')
     aligned = align(segments, spans, audio_start, audio_offset)
 
     return {
@@ -235,9 +350,11 @@ def process(
         'transcription_info': info,
         'audio_start_time': audio_start.isoformat(),
         'audio_offset_seconds': audio_offset,
+        'silence_gap_seconds': silence_gap,
         'source_json': str(json_path),
         'source_wav': str(wav_path),
         'segments': aligned,
+        'spans': spans,
     }
 
 
@@ -261,17 +378,116 @@ def format_text_report(result: dict) -> str:
     lines.append('')
 
     for seg in result.get('segments', []):
-        lines.append(f"[{seg['start']:6.1f}s – {seg['end']:6.1f}s]  {seg['text']}")
+        display = seg.get('cleaned_text') or seg['text']
+        flag = ' [!]' if seg.get('needs_review') else ''
+        t = _time_range_hms(seg.get('abs_start', ''), seg.get('abs_end', ''))
+        lines.append(f"[{t}]  {display}{flag}")
         for sp in seg.get('linked_spans', []):
             parts = [sp.get('type', ''), sp.get('tool', ''), sp.get('segment', '')]
             detail = '  |  '.join(p for p in parts if p)
             note   = sp.get('text', '')
             lines.append(f"    → {detail}")
             if note and note != detail:
-                # wrap long notes
-                lines.append(f"      {note[:120]}")
+                lines.append(f"      {note}")
+            traj = sp.get('trajectory')
+            if traj:
+                pts = ', '.join(
+                    '(' + ','.join(str(int(round(float(v)))) for v in pt[:3]) + ')'
+                    for pt in traj
+                )
+                lines.append(f"      trajectory=[{pts}]")
         if not seg.get('linked_spans'):
             lines.append('    → (no annotation activity in this window)')
         lines.append('')
 
     return '\n'.join(lines)
+
+
+def _hms(iso: str) -> str:
+    """Return HH:MM:SS from an ISO datetime string."""
+    try:
+        return datetime.datetime.fromisoformat(iso).strftime('%H:%M:%S')
+    except (ValueError, TypeError):
+        return '??:??:??'
+
+
+def _time_range_hms(start_iso: str, end_iso: str) -> str:
+    a, b = _hms(start_iso), _hms(end_iso)
+    return a if a == b else f'{a}–{b}'
+
+
+def _fmt_span_block(span: dict) -> str:
+    """Render a span identically to how _summary.txt renders it."""
+    if _HAS_SUMMARIZER:
+        try:
+            from TimeLogSummarizer import _span_text  # type: ignore[import]
+            return _span_text(span)
+        except Exception:
+            pass
+    # Fallback: mirror _span_text logic manually
+    text = span.get('text', '').strip()
+    trajectory = span.get('trajectory')
+    if trajectory:
+        pts = ', '.join(
+            '(' + ','.join(str(int(round(float(v)))) for v in pt[:3]) + ')'
+            for pt in trajectory
+        )
+        text += f'\n  trajectory=[{pts}]'
+    return text
+
+
+def format_caption_report(result: dict) -> str:
+    """_summary.txt layout enriched with timestamped audio captions.
+
+    Each span block is identical to _summary.txt.  Any speech that overlapped
+    the span is appended as one line per phrase:
+        [HH:MM:SS–HH:MM:SS] spoken text
+    """
+    # span index → list of (abs_start, abs_end, text)
+    span_audio: dict[int, list[tuple[str, str, str]]] = {}
+    for seg in result.get('segments', []):
+        for linked in seg.get('linked_spans', []):
+            idx = linked.get('index')
+            if idx is not None:
+                span_audio.setdefault(idx, []).append(
+                    (seg.get('abs_start', ''), seg.get('abs_end', ''),
+                     seg.get('cleaned_text') or seg['text'])
+                )
+
+    meta = result.get('metadata') or {}
+    info = result.get('transcription_info') or {}
+
+    # Header matches _summary.txt exactly (plus language line)
+    header_lines: list[str] = []
+    if meta.get('start_time'):
+        try:
+            dt = datetime.datetime.fromisoformat(meta['start_time'])
+            header_lines.append(f"Recording: {dt.strftime('%Y-%m-%d %H:%M:%S')}")
+        except (ValueError, TypeError):
+            header_lines.append(f"Recording: {meta['start_time']}")
+    if info.get('language'):
+        header_lines.append(
+            f"Language: {info['language']} (p={info.get('language_probability', '?')})"
+        )
+
+    parts: list[str] = ['\n'.join(header_lines)] if header_lines else []
+
+    current_date: str | None = (
+        header_lines[0][10:20] if header_lines else None
+    )
+
+    for i, span in enumerate(result.get('spans', [])):
+        # Date-change divider (mirrors export_text behaviour)
+        span_date = span.get('start_time', '')[:10]
+        if span_date and current_date is not None and span_date != current_date:
+            parts.append(f'--- {span_date} ---')
+            current_date = span_date
+
+        block = _fmt_span_block(span)
+        phrases = span_audio.get(i)
+        if phrases:
+            for abs_start, abs_end, text in phrases:
+                block += f'\n  [{_time_range_hms(abs_start, abs_end)}] {text}'
+        parts.append(block)
+
+    return '\n\n'.join(parts) + '\n'

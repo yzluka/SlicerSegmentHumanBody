@@ -7,22 +7,9 @@ Run with:
 from __future__ import annotations
 
 import json
-import os
 import sys
 import threading
 from pathlib import Path
-
-# When the standalone Python shares Slicer's PYTHONPATH its own DLLs directory
-# (containing _tkinter.pyd) is shadowed by Slicer's DLLs dir.  Prepend it so
-# tkinter can find _tkinter.pyd.
-_py_dlls = os.path.join(os.path.dirname(sys.executable), 'DLLs')
-if os.path.isdir(_py_dlls) and _py_dlls not in sys.path:
-    sys.path.insert(0, _py_dlls)
-
-# Also make sure the standalone Python's own Lib is reachable for tcl/tk
-_py_lib = os.path.join(os.path.dirname(sys.executable), 'Lib')
-if os.path.isdir(_py_lib) and _py_lib not in sys.path:
-    sys.path.insert(1, _py_lib)
 
 import tkinter as tk
 from tkinter import filedialog, ttk
@@ -35,16 +22,66 @@ sys.path.insert(0, str(Path(__file__).parent))
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _auto_wav(json_path: str) -> str:
-    """Given a JSON file, find the nearest matching WAV in the same directory."""
+    """Find the WAV whose filename timestamp best matches metadata.start_time in the JSON.
+
+    WAV filenames follow the pattern ``{base}_{YYYYMMDDTHHMMSSMMM}.wav`` where
+    the timestamp comes from _recording_start_time in the Slicer widget, which
+    is set a few milliseconds before metadata.start_time is written.  We pick
+    the candidate whose parsed timestamp is closest to metadata.start_time and
+    within a 5-second tolerance.  Falls back to first candidate if the JSON
+    cannot be parsed or no timestamp-bearing WAV is found.
+    """
+    import datetime
+    import json as _json
+    import re
+
     p = Path(json_path)
     stem = p.stem
-    for suffix in ('_raw', ''):
-        if stem.endswith(suffix):
-            stem = stem[: len(stem) - len(suffix)] if suffix else stem
-            break
+    if stem.endswith('_raw'):
+        stem = stem[:-4]
+
     candidates = list(p.parent.glob(f'{stem}*.wav'))
-    return str(candidates[0]) if candidates else ''
+    if not candidates:
+        return ''
+    if len(candidates) == 1:
+        return str(candidates[0])
+
+    # Read start_time from the JSON metadata.
+    start_dt = None
+    try:
+        data = _json.loads(p.read_text(encoding='utf-8'))
+        start_str = (data.get('metadata') or {}).get('start_time')
+        if start_str:
+            start_dt = datetime.datetime.fromisoformat(start_str)
+    except Exception:
+        pass
+
+    if start_dt is None:
+        return str(candidates[0])
+
+    # Match each candidate whose name ends with _{YYYYMMDDTHHMMSSMMM}.wav.
+    # %f accepts 1-6 digits; 3-digit milliseconds are padded to microseconds.
+    best: Path | None = None
+    best_delta: float | None = None
+    for wav in candidates:
+        m = re.search(r'_(\d{8}T\d{9})\.wav$', wav.name)
+        if not m:
+            continue
+        try:
+            wav_dt = datetime.datetime.strptime(m.group(1), '%Y%m%dT%H%M%S%f')
+        except ValueError:
+            continue
+        delta = abs((wav_dt - start_dt).total_seconds())
+        if best_delta is None or delta < best_delta:
+            best_delta = delta
+            best = wav
+
+    if best is not None and best_delta <= 5.0:
+        return str(best)
+
+    return str(candidates[0])
 
 
 # ---------------------------------------------------------------------------
@@ -119,11 +156,36 @@ class App(tk.Tk):
             from_=-120.0, to=120.0, increment=0.5, width=7,
         ).grid(row=1, column=3, sticky='w', **p)
 
+        ttk.Label(grp_opts, text='Phrase gap (s):').grid(
+            row=2, column=0, sticky='e', **p)
+        self._gap_var = tk.DoubleVar(value=0.35)
+        ttk.Spinbox(
+            grp_opts, textvariable=self._gap_var,
+            from_=0.05, to=5.0, increment=0.05, width=7,
+        ).grid(row=2, column=1, sticky='w', **p)
+
+        ttk.Label(grp_opts, text='Corrections:').grid(row=2, column=2, sticky='e', **p)
+        self._corrections_var = tk.StringVar()
+        ttk.Entry(grp_opts, textvariable=self._corrections_var, width=16).grid(
+            row=2, column=3, sticky='ew', **p)
+        ttk.Button(grp_opts, text='Browse…', command=self._browse_corrections).grid(
+            row=2, column=4, **p)
+
         ttk.Label(
             grp_opts,
             text='Offset: positive = WAV started that many seconds before annotation start.',
             foreground='gray',
-        ).grid(row=2, column=0, columnspan=4, sticky='w', padx=6)
+        ).grid(row=3, column=0, columnspan=4, sticky='w', padx=6)
+
+        # ---- Prompt section --------------------------------------
+        grp_prompt = ttk.LabelFrame(self, text='Initial Prompt (optional — bias Whisper toward domain vocabulary)')
+        grp_prompt.pack(fill='x', padx=8, pady=2)
+
+        self._prompt_text = tk.Text(grp_prompt, height=4, wrap='word')
+        sb_p = ttk.Scrollbar(grp_prompt, command=self._prompt_text.yview)
+        self._prompt_text.configure(yscrollcommand=sb_p.set)
+        self._prompt_text.pack(side='left', fill='both', expand=True, padx=(4, 0), pady=3)
+        sb_p.pack(side='right', fill='y', pady=3)
 
         # ---- Run button ------------------------------------------
         self._run_btn = ttk.Button(self, text='Run', command=self._on_run)
@@ -162,6 +224,11 @@ class App(tk.Tk):
         )
         if path:
             self._wav_var.set(path)
+
+    def _browse_corrections(self) -> None:
+        path = filedialog.askdirectory(title='Select corrections directory (leave blank to skip)')
+        if path:
+            self._corrections_var.set(path)
 
     # ------------------------------------------------------------------
     # Logging
@@ -202,7 +269,10 @@ class App(tk.Tk):
                         if self._lang_var.get() not in ('', 'auto')
                         else None
                     ),
+                    initial_prompt=self._prompt_text.get('1.0', 'end').strip() or None,
                     audio_offset=self._offset_var.get(),
+                    silence_gap=self._gap_var.get(),
+                    corrections_dir=self._corrections_var.get().strip() or None,
                     progress_cb=self._append_log,
                 )
                 self._result = result
@@ -211,8 +281,9 @@ class App(tk.Tk):
                 base = Path(json_path)
                 if base.suffix == '.json':
                     base = base.with_suffix('')
-                out_json = base.with_name(base.name + '_transcript.json')
-                out_txt  = base.with_name(base.name + '_transcript.txt')
+                out_json    = base.with_name(base.name + '_transcript.json')
+                out_txt     = base.with_name(base.name + '_transcript.txt')
+                out_caption = base.with_name(base.name + '_caption.txt')
 
                 with open(out_json, 'w', encoding='utf-8') as f:
                     json.dump(result, f, indent=2, ensure_ascii=False)
@@ -220,7 +291,10 @@ class App(tk.Tk):
                 with open(out_txt, 'w', encoding='utf-8') as f:
                     f.write(processor.format_text_report(result))
 
-                self._append_log(f'\nSaved:\n  {out_json}\n  {out_txt}')
+                with open(out_caption, 'w', encoding='utf-8') as f:
+                    f.write(processor.format_caption_report(result))
+
+                self._append_log(f'\nSaved:\n  {out_json}\n  {out_txt}\n  {out_caption}')
 
             except Exception as exc:
                 self._append_log(f'\nERROR: {exc}')
