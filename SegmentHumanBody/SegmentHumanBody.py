@@ -37,6 +37,7 @@ class _AudioSubprocess:
         self._ready_file: str | None = None
         self._result_file: str | None = None
         self._wav_path: str | None = None
+        self.start_time: datetime.datetime | None = None
 
     @property
     def is_active(self) -> bool:
@@ -48,6 +49,7 @@ class _AudioSubprocess:
         return self._ready_file is not None and os.path.exists(self._ready_file)
 
     def start(self) -> None:
+        self.start_time = datetime.datetime.now()
         self._temp_dir = tempfile.mkdtemp(prefix='shb_audio_')
         self._stop_file = os.path.join(self._temp_dir, '_stop')
         self._ready_file = os.path.join(self._temp_dir, '_ready')
@@ -138,6 +140,8 @@ class SegmentHumanBody(ScriptedLoadableModule):
 # Widget
 #
 
+
+
 class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     """Pure wrapper around Slicer's native Segment Editor.
 
@@ -193,6 +197,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._audio_prewarm: _AudioSubprocess | None = None
         self._audio_only_mode: bool = False
         self._recording_start_time: datetime.datetime | None = None
+        self._pause_start_time: datetime.datetime | None = None
+        self._pause_intervals: list[tuple[float, float]] = []
 
     # ------------------------------------------------------------------ #
     # Lifecycle                                                            #
@@ -442,6 +448,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         ui.showSegmentsCheckBox.connect('toggled(bool)', self._onToggleSavedSegments)
 
         ui.recordToggleButton.connect('clicked(bool)', self.onRecordToggle)
+        ui.pauseRecordButton.connect('clicked(bool)', self.onPauseResumeRecord)
         ui.exportRecordButton.connect('clicked(bool)', self.onExportRecord)
         self._populate_audio_devices()
 
@@ -811,7 +818,51 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         else:
             self._do_start_recording()
 
+    def onPauseResumeRecord(self, *_):
+        self._do_pause_recording()
+
+    def _do_pause_recording(self) -> None:
+        self._recorder.pause()
+        self._pause_start_time = datetime.datetime.now()
+        self._update_record_ui()
+
+        dlg = qt.QDialog(slicer.util.mainWindow())
+        dlg.setWindowTitle('Recording Paused')
+        dlg.setModal(True)
+        layout = qt.QVBoxLayout(dlg)
+        label = qt.QLabel('Recording is paused.\nAnnotation tools are locked.')
+        label.setAlignment(qt.Qt.AlignCenter)
+        layout.addWidget(label)
+        btn_layout = qt.QHBoxLayout()
+        resume_btn = qt.QPushButton('Resume')
+        wait_btn = qt.QPushButton('Keep Waiting')
+        btn_layout.addWidget(resume_btn)
+        btn_layout.addWidget(wait_btn)
+        layout.addLayout(btn_layout)
+
+        resume_btn.connect('clicked()', dlg.accept)
+        wait_btn.connect('clicked()', dlg.reject)
+
+        # Keep showing the dialog until the user clicks Resume
+        while dlg.exec_() != qt.QDialog.Accepted:
+            pass
+
+        self._do_resume_recording()
+
+    def _do_resume_recording(self) -> None:
+        # Record the silenced interval for WAV post-processing on export
+        if self._pause_start_time is not None and self._recording_start_time is not None:
+            pause_sec = (self._pause_start_time - self._recording_start_time).total_seconds()
+            resume_sec = (datetime.datetime.now() - self._recording_start_time).total_seconds()
+            self._pause_intervals.append((pause_sec, resume_sec))
+        self._pause_start_time = None
+        self._recorder.resume()
+        self._update_record_ui()
+
     def _do_stop_recording(self):
+        # If paused, close out the pause interval and clean up the filter first
+        if self._recorder.is_paused:
+            self._do_resume_recording()
         if self._recorder.is_active:
             self._recorder.stop()
         if self._audio_only_mode:
@@ -848,6 +899,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             return
 
         self._recording_start_time = datetime.datetime.now()
+        self._pause_intervals.clear()
+        self._pause_start_time = None
 
         if not audio_only:
             place_states = self._prompt_place_states()
@@ -1115,6 +1168,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 path = path + ts_tag + '.wav'
             try:
                 shutil.copy2(wav_tmp, path)
+                self._finalize_wav(path)
                 self._recording_saved = True
                 self._update_record_ui()
                 slicer.util.infoDisplay(f'Audio saved:\n  {path}')
@@ -1141,6 +1195,7 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             wav_out = base + ts_tag + '.wav'
             try:
                 shutil.copy2(wav_tmp, wav_out)
+                self._finalize_wav(wav_out)
                 wav_saved = True
             except Exception as exc:
                 slicer.util.warningDisplay(f'Failed to save audio:\n{exc}')
@@ -1155,25 +1210,60 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         slicer.util.infoDisplay(msg)
         return True
 
+    def _finalize_wav(self, wav_path: str) -> None:
+        """Trim prewarm lead-in and zero-out pause intervals in the WAV file."""
+        import wave
+        with wave.open(wav_path, 'rb') as wf:
+            params = wf.getparams()
+            frames = bytearray(wf.readframes(wf.getnframes()))
+        sr = params.framerate
+        frame_size = params.sampwidth * params.nchannels
+
+        # Trim prewarm: discard audio captured before recording officially started.
+        trim_sec = 0.0
+        if (self._recording_start_time is not None
+                and self._audio_recorder is not None
+                and self._audio_recorder.start_time is not None):
+            trim_sec = max(0.0, (
+                self._recording_start_time - self._audio_recorder.start_time
+            ).total_seconds())
+        trim_bytes = int(trim_sec * sr) * frame_size
+        if trim_bytes > 0:
+            frames = frames[trim_bytes:]
+
+        for start_sec, end_sec in self._pause_intervals:
+            s = max(0, int(start_sec * sr) * frame_size)
+            e = min(len(frames), int(end_sec * sr) * frame_size)
+            if e > s:
+                frames[s:e] = b'\x00' * (e - s)
+
+        with wave.open(wav_path, 'wb') as wf:
+            wf.setparams(params)
+            wf.writeframes(bytes(frames))
+
     def _update_record_ui(self):
         ui           = self.ui
         is_recording = self._recorder.is_active or self._audio_only_mode
+        is_paused    = self._recorder.is_paused
         has_events   = len(self._recorder) > 0
         has_audio    = self._audio_recorder is not None
         has_data     = has_events or has_audio
 
         ui.recordToggleButton.setText('Stop' if is_recording else 'Record')
+        ui.pauseRecordButton.setEnabled(is_recording and not is_paused)
         ui.recordMouseKeyCheckBox.setEnabled(not is_recording)
         ui.recordAudioCheckBox.setEnabled(not is_recording)
         ui.audioDeviceComboBox.setEnabled(not is_recording)
         ui.exportRecordButton.setEnabled(not is_recording and has_data)
 
-        audio_tag = ' [audio cached]' if has_audio else ''
-        if is_recording:
+        audio_tag = ' [audio]' if has_audio else ''
+        if is_paused:
+            ui.recordStatusLabel.setText(f'Paused: {len(self._recorder)} events{audio_tag}')
+        elif is_recording:
             if self._audio_only_mode:
                 ui.recordStatusLabel.setText('Audio recording in progress...')
             else:
-                ui.recordStatusLabel.setText(f'Recording: {len(self._recorder)} events')
+                ui.recordStatusLabel.setText(f'Recording: {len(self._recorder)} events{audio_tag}')
         elif has_events:
             saved_str = '' if self._recording_saved else ' (unsaved)'
             ui.recordStatusLabel.setText(

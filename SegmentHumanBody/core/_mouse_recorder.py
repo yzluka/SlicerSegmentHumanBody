@@ -244,6 +244,7 @@ class MouseEventRecorder:
         self._records: list = []
         self._listeners: list = []
         self._active = False
+        self._paused = False
         self._move_interval_ms = 1000.0 / sample_rate_hz
         self._move_timer = None
         self._pending_move_sample = None
@@ -265,6 +266,17 @@ class MouseEventRecorder:
     @property
     def is_active(self) -> bool:
         return self._active
+
+    @property
+    def is_paused(self) -> bool:
+        return self._active and self._paused
+
+    def pause(self) -> None:
+        if self._active:
+            self._paused = True
+
+    def resume(self) -> None:
+        self._paused = False
 
     def start(self, volume_node=None, segmentation_name: str | None = None,
               volume_sequences: list | None = None):
@@ -806,6 +818,9 @@ class MouseEventRecorder:
         }
 
     def _on_mouse(self, view_name: str, xy_local: tuple, event_type: str, extra=None):
+        if self._paused:
+            self._note_mouse_button_state(event_type)
+            return
         timestamp = datetime.datetime.now()
         if not self._mouse_xy_is_active(view_name, xy_local, event_type):
             self._note_mouse_button_state(event_type)
@@ -1068,6 +1083,8 @@ class MouseEventRecorder:
             self._notify_record_appended()
 
     def _append(self, event_type, ras, payload):
+        if self._paused:
+            return
         self._records.append(self._new_record(
             datetime.datetime.now(), ras, event_type, payload))
         self._notify_record_appended()
