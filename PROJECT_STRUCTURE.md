@@ -260,18 +260,30 @@ core/modelFamilies.py    FAMILY_REGISTRY, VISIBLE_BUTTONS
 ### Offline analysis tool (separate process, no Slicer)
 
 ```
-tools/audio_processor/app.py       tkinter GUI
-  → processor.py
+tools/audio_processor/app.py       tkinter GUI — two-stage workflow
+  Stage 1 · Transcribe
+  → processor.transcribe_and_phrase()
         load annotation JSON        (auto-interprets raw / process / summary)
-        transcribe WAV              faster-whisper (word-level)
+        transcribe WAV              faster-whisper → whisper_{stem}.json
         merge words → phrases       silence gaps + annotation boundaries
+        write phrases_{stem}.txt    one phrase per line, editable
+
+  Stage 2 · Review Phrases & Generate Reports
+        user edits phrases_{stem}.txt in any text editor
+  → processor.apply_phrase_corrections()
+        edit-distance alignment     SequenceMatcher aligns corrected tokens to
+                                    original words; unchanged tokens keep exact
+                                    timing + probability; changed tokens get
+                                    synthetic entries with proportionally
+                                    distributed timestamps
+        write whisper_{stem}_refined.json
+  → processor.process()
+        re-merge with refined words
+        clean via cleaner.py        regex replacements + review flags
         align phrases to spans      timestamp overlap
-        write _caption.txt          annotation-centric view
+        write _transcript.json      structured output
             _transcript.txt         audio-centric view
-            _transcript.json        structured output
-  → cleaner.py
-        apply corrections/          regex replacements from JSON pattern files
-        flag _review_patterns       phrases needing manual review
+            _caption.txt            annotation-centric view
 ```
 
 ---

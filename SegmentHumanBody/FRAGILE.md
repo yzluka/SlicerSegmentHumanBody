@@ -4,6 +4,60 @@ Spots in the codebase that work correctly today but are sensitive to specific
 assumptions. Each entry describes the fragility and its safe precondition so
 a future refactor knows what contract to preserve or harden.
 
+---
+
+## Known Bugs — Fix Queue
+
+Confirmed in usage. Not yet fixed.
+
+### BUG-1 — Slice scrollbar does not respond during recording
+
+**Symptom:** The slice-position slider in the Red/Green/Yellow views stops
+working (or has no effect) while a recording session is active.
+
+**Suspected cause:** The mouse-event filter or VTK interactor observer
+installed by the recorder consumes or shadows the scroll/drag events that
+Slicer's slice slider relies on. The recording listener may be intercepting
+wheel or drag events before they reach the slice navigation widget.
+
+**Fix direction:** Audit the VTK observer and any Qt event-filter installed
+on the slice views. Ensure scroll/wheel events are passed through and not
+consumed. Only cursor position and button state should be captured; slice
+navigation must remain fully functional during recording.
+
+---
+
+### BUG-2 — Brush click coordinate wrong after zoom or pan
+
+**Symptom:** After zooming in/out or panning a slice view, brush strokes are
+recorded at the wrong IJK position. The same operation with the Point tool is
+correct.
+
+**Root cause (suspected):** Brush uses device XY → IJK via a cached
+`xy_to_ijk` matrix that is captured at recording start (and on `view_changed`
+events). Zoom and pan change the mapping from screen pixels to IJK without
+necessarily firing a `view_changed` event, so the cached matrix becomes stale.
+The Point tool is unaffected because it derives IJK from the accepted world-RAS
+coordinate reported directly by the Slicer markups system, bypassing the cached
+matrix.
+
+**Fix direction:**
+
+1. Record zoom and pan as first-class metadata state-change events (alongside
+   `slice_change` and `tool_change`). Each zoom/pan event should capture the
+   updated `xy_to_ijk` matrix for the affected view so that offline IJK
+   derivation in `TimeLogInterpreter` uses the matrix that was live at the
+   time of each stroke.
+
+2. On the live recording side, hook the Slicer interactor's zoom/pan callbacks
+   (or the slice-node `ModifiedEvent`) to refresh the per-view `_xy_to_ijk`
+   cache immediately, so in-session coordinate derivation also stays accurate.
+
+3. The compact export schema will need a new delta event — `view_transform_change`
+   (or extend `slice_change`) — carrying the new `xy_to_ijk` for the view.
+
+---
+
 ## Planned improvements
 
 - **Expandable trajectory in `_caption` / `_summary`:** Collapsed spans show only
