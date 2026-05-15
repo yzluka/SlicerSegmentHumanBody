@@ -72,6 +72,7 @@ class _FakeRecorder:
 class _RestartRecorder:
     def __init__(self, *, active=False, count=0):
         self.is_active = active
+        self.is_paused = False
         self.count = count
         self.started = 0
         self.stopped = 0
@@ -144,6 +145,7 @@ class _CheckBoxStub:
 class _RecordUI:
     def __init__(self):
         self.recordToggleButton = _TextWidget()
+        self.pauseRecordButton = _TextWidget()
         self.recordMouseKeyCheckBox = _CheckBoxStub(checked=True)
         self.recordAudioCheckBox = _CheckBoxStub(checked=False)
         self.exportRecordButton = _TextWidget()
@@ -168,6 +170,9 @@ def _record_widget(recorder):
     widget._parameterNode = None
     widget._audio_recorder = None
     widget._audio_only_mode = False
+    widget._recording_start_time = None
+    widget._pause_start_time = None
+    widget._pause_intervals = []
     widget.ui = _RecordUI()
     widget._prompt_place_states = lambda: [False, False]
     widget._set_prompt_place_states = lambda states: None

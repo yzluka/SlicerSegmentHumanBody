@@ -74,7 +74,7 @@ class PointLog:
         return list(self._data.get(segment_id, []))
 
     def all_segments(self) -> list:
-        """Return all segment IDs that have at least one entry."""
+        """Return all segment IDs that have been tracked (including empty)."""
         return list(self._data.keys())
 
     def export(self) -> dict:

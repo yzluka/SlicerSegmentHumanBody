@@ -1,6 +1,6 @@
 # SPEC.md - Behavior Specification
 
-This file defines expected behavior for the current native-editor-wrapper
+This file defines expected behavior for the `annotation-process-recorder`
 branch. Re-check relevant sections after changes to `SegmentHumanBody.py`,
 `core/_input.py` or `core/_mouse_recorder.py`.
 
@@ -118,6 +118,10 @@ Recording is mouse-centered. It is not a general UI macro recorder.
 | 5.23 | Audio capture | `_AudioSubprocess` forks `core/_audio_subprocess.py` (CREATE_NO_WINDOW on Windows) at 22050 Hz mono. Stop is signalled via sentinel file; process drains 150 ms of buffered audio after stop. Missing `sounddevice` silently disables audio; mouse recording continues. |
 | 5.24 | WAV export filename | WAV is saved as `{base}_{YYYYMMDDTHHMMSSMMM}.wav` alongside the JSON. The timestamp is the recording start time with millisecond precision; no colons are written to filenames. In audio-only mode, the user's chosen base name gets the same timestamp postfix. |
 | 5.25 | Stop vs export | Clicking `Stop Recording` finalises the WAV (stops the subprocess) but keeps temp files. `Export` can be used at any time — it stops recorders if still active, then opens save dialogs. Starting a new recording while unsaved data exists triggers Save/Discard/Cancel. |
+| 5.26 | Pause recording | `Pause` button calls `recorder.pause()` and opens a modal `QDialog`. While the dialog is open, mouse events are dropped (button state still tracked). "Keep Waiting" leaves the dialog open; "Resume" closes it and calls `_do_resume_recording()`. |
+| 5.27 | Pause interval tracking | Each pause/resume cycle appends `(pause_sec, resume_sec)` — relative to `_recording_start_time` — to `_pause_intervals`. Multiple cycles accumulate in the same list. The list is cleared at the start of each new recording. |
+| 5.28 | WAV finalization | `_finalize_wav(wav_path)` trims prewarm frames captured before `_recording_start_time`, then zeros bytes for every `(pause_sec, resume_sec)` interval. Both operations are applied in a single in-place rewrite. |
+| 5.29 | Prewarm trim | Trim length is `max(0, recording_start_time − audio_subprocess.start_time)` in seconds. If no audio subprocess is present, no trim is applied. |
 
 Movement capture is staged before policy classification. Each raw move keeps the
 original VTK device XY and is kept only if cached DataProbe-style XY-to-IJK
@@ -242,8 +246,6 @@ Future families should follow this registry pattern:
 | 8.4 | Change W/L controls | Volume display node updates immediately |
 | 8.5 | Apply W/L | Same W/L values are explicitly written |
 
-Superpixel-grid display and any related shortcut are deferred while the active
-branch focuses on native Segment Editor wrapping and process recording.
 
 ## 9. Audio Recording Infrastructure
 

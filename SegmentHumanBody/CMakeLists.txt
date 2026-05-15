@@ -9,12 +9,15 @@ set(MODULE_PYTHON_SCRIPTS
   core/modelFamilies.py
   core/modelRegistry.py
   core/models/__init__.py
+  core/models/default.py
   core/models/spx.py
   core/models/timed_annotator.py
   core/_state.py
   core/_input.py
   core/_logic.py
   core/_tracker.py
+  core/_audio_recorder.py
+  core/_mouse_recorder.py
   )
 
 set(MODULE_PYTHON_RESOURCES

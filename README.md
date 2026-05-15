@@ -1,157 +1,114 @@
 # SegmentHumanBody
 
-[![arXiv Paper](https://img.shields.io/badge/arXiv-2401.12974-orange.svg?style=flat)](https://arxiv.org/abs/2401.12974)
-[![arXiv Paper](https://img.shields.io/badge/arXiv-2505.01854-orange.svg?style=flat)](https://www.arxiv.org/abs/2505.01854)
+A 3D Slicer extension for medical image segmentation research. This branch (`annotation-process-recorder`) uses Slicer's native Segment Editor as the editing engine and adds a mouse-centered annotation-process recorder for studying how radiologists annotate images.
 
-SegmentHumanBody aims to asist its users in segmenting medical data on <a href="https://github.com/Slicer/Slicer">3D Slicer</a> by integrating the <a href="https://github.com/mazurowski-lab/SegmentAnyBone">SegmentAnyBone</a>, and <a href="https://github.com/mazurowski-lab/SLM-SAM2">SLM-SAM2</a> developed by Mazurowski Lab.
+## What It Does
 
-## Current Development Branch
+### Interactive Annotation
 
-The active development branch (`feature/native-editor-wrapper`) keeps the
-existing Slicer module UI but delegates interactive editing to Slicer's native
-Segment Editor tools. Brush and erase use Slicer's Paint/Erase effects, prompt
-points use native markups nodes, and undo/redo use Slicer's native undo stack.
+Brush, erase, and prompt-point placement delegate entirely to Slicer's built-in Segment Editor. Undo/redo uses Slicer's native undo stack. No custom stroke implementation.
 
-The current focus is a mouse-centered annotation-process recorder:
+Handler wrappers enforce mutual exclusion — only one tool is active at a time, and deactivating a tool disables the underlying Slicer effect.
 
-- records only Red/Green/Yellow slice-view mouse events inside the active volume;
-- stores raw device XY per event; IJK coordinates are derived offline by `TimeLogInterpreter` using stored per-view `xy_to_ijk` matrices;
-- assigns exported process events compact `id` values starting at 1; metadata is not an event;
-- exports a compact `{type, metadata, events}` process log;
-- uses IJK as the canonical compact coordinate; point events carry world RAS from Slicer markups, converted to IJK via stored `ras_to_ijk`;
-- samples in-volume movement at 60 Hz, then adaptively thins by cached XY-to-IJK scale;
-- listens to both Qt slice-view events and high-priority, non-consuming VTK slice interactor events so native Segment Editor brush/erase input is captured before Paint/Erase can consume it;
-- records mouse status (`move`, `press`, `release`, `view`);
-- records active handler/tool plus only the parameters needed for reconstruction, such as brush radius;
-- differentiates `annotation_move` from `non_annotation_move`, with matching `annotation_trajectory` or `visualization_trajectory` roles;
-- caches initial Red/Green/Yellow slice views at recording start and stores later visual snapshots only for explicit view-change events, without repeated slice-view dimensions;
-- updates the recording event count as records arrive;
-- records new point placement as one semantic `point_placed` verdict with point ID/name while keeping raw point listener boundaries recordable;
-- treats press-release drift during new point placement as `non_annotation_move` trajectory;
-- keeps segment switches out of the event stream, relying on the segment ID carried by boundary, trajectory, and semantic events;
-- infers a brush/erase `press` boundary if Slicer drops the initial press but a drag sample or release is observed;
-- records brush/erase press, release, held-button movement, and released-button hover as listener events inside the active volume;
-- records segment removal and segment rename, but not segment creation;
-- records existing-point relocation as `point_drag_start` grab, sampled `non_annotation_move` trajectory, and final `point_replaced` replace;
-- records control-point deletion as `point_removed` with the last cached point location;
+### Annotation-Process Recording
 
-Current module shortcuts:
+Records *how* annotators work, not just the final masks.
 
-- `A` / `W`: next / previous loaded volume sequence.
-- `Z` / `C`: previous / next segment.
-- `Q`: show/hide the current segment.
-- `S`: show/hide saved/other segments.
-- `E`: reserved for future use.
+**Three-stage pipeline:**
 
-Volume and segment shortcuts wrap around at the ends. Volume sequence switching
-updates the source volume and slice views only.
-Segmentation selection is manual; switching sequences does not auto-match,
-auto-match, clear, or switch segmentation nodes. If the selected segmentation
-has a different voxel grid shape, spacing, or orientation than the target
-volume, the module asks whether to create a new empty segmentation for that
-volume, keep the current segmentation, or cancel the switch. Origin differences
-are ignored for this compatibility check. When a compatible target volume has a
-zero origin, the module copies the first compatible non-zero scene origin onto
-that volume. This scan runs when volumes are imported and again before display,
-so native Slicer slice offsets line up across CT and derived sequences. When a
-segment is explicitly created and no segmentation exists, the module creates a
-generic segmentation node for the current volume. The process recorder stores
-the explicit selected volume, segmentation, and segment identities instead of
-relying on filename conventions.
+| Stage | Input | Output | Runs |
+|---|---|---|---|
+| `MouseEventRecorder` | Live Slicer events | `*_raw.json` | Inside Slicer |
+| `TimeLogInterpreter` | `*_raw.json` | `*.json` compact process log | Offline, no Slicer |
+| `TimeLogSummarizer` | `*.json` | `*_summary.txt` human-readable spans | Offline, no Slicer |
 
-The current workflow assumes a dragged folder contains one patient's compatible
-volume set. All loaded scalar volumes are checked as a group after import:
-shape, spacing, and orientation must match. Origin may differ and is normalized.
-If spacing/shape/orientation differs, the module shows one informational
-warning after the import stream settles, listing geometry-group statistics and
-filenames for all loaded volumes. Loading and sequence switching are still
-allowed.
+What is recorded at 60 Hz:
+- Mouse trajectory (device XY) inside the active volume — IJK derived offline via stored `xy_to_ijk` matrices
+- Button events, tool changes, brush radius changes
+- Segment rename and removal
+- Point placement, relocation, and deletion (from markups events)
+- Volume navigation and slice changes
+- Audio narration (optional, via background subprocess)
 
-Recordings store the loaded volume sequence list in metadata, including each
-sequence index, node ID, and name. Volume switches are kept in the raw log and
-interpreted into compact `volume_change` events in the semantic annotation log.
+Pressing **Export** saves all three outputs alongside each other. Recordings can be re-interpreted offline from `*_raw.json` alone.
 
-Use `Clear Loaded Volumes` to remove all scalar volume nodes from the scene.
-Segmentation nodes are intentionally left untouched for manual deletion.
-If a volume file is imported again from the same path, the newly loaded node
-replaces the older scalar volume node and uses the full storage filename,
-including suffix such as `.nii.gz`, instead of leaving a `_1` duplicate.
+### Audio Recording
 
-Superpixel-grid display is deferred for now. The SPX implementation remains in
-the codebase as reusable infrastructure for later restoration.
+Integrated microphone capture via a background subprocess (`core/_audio_subprocess.py`, CREATE_NO_WINDOW on Windows). Audio and mouse recording start and stop together.
 
-A second-stage summarizer, `SegmentHumanBody/core/TimeLogSummarizer.py`, converts
-the compact `annotation_process` log into a human-readable `annotation_summary`
-with higher-level activity spans (`stroke`, `click`, `volume_navigation`,
-`point_click_place`, `point_drag`, etc.), each carrying full volume/tool/segment
-context. Both `TimeLogInterpreter` and `TimeLogSummarizer` run offline with no
-Slicer dependency.
+**Pause/Resume:** Pause freezes mouse recording and shows a modal dialog. Resuming records the paused interval. On export, the WAV is trimmed to the recording start (removing prewarm lead-in) and paused intervals are silenced (bytes zeroed) while the timeline is preserved.
 
-A standalone audio recorder is available in `SegmentHumanBody/core/_audio_recorder.py`
-for future local Whisper transcription workflows. It records timestamped
-Whisper-friendly WAV chunks and metadata, but it is not connected to the module
-UI or process recorder yet.
+### Keyboard Shortcuts
 
-The model-family framework is still present. A placeholder `Default` family with
-an `Identity` variant is available as a template for future model integrations.
+| Key | Action |
+|---|---|
+| `A` / `W` | Next / previous loaded volume sequence (wraps) |
+| `Z` / `C` | Previous / next segment (wraps) |
+| `Q` | Show/hide current segment |
+| `S` | Show/hide other saved segments |
 
-## License
+### Offline Analysis Tool
 
-The repository is licensed under the [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/)
+`tools/audio_processor/` is a standalone GUI for aligning transcribed audio with recorded annotation spans. Given a recording's WAV and JSON files, it produces:
 
-## Installation via GitHub Repository
+- `*_caption.txt` — span-centric view: each annotation span aligned with overlapping audio
+- `*_transcript.txt` — audio-centric view: each audio phrase aligned with overlapping annotation spans
+- `*_summary.txt` — human-readable activity log
 
-You can clone this repository by running the following command:
+Includes a post-processing layer (`cleaner.py`) for applying domain-specific text corrections from JSON pattern files.
+
+## Installation
+
+Clone the repository:
 
 ```
 git clone https://github.com/mazurowski-lab/SlicerSegmentHumanBody.git
 ```
 
-After cloning the repository, you need to introduce the extension to 3D Slicer. Please go to Modules > Developer Tools > Extension Wizard on 3D Slicer and click 'Select Extension' button. You should select the root folder that contains this repository in the pop-up. If you don't get any error on Python terminal, that means you are ready to use the extension!
+Open 3D Slicer, go to **Modules > Developer Tools > Extension Wizard**, click **Select Extension**, and choose the repository root folder.
 
-## Usage
+### Offline analysis tool (`tools/audio_processor/`)
 
-### Preparation
+Install dependencies into your Python environment:
 
-- Load an image to be segmented.
-- Choose **Modules > Segmentation > SegmentHumanBody** module in the module selector. The first time the module is started, it will ask permission to install pytorch. Give permission and wait several minutes for the installation to complete. The application will not be responsive during the installation.
-- Click "Configure labels in the segment editor" button to create a label for each structure that will be segmented. For example, "hip" and "femur".
-- Go back to **SegmentHumanBody** module by clicking the green left arrow on the module toolbar. You are ready to segment now!
+```
+pip install -r tools/audio_processor/requirements.txt
+```
 
-### Automatic Segmentation
+To launch via the provided batch file on Windows, edit `tools/audio_processor/launch.bat` first — it contains hardcoded paths to a specific machine. Update the `PYTHONPATH` and `pythonw.exe` lines to match your Python installation before running it. Alternatively, run the tool directly:
 
-<img src="Screenshots/sws1.png" width=45%> <img src="Screenshots/sws2.png" width=42%>
+```
+python -m tools.audio_processor
+```
 
-- Click "Run Automatic Segmentation" button and wait until the processing is completed (it may take some time based on number of slices). SegmentAnyBone will run in automated mode and will segment bones in each slice it can detect. This is going to be a binary segmentation (e.g. bone vs no-bone). To assign labels to different object of interests in slices, you can use label assignment feature: 
-- For each structure of interest: choose a label to assign (above the "Run automatic segmentation" button, for example: "hip") and click "Assign label (2D)" or "Assign label (3D)" button
-  - **2D Label Assignment:** Change label of the connected component *only in the current slice*. You should first place a prompt point on the object of interest whose label you want to change and click Assign Label (2D) button. Label of the object of interest will be changed only on that particular slice.
-  - **3D Label Assignment:** Change label of the connected component *through consecutive slices in 3D*. You should first place a prompt point on the object of interest whose label you want to change. Then, you should click Assign Label (3D) button. Label of the connected component through consecutive slices will be changed.
+## Basic Usage
 
-### Prompt Based Segmentation
+1. Load a volume in 3D Slicer.
+2. Open **Modules > Segmentation > SegmentHumanBody**.
+3. Add segments with the `+` button.
+4. Use **Brush**, **Erase**, or **Point** tools to annotate.
+5. Check **Mouse+Key** and/or **Audio**, then click **Record**.
+6. Annotate. Optionally **Pause** and resume.
+7. Click **Record** again to stop, then **Export** to save all files.
 
-<img src="Screenshots/sws3.png" width=45% height=45%>
+## Volume Management
 
-- Select the label you want to segment from the dropdown list (for example "femur" as shown in the image above).
-- Click "Start Segmentation for Current Slice" button.
+- `A` / `W` navigate loaded scalar volumes; segmentation selection stays manual.
+- If the selected segmentation's grid does not match the new volume, you are asked to create a new segmentation, keep the current one, or cancel.
+- **Clear Loaded Volumes** removes scalar volumes only; segmentation nodes remain.
+- Re-importing a file from the same path replaces the existing node instead of creating a `_1` duplicate.
 
-If it is the first time to segment a slice of this file, you need to wait for SegmentHumanBody to produce some files that will be used for the segmentation. After SegmentHumanBody generated these files, you can start putting **prompt points** or **prompt boxes** on the current slice. You'll be able to see the segmentation mask on 3D Slicer. Please click "Stop Segmentation for Current Slice" whenever you finish your segmentation for the current slice.
+## Model Framework
 
-If you are not satisfied with the segmentation mask produced by SegmentHumanBody, you can edit it as you wish using the "Segment Editor" module of 3D Slicer.
-
-## Future Work
-
-More segmentation models that aims to segment various type of tissues will be added in the future.
+A `Default` / `Identity` model-family template is present for future model integrations. SPX superpixel infrastructure remains in the codebase. The model-family UI is currently hidden while the recording pipeline is the active focus.
 
 ## Citation
 
-If you find our work to be useful for your research, please cite [our paper](https://arxiv.org/abs/2401.12974):
+Citation information is not yet available for this work. Please [submit an issue](https://github.com/mazurowski-lab/SlicerSegmentHumanBody/issues) to request a citation.
 
-```bibtex
-@misc{gu2024segmentanybone,
-      title={SegmentAnyBone: A Universal Model that Segments Any Bone at Any Location on MRI},
-      author={Hanxue Gu and Roy Colglazier and Haoyu Dong and Jikai Zhang and Yaqian Chen and Zafer Yildiz and Yuwen Chen and Lin Li and Jichen Yang and Jay Willhite and Alex M. Meyer and Brian Guo and Yashvi Atul Shah and Emily Luo and Shipra Rajput and Sally Kuehn and Clark Bulleit and Kevin A. Wu and Jisoo Lee and Brandon Ramirez and Darui Lu and Jay M. Levin and Maciej A. Mazurowski},
-      year={2024},
-      eprint={2401.12974},
-      archivePrefix={arXiv},
-      primaryClass={eess.IV}
-```
+## License
+
+[CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/)
+
+If you require a different licensing arrangement, please email the author or [open an issue](https://github.com/mazurowski-lab/SlicerSegmentHumanBody/issues).
+

@@ -4,12 +4,12 @@ Guidance for AI assistants and future maintainers working on this repository.
 
 ## Current Branch Direction
 
-This branch (`feature/native-editor-wrapper`) keeps the current UI layout and
-uses Slicer's native Segment Editor for editing. Do not reimplement brush,
-erase, undo, redo, or markup placement unless there is a clear Slicer limitation.
+This branch (`annotation-process-recorder`) uses Slicer's native Segment Editor
+as the editing engine and adds a mouse-centered annotation-process recorder for
+studying how annotators work.
 
-The main development focus is the mouse-centered record/export
-system for annotation-process analysis.
+Do not reimplement brush, erase, undo, redo, or markup placement unless there is
+a clear Slicer limitation.
 
 ## Development Principles
 
@@ -67,10 +67,9 @@ system for annotation-process analysis.
    Inconsistent spacing/shape/orientation should show one informational warning
    after the import stream settles, with geometry-group statistics and
    filenames, but must not prevent loading or sequence switching. If the user
-   explicitly creates a segment while no
-   segmentation exists, create a generic segmentation for the current volume.
-   Record the selected volume, segmentation, and segment identities explicitly
-   instead of relying on naming conventions.
+   explicitly creates a segment while no segmentation exists, create a generic
+   segmentation for the current volume. Record the selected volume, segmentation,
+   and segment identities explicitly instead of relying on naming conventions.
    Recording metadata must include all loaded/involved volume sequences with
    sequence index, node ID, and name. Volume switching should be present in raw
    logs and interpreted as compact semantic `volume_change` events.
@@ -89,7 +88,6 @@ system for annotation-process analysis.
    - `Q`: show/hide current segment.
    - `S`: show/hide saved/other segments.
    - `E`: reserved; no binding.
-   - Superpixel-grid shortcut/functionality is deferred.
 
 7. Audio recording is wired to the recording UI via `_AudioSubprocess`.
 
@@ -109,8 +107,22 @@ system for annotation-process analysis.
    every 50 ms, and drains 150 ms of buffered audio after stop. If `sounddevice`
    is unavailable, audio silently skips and mouse recording continues unaffected.
 
-   On export, the WAV filename is `{base}_{YYYYMMDDTHHMMSSMMM}.wav`, where the
-   timestamp is the recording start time with millisecond precision. Colons are
+   `_AudioSubprocess.start_time` is set when `start()` is called. This timestamp
+   is used on export to trim the prewarm lead-in from the saved WAV (see
+   `_finalize_wav` below).
+
+   On export, `_finalize_wav(wav_path)` performs two operations in order:
+   1. **Prewarm trim**: discards frames captured before `_recording_start_time`
+      by computing `trim_sec = max(0, recording_start - audio.start_time)`.
+   2. **Pause silence**: zeros byte ranges for each `(pause_sec, resume_sec)`
+      entry in `_pause_intervals`, where both offsets are relative to
+      `_recording_start_time` (i.e., the post-trim timeline).
+
+   `_pause_intervals: list[tuple[float, float]]` accumulates across all pause/
+   resume cycles in a session. It is cleared at the start of each new recording.
+
+   The saved WAV filename is `{base}_{YYYYMMDDTHHMMSSMMM}.wav`, where the
+   timestamp is `_recording_start_time` with millisecond precision. Colons are
    never written to filenames.
 
    `core/_audio_recorder.py` remains available as standalone chunk-based
@@ -140,6 +152,24 @@ Current schema is intentionally strict while this branch is under test:
   inverse). Markup point events may carry world RAS because Slicer provides the
   accepted point location that way; their cleaned IJK is derived with
   `ras_to_ijk`.
+
+### Pause/resume during recording
+
+Calling `recorder.pause()` sets `_paused = True`. While paused:
+- `_on_mouse` still tracks button state (`_active_mouse_press`) but drops all
+  records; it does not append to `recorder.records`.
+- `_append` returns immediately without writing.
+
+Calling `recorder.resume()` clears `_paused`. `is_paused` is `True` only when
+both `is_active` and `_paused` are `True`.
+
+On the widget side, `_do_pause_recording()` opens a modal `QDialog` that blocks
+parent-window input. "Keep Waiting" keeps the dialog open; "Resume" closes it
+and calls `_do_resume_recording()`. The dialog is the only mechanism for
+resuming — there is no keyboard shortcut or second code path.
+
+`_do_resume_recording()` appends `(pause_sec, resume_sec)` to `_pause_intervals`
+(relative to `_recording_start_time`) and calls `recorder.resume()`.
 
 The recorder is an event-listener-style component. It should first produce a
 correct in-volume event stream, then annotate events with
