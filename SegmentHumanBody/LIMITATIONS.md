@@ -1,60 +1,44 @@
-# FRAGILE.md — Known Code Fragility
+# LIMITATIONS.md — Known Limitations
 
 Spots in the codebase that work correctly today but are sensitive to specific
-assumptions. Each entry describes the fragility and its safe precondition so
+assumptions. Each entry describes the limitation and its safe precondition so
 a future refactor knows what contract to preserve or harden.
 
 ---
 
-## Known Bugs — Fix Queue
+## Fixed Bugs
 
-Confirmed in usage. Not yet fixed.
+### BUG-1 — Slice scrollbar movement not traced as a recording event  ✓ FIXED
 
-### BUG-1 — Slice scrollbar does not respond during recording
+**Was:** Dragging the slice-position slider in the Red/Green/Yellow views never
+produced a `slice_change` event in the compact log because slider drag goes
+through the MRML pipeline, not the VTK interactor.
 
-**Symptom:** The slice-position slider in the Red/Green/Yellow views stops
-working (or has no effect) while a recording session is active.
-
-**Suspected cause:** The mouse-event filter or VTK interactor observer
-installed by the recorder consumes or shadows the scroll/drag events that
-Slicer's slice slider relies on. The recording listener may be intercepting
-wheel or drag events before they reach the slice navigation widget.
-
-**Fix direction:** Audit the VTK observer and any Qt event-filter installed
-on the slice views. Ensure scroll/wheel events are passed through and not
-consumed. Only cursor position and button state should be captured; slice
-navigation must remain fully functional during recording.
+**Fix applied:** `MouseEventRecorder.start()` now installs a
+`vtkMRMLSliceNode ModifiedEvent` observer for each slice view
+(`_slice_node_tags` dict stores `(node, tag, cb)` to keep the lambda alive).
+The observer fires `_on_slice_node_modified` → dirty-flag + `QTimer.singleShot(0)`
+coalescing → `_flush_dirty_views`, which re-samples the `xy_to_ijk` matrix,
+updates the live `_ActiveRegionGate`, and appends a `VIEW_CHANGED` record with
+`slice_idx = int(round(mat[11]))`. `TimeLogInterpreter` already performs
+event-type-agnostic `slice_change` detection at the top of its loop, so no
+change was needed there.
 
 ---
 
-### BUG-2 — Brush click coordinate wrong after zoom or pan
+### BUG-2 — Brush click coordinate wrong after zoom or pan  ✓ FIXED
 
-**Symptom:** After zooming in/out or panning a slice view, brush strokes are
-recorded at the wrong IJK position. The same operation with the Point tool is
-correct.
+**Was:** After zooming or panning, brush strokes were recorded at the wrong IJK
+position because the cached `xy_to_ijk` matrix was only captured at recording
+start.
 
-**Root cause (suspected):** Brush uses device XY → IJK via a cached
-`xy_to_ijk` matrix that is captured at recording start (and on `view_changed`
-events). Zoom and pan change the mapping from screen pixels to IJK without
-necessarily firing a `view_changed` event, so the cached matrix becomes stale.
-The Point tool is unaffected because it derives IJK from the accepted world-RAS
-coordinate reported directly by the Slicer markups system, bypassing the cached
-matrix.
-
-**Fix direction:**
-
-1. Record zoom and pan as first-class metadata state-change events (alongside
-   `slice_change` and `tool_change`). Each zoom/pan event should capture the
-   updated `xy_to_ijk` matrix for the affected view so that offline IJK
-   derivation in `TimeLogInterpreter` uses the matrix that was live at the
-   time of each stroke.
-
-2. On the live recording side, hook the Slicer interactor's zoom/pan callbacks
-   (or the slice-node `ModifiedEvent`) to refresh the per-view `_xy_to_ijk`
-   cache immediately, so in-session coordinate derivation also stays accurate.
-
-3. The compact export schema will need a new delta event — `view_transform_change`
-   (or extend `slice_change`) — carrying the new `xy_to_ijk` for the view.
+**Fix applied:** The same `vtkMRMLSliceNode ModifiedEvent` mechanism introduced
+for BUG-1 also handles zoom and pan: any matrix change causes `_flush_dirty_views`
+to update `_active_region_gate.xy_to_ijk_by_view` (live path) and write a
+`VIEW_CHANGED` record with the new `visual_state` (offline path). The offline
+`TimeLogInterpreter` picks up the updated matrix from `raw['visual_state']['xy_to_ijk']`
+in its `elif evt == 'view_changed':` branch, so subsequent IJK derivations use
+the correct post-zoom matrix.
 
 ---
 
@@ -74,12 +58,13 @@ matrix.
 ## Checklist before touching any of these areas
 
 - [ ] `_active_prompt_widget` is never `None` when `PointHandler.detach()` can be called
-- [ ] Slicer window layout does not change mid-recording (no resize, dock, undock)
+- [ ] Slicer window layout does not change mid-recording (dock/undock) — zoom, pan, slider, and window resize are all safe
 - [ ] Brush press inference is only a fallback — verify the normal press fires in the target Slicer version
 - [ ] `tempfile.mkdtemp()` resolves to a local (non-network) drive on the target machine
 - [ ] The audio subprocess still writes mono PCM16 if its recording parameters change
 - [ ] Both `posNode` and `negNode` have `PointRemovedEvent` observers wired before any removal can occur
 - [ ] All Qt widget comparisons use `==`, never `is`
+- [ ] `_slice_node_tags` is only cleared inside `stop()`, after `RemoveObserver` is called for every entry — do not call `clear()` on it elsewhere
 
 ---
 
@@ -104,20 +89,37 @@ and is not cleared until after `detach()` completes.
 
 ---
 
-## 2. `_mouse_recorder.py` — Stale `xy_to_ijk` matrix cache
+## 2. `_mouse_recorder.py` — Stale `xy_to_ijk` matrix after window resize  ✓ FIXED
 
-**Location:** `core/_mouse_recorder.py` — per-view `_xy_to_ijk` cache updated
-in `_all_slice_visual_state`.
+**Was:** `vtkMRMLSliceNode ModifiedEvent` fires for zoom/pan/slider but not for
+Slicer window resize. Resizing changed the pixel-to-IJK mapping without the
+recorder knowing, causing subsequent IJK coordinates to be off.
 
-The DataProbe-style `xy_to_ijk` matrix is captured once at recording start and
-on `view_changed` events. If the user resizes the Slicer window or docks/undocks
-a panel between those events, the cached matrix drifts from the live transform.
-Subsequent IJK coordinates derived from that cache will be slightly wrong without
-any warning.
+**Fix applied:** `_SliceResizeFilter` (a `qt.QObject` event filter) is installed
+on each slice widget in `start()` via `sw.installEventFilter(flt)`. On
+`QEvent.Resize`, it calls `_on_slice_node_modified(view_name)`, which marks the
+view dirty and schedules the same deferred `_flush_dirty_views` used for
+zoom/pan/slider. Filters are stored in `_resize_filters` and removed in `stop()`.
 
-**Safe precondition:** The Slicer window layout does not change during a
-recording session, or view-changed events are fired reliably on any resize that
-affects the slice view geometry.
+**Remaining precondition:** Panel dock/undock is not yet covered (dock events do
+not produce a `QResizeEvent` on the slice widget itself).
+
+## 8. `_mouse_recorder.py` — MRML observer lambda must be kept alive (limitation)
+
+**Location:** `core/_mouse_recorder.py:start()` — `_slice_node_tags` dict.
+
+`vtkMRMLSliceNode.AddObserver(event, callback)` in VTK Python holds only a
+weak reference to the callback if it is a plain lambda. The observer is stored
+as `_slice_node_tags[view_name] = (node, tag, cb)` where `cb` is the lambda.
+The tuple keeps `cb` alive as long as `_slice_node_tags` exists.
+
+If `_slice_node_tags` is ever cleared before `stop()` (e.g., a partial reset),
+`cb` will be GC'd and `_on_slice_node_modified` will silently stop firing — no
+error, no traceback, just missing `slice_change` events. `RemoveObserver` must
+always be called before the dict is cleared.
+
+**Safe precondition:** `_slice_node_tags` is only cleared inside `stop()`, after
+`RemoveObserver` has been called for every entry.
 
 ---
 

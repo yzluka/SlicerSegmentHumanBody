@@ -92,6 +92,23 @@ def _volume_metadata(volume_node) -> dict | None:
     }
 
 
+_QObjectBase = getattr(qt, 'QObject', object)
+
+
+class _SliceResizeFilter(_QObjectBase):
+    """Qt event filter that marks a slice view dirty when it is resized."""
+
+    def __init__(self, view_name, on_modified):
+        super().__init__()
+        self._view_name = view_name
+        self._on_modified = on_modified
+
+    def eventFilter(self, obj, event):
+        if event.type() == qt.QEvent.Resize:
+            self._on_modified(self._view_name)
+        return False
+
+
 class _SliceRecordInteractorObserver:
     """Per-slice-view VTK interactor observer using DataProbe device XY."""
 
@@ -263,6 +280,7 @@ class MouseEventRecorder:
         self.on_record_appended = None
         self._next_event_id = 1
         self._slice_node_tags: dict = {}
+        self._resize_filters: dict = {}
         self._dirty_views: set = set()
         self._refresh_scheduled: bool = False
 
@@ -303,11 +321,16 @@ class MouseEventRecorder:
             node = sw.mrmlSliceNode()
             if node is None:
                 continue
-            tag = node.AddObserver(
-                'ModifiedEvent',
-                lambda c, e, vn=view_name: self._on_slice_node_modified(vn),
-            )
-            self._slice_node_tags[view_name] = (node, tag)
+            cb = lambda c, e, vn=view_name: self._on_slice_node_modified(vn)
+            tag = node.AddObserver(vtk.vtkCommand.ModifiedEvent, cb)
+            self._slice_node_tags[view_name] = (node, tag, cb)
+        for view_name in ('Red', 'Green', 'Yellow'):
+            sw = _slice_widget(view_name)
+            if sw is None:
+                continue
+            flt = _SliceResizeFilter(view_name, self._on_slice_node_modified)
+            sw.installEventFilter(flt)
+            self._resize_filters[view_name] = (sw, flt)
         if self._listeners:
             self._start_move_timer()
         hz = round(1000.0 / self._move_interval_ms)
@@ -348,9 +371,12 @@ class MouseEventRecorder:
         self._sample_pending_move()
         self._stop_move_timer()
         self._flush_dirty_views()
-        for view_name, (node, tag) in self._slice_node_tags.items():
+        for view_name, (node, tag, _cb) in self._slice_node_tags.items():
             node.RemoveObserver(tag)
         self._slice_node_tags.clear()
+        for view_name, (sw, flt) in self._resize_filters.items():
+            sw.removeEventFilter(flt)
+        self._resize_filters.clear()
         for listener in self._listeners:
             listener.remove()
         self._listeners = []
@@ -863,6 +889,8 @@ class MouseEventRecorder:
                     'visual_state': new_state,
                     'analysis_event_type': BOUNDARY_EVENT,
                 }
+                if new_mat is not None and len(new_mat) == 16:
+                    payload['slice_idx'] = int(round(new_mat[11]))
                 payload.update(self._bound_tool_payload())
                 self._append(VIEW_CHANGED, None, payload)
 
