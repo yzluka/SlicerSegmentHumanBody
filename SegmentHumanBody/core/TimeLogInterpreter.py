@@ -113,6 +113,12 @@ class TimeLogInterpreter:
                     export_id += 1
                     events.append(ev)
 
+            elif evt == 'view_changed':
+                vs = (raw.get('visual_state') or {})
+                mat = vs.get('xy_to_ijk')
+                if view and mat and len(mat) == 16:
+                    self._view_mats[view] = mat
+
             elif evt == 'mouse':
                 for ev in self._from_mouse(raw, last_slice):
                     ev['id'] = export_id

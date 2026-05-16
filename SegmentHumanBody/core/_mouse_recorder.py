@@ -262,6 +262,9 @@ class MouseEventRecorder:
         self.context_fn = None
         self.on_record_appended = None
         self._next_event_id = 1
+        self._slice_node_tags: dict = {}
+        self._dirty_views: set = set()
+        self._refresh_scheduled: bool = False
 
     @property
     def is_active(self) -> bool:
@@ -293,6 +296,18 @@ class MouseEventRecorder:
             listener = _SliceRecordListener(view_name, view, self._on_mouse)
             if listener.install():
                 self._listeners.append(listener)
+        for view_name in ('Red', 'Green', 'Yellow'):
+            sw = _slice_widget(view_name)
+            if sw is None:
+                continue
+            node = sw.mrmlSliceNode()
+            if node is None:
+                continue
+            tag = node.AddObserver(
+                'ModifiedEvent',
+                lambda c, e, vn=view_name: self._on_slice_node_modified(vn),
+            )
+            self._slice_node_tags[view_name] = (node, tag)
         if self._listeners:
             self._start_move_timer()
         hz = round(1000.0 / self._move_interval_ms)
@@ -318,8 +333,9 @@ class MouseEventRecorder:
             'coordinate_sources': {
                 'cursor': (
                     'VTK interactor GetEventPosition device XY interpreted '
-                    'with the per-view xy_to_ijk matrices stored once in '
-                    'metadata.initial_visual_state.'
+                    'with the per-view xy_to_ijk matrices stored in '
+                    'metadata.initial_visual_state and updated via '
+                    'view_changed events with visual_state during recording.'
                 ),
             },
         }
@@ -331,6 +347,10 @@ class MouseEventRecorder:
     def stop(self):
         self._sample_pending_move()
         self._stop_move_timer()
+        self._flush_dirty_views()
+        for view_name, (node, tag) in self._slice_node_tags.items():
+            node.RemoveObserver(tag)
+        self._slice_node_tags.clear()
         for listener in self._listeners:
             listener.remove()
         self._listeners = []
@@ -351,6 +371,8 @@ class MouseEventRecorder:
         self._active_region_gate = None
         self._bound_tool_context = {'tool': None}
         self._next_event_id = 1
+        self._dirty_views.clear()
+        self._refresh_scheduled = False
 
     def record_action(self, name: str):
         self._append(ACTION, None, {'name': name})
@@ -816,6 +838,41 @@ class MouseEventRecorder:
             'metadata': metadata,
             'events': events,
         }
+
+    def _flush_dirty_views(self) -> None:
+        self._refresh_scheduled = False
+        if not self._active:
+            self._dirty_views.clear()
+            return
+        for view_name in list(self._dirty_views):
+            self._dirty_views.discard(view_name)
+            new_state = _visual_state(view_name, self._volume_node)
+            new_mat = new_state.get('xy_to_ijk')
+            old_mat = (self._active_region_gate.xy_to_ijk_by_view.get(view_name)
+                       if self._active_region_gate is not None else None)
+            if new_mat is None or new_mat == old_mat:
+                continue
+            if self._active_region_gate is not None:
+                self._active_region_gate._update_visual_state({
+                    'view_name': view_name,
+                    'visual_state': new_state,
+                })
+            if not self._paused:
+                payload = {
+                    'view_name': view_name,
+                    'visual_state': new_state,
+                    'analysis_event_type': BOUNDARY_EVENT,
+                }
+                payload.update(self._bound_tool_payload())
+                self._append(VIEW_CHANGED, None, payload)
+
+    def _on_slice_node_modified(self, view_name: str) -> None:
+        if not self._active:
+            return
+        self._dirty_views.add(view_name)
+        if not self._refresh_scheduled:
+            self._refresh_scheduled = True
+            qt.QTimer.singleShot(0, self._flush_dirty_views)
 
     def _on_mouse(self, view_name: str, xy_local: tuple, event_type: str, extra=None):
         if self._paused:
@@ -1648,6 +1705,8 @@ def _raw_event(record, context=None) -> dict | None:
         _copy_mouse_binding_fields(ev, payload)
         if payload.get('wheel_delta') is not None:
             ev['wheel_delta'] = payload['wheel_delta']
+        if payload.get('visual_state') is not None:
+            ev['visual_state'] = payload['visual_state']
     if record.event_type == BRUSH_PARAMETERS_CHANGED:
         ev.setdefault('event_type', BOUNDARY_EVENT)
         fields = _brush_param_export_fields(payload, raw=True)
