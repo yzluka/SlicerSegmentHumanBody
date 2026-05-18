@@ -1,9 +1,5 @@
 # SegmentHumanBody
-
-[![arXiv Paper](https://img.shields.io/badge/arXiv-2401.12974-orange.svg?style=flat)](https://arxiv.org/abs/2401.12974)
-[![arXiv Paper](https://img.shields.io/badge/arXiv-2505.01854-orange.svg?style=flat)](https://www.arxiv.org/abs/2505.01854)
-
-SegmentHumanBody aims to asist its users in segmenting medical data on <a href="https://github.com/Slicer/Slicer">3D Slicer</a> by integrating the <a href="https://github.com/mazurowski-lab/SegmentAnyBone">SegmentAnyBone</a>, and <a href="https://github.com/mazurowski-lab/SLM-SAM2">SLM-SAM2</a> developed by Mazurowski Lab. Currently maintained by Yixin Zhang and Yaqian Chen for pre-release and internal features.
+SegmentHumanBody aims to asist its users in segmenting medical data on <a href="https://github.com/Slicer/Slicer">3D Slicer</a>. This is the repository for pre-release experimental features and is developed by Yixin Zhang and Yaqian Chen from Mazurowski Lab.
 
 ## License
 
@@ -11,13 +7,19 @@ The repository is licensed under the [CC BY-NC 4.0](https://creativecommons.org/
 
 ## Installation via GitHub Repository
 
-You can clone this repository by running the following command:
+For stable release and old-version features, you can clone the repository  by running the following command:
 
 ```
 git clone https://github.com/mazurowski-lab/SlicerSegmentHumanBody.git
 ```
 
-After cloning the repository, you need to introduce the extension to 3D Slicer. Please go to Modules > Developer Tools > Extension Wizard on 3D Slicer and click 'Select Extension' button. You should select the root folder that contains this repository in the pop-up. If you don't get any error on Python terminal, that means you are ready to use the extension!
+For pre-release models and features (SPX-annotator in "main" and annotation-process-recorder), you should use:
+
+```
+git clone https://github.com/yzluka/SlicerSegmentHumanBody.git
+```
+
+After the repository, you need to introduce the extension to 3D Slicer. Please go to Modules > Developer Tools > Extension Wizard on 3D Slicer and click 'Select Extension' button. You should select the root folder that contains this repository in the pop-up. If you don't get any error on Python terminal, that means you are ready to use the extension!
 
 ## Usage
 
@@ -54,14 +56,4 @@ More segmentation models that aims to segment various type of tissues will be ad
 
 ## Citation
 
-If you find our work to be useful for your research, please cite [our paper](https://arxiv.org/abs/2401.12974):
-
-```bibtex
-@misc{gu2024segmentanybone,
-      title={SegmentAnyBone: A Universal Model that Segments Any Bone at Any Location on MRI},
-      author={Hanxue Gu and Roy Colglazier and Haoyu Dong and Jikai Zhang and Yaqian Chen and Zafer Yildiz and Yuwen Chen and Lin Li and Jichen Yang and Jay Willhite and Alex M. Meyer and Brian Guo and Yashvi Atul Shah and Emily Luo and Shipra Rajput and Sally Kuehn and Clark Bulleit and Kevin A. Wu and Jisoo Lee and Brandon Ramirez and Darui Lu and Jay M. Levin and Maciej A. Mazurowski},
-      year={2024},
-      eprint={2401.12974},
-      archivePrefix={arXiv},
-      primaryClass={eess.IV}
-```
+If you find our work to be useful for your research, please cite this repository.
