@@ -121,6 +121,41 @@ class DependencyCheck:
         msg = cls._file_result(path, display_name or path)
         return msg is None, msg or ''
 
+    @classmethod
+    def check_distribution(
+        cls,
+        dist_name: str,
+        *,
+        min_version: str | None = None,
+    ) -> tuple[bool, str]:
+        """Cheap metadata-only install-presence probe.
+
+        Uses ``importlib.metadata.distribution`` — reads ``*.dist-info/METADATA``
+        without importing or executing any package code. Cached per process.
+
+        Returns ``(ok, message)`` where *message* is empty when *ok* is True.
+        """
+        key = ('dist', dist_name, min_version)
+        if key not in cls._cache:
+            cls._cache[key] = cls._probe_distribution(dist_name, min_version)
+        msg = cls._cache[key]
+        return msg is None, msg or ''
+
+    @staticmethod
+    def _probe_distribution(dist_name: str, min_version) -> str | None:
+        from importlib.metadata import distribution, PackageNotFoundError
+        try:
+            d = distribution(dist_name)
+        except PackageNotFoundError:
+            return f"Missing distribution: '{dist_name}'"
+        if min_version is not None:
+            if not _version_ok(d.version, min_version):
+                return (
+                    f"'{dist_name}' {d.version} installed "
+                    f"but >={min_version} required"
+                )
+        return None
+
     # ------------------------------------------------------------------
     # Internal — cache coordination
     # ------------------------------------------------------------------

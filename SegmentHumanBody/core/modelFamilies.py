@@ -35,6 +35,11 @@ class BaseModelFamily:
     # buttons and shows/hides each based on membership in this set.
     VISIBLE_BUTTONS: frozenset = frozenset()
 
+    # Sequence of (dist_name, min_version_or_None) pairs checked via
+    # importlib.metadata.distribution — no package import occurs.
+    # An empty tuple means no extra dependencies.
+    REQUIRES_DISTRIBUTIONS: tuple = ()
+
     def __init__(self, variant=None):
         self.variant = variant
         self.model = None
@@ -59,10 +64,10 @@ class BaseModelFamily:
 # ---------------------------------------------------------------------------
 
 class DefaultFamily(BaseModelFamily):
-    """No-op family used as the template for future model integrations."""
+    """No-op family — delegates directly to Slicer's native Segment Editor."""
 
-    VARIANTS = ['Identity']
-    MODEL_MAP = {'Identity': 'Identity'}
+    VARIANTS = ['Basic']
+    MODEL_MAP = {'Basic': 'Identity'}
     VISIBLE_BUTTONS = frozenset()
 
     def _get_model_key(self):
@@ -97,6 +102,7 @@ class SAMFamily(BaseModelFamily):
         'SAM-VIT-H', 'SAM-ViT-L', 'SAM-ViT-B',
         'sam2_hiera_l', 'sam2_hiera_b+', 'sam2_hiera_s', 'sam2_hiera_t',
     ]
+    REQUIRES_DISTRIBUTIONS: tuple = (('torch', None),)
 
     VISIBLE_BUTTONS = frozenset({
         'goToMarkupsButton',
@@ -129,11 +135,9 @@ class SPXModelFamily(BaseModelFamily):
     VARIANTS = sorted(list(MODEL_MAP.keys()))
 
     VISIBLE_BUTTONS = frozenset({
-        'expandSelectedLabelButton',
+        'spxBrushToolButton',
+        'spxEraseToolButton',
         'showSPXBoundaryCheckBox',
-        'goToMarkupsButton',
-        'positivePrompts', 'positivePromptLabel',
-        'negativePrompts', 'negativePromptLabel',
     })
 
     def __init__(self, variant=None):
@@ -157,20 +161,23 @@ class SPXModelFamily(BaseModelFamily):
         self._cache_key    = None
         self._cache_labels = None
 
-    def _make_cache_key(self, img, kwargs):
-        # img.ctypes.data is the pointer to the first byte of the slice in the
-        # volume buffer.  For a view (which get_slice_from_volume always returns),
-        # this pointer uniquely identifies the slice position within the volume
-        # without copying any pixel data.
+    def _make_cache_key(self, volume_node, axis, slice_idx, kwargs):
+        # Keyed on node ID (invalidates on volume switch), axis, slice, and params.
+        # MTime is intentionally excluded: Slicer's display pipeline increments it
+        # after every modifySelectedSegmentByLabelmap call, which would bust the cache
+        # on every stroke and force SLIC/Felzenszwalb to re-run each time.
         try:
             params = frozenset(kwargs.items())
         except TypeError:
             params = str(sorted(kwargs.items()))
-        return (img.ctypes.data, img.shape, img.dtype.str, params)
+        return (volume_node.GetID(), axis, int(slice_idx), params)
 
-    def on_expand(self, **kwargs):
+    def on_expand(self, volume_node=None, axis=None, slice_idx=None, **kwargs):
         if not self.model:
             raise RuntimeError("Model not confirmed")
+        if volume_node is None or axis is None or slice_idx is None:
+            raise ValueError(
+                "on_expand requires 'volume_node', 'axis', and 'slice_idx' keyword arguments")
 
         img = kwargs.get('img')
         if img is None:
@@ -179,9 +186,7 @@ class SPXModelFamily(BaseModelFamily):
         # Strip 'img' so only algorithm params reach model.forward and cache key.
         model_kwargs = {k: v for k, v in kwargs.items() if k != 'img'}
 
-        # Reuse cached labels when the user has been working on this slice in
-        # interactive mode — avoids a redundant forward pass.
-        key = self._make_cache_key(img, model_kwargs)
+        key = self._make_cache_key(volume_node, axis, slice_idx, model_kwargs)
         if key != self._cache_key:
             self._cache_labels = self.model.forward(img=img, **model_kwargs)
             self._cache_key = key
@@ -275,8 +280,7 @@ class TimedAnnotatorFamily(BaseModelFamily):
 # Keys are the display names shown in the UI; values are family classes.
 # Add a new family by adding one entry here — no widget edits required.
 FAMILY_REGISTRY: dict = {
-    'Default':                   DefaultFamily,
-    'None':                      BaseModelFamily,
+    'Basic':                     DefaultFamily,
     'SAM-Style':                 SAMFamily,
     'SPX-Assisted Annotation':   SPXModelFamily,
     'Auto':                      AutoModelFamily,

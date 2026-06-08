@@ -119,6 +119,7 @@ class _TextWidget:
 class _ComboBoxStub:
     currentIndex = 0
     def itemData(self, idx): return -1
+    def itemText(self, idx): return ''
     def setEnabled(self, v): pass
     def clear(self): pass
     def addItem(self, text, data=None): pass
@@ -151,6 +152,7 @@ class _RecordUI:
         self.exportRecordButton = _TextWidget()
         self.recordStatusLabel = _TextWidget()
         self.audioDeviceComboBox = _ComboBoxStub()
+        self.overwriteModeDropdown = _ComboBoxStub()
 
 
 def _widget(seg_node, recorder=None):

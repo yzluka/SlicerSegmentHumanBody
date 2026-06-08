@@ -120,6 +120,15 @@ class TimeLogSummarizer:
                 span, i = self._consume_point_drag(i)
             elif kind in ('place', 'replace', 'remove', 'point_drag_start'):
                 span, i = self._consume_point_event(i)
+            elif kind in ('spx_brush_fill', 'spx_erase_fill'):
+                span, i = self._consume_spx_stroke(i)
+            elif kind == 'fill_hole':
+                span, i = self._consume_fill_hole(i)
+            elif kind in ('spx_boundary_on', 'spx_boundary_off'):
+                span, i = self._consume_spx_boundary(i)
+            elif kind in ('model_family_changed', 'model_variant_changed',
+                          'model_confirmed'):
+                span, i = self._consume_model_change(i)
             else:
                 i += 1
                 continue
@@ -454,6 +463,70 @@ class TimeLogSummarizer:
         }
         data.update(merged)
         return _span(ev.get('event'), start, ev, text, data)
+
+    def _consume_spx_stroke(self, i):
+        first = self._events[i]
+        kind = first.get('event')
+        merge_key = (kind, first.get('segment_id'), first.get('slice_idx'), first.get('view'))
+        labels = []
+        total_delta = 0
+        j = i
+        while j < len(self._events):
+            ev = self._events[j]
+            this_key = (ev.get('event'), ev.get('segment_id'), ev.get('slice_idx'), ev.get('view'))
+            if this_key != merge_key:
+                break
+            label_id = ev.get('label_id')
+            if label_id is not None:
+                labels.append(label_id)
+            delta = ev.get('delta_pixels')
+            if delta is not None:
+                total_delta += delta
+            j += 1
+        end = self._events[j - 1]
+        span_type = 'spx_brush_stroke' if kind == 'spx_brush_fill' else 'spx_erase_stroke'
+        ctx = self._context_parts(segment=first.get('segment_id'), view=first.get('view'),
+                                  slice_idx=first.get('slice_idx'))
+        text = f'({_time_range(first, end)}: {span_type} labels={labels} Δ={total_delta}px {", ".join(ctx)})'
+        return _span(span_type, first, end, text, {
+            'labels': labels, 'total_delta_pixels': total_delta,
+            'slice_idx': first.get('slice_idx'), 'view': first.get('view'),
+            'segment_id': first.get('segment_id'),
+            'model_key': first.get('model_key'),
+        }), j
+
+    def _consume_fill_hole(self, i):
+        ev = self._events[i]
+        ctx = self._context_parts(segment=ev.get('segment_id'), view=ev.get('view'),
+                                  slice_idx=ev.get('slice_idx'))
+        text = f'({_time_point(ev)}: fill_hole Δ={ev.get("delta_pixels")}px {", ".join(ctx)})'
+        return _span('fill_hole', ev, ev, text, {
+            'slice_idx': ev.get('slice_idx'), 'view': ev.get('view'),
+            'delta_pixels': ev.get('delta_pixels'),
+            'segment_id': ev.get('segment_id'),
+        }), i + 1
+
+    def _consume_spx_boundary(self, i):
+        first = self._events[i]
+        kind = first.get('event')
+        j = i + 1
+        end = first
+        if kind == 'spx_boundary_on' and j < len(self._events):
+            if self._events[j].get('event') == 'spx_boundary_off':
+                end = self._events[j]
+                j += 1
+        text = f'({_time_range(first, end)}: spx_boundary_inspection view={first.get("view")})'
+        return _span('spx_boundary_inspection', first, end, text, {
+            'view': first.get('view'), 'model_key': first.get('model_key'),
+        }), j
+
+    def _consume_model_change(self, i):
+        ev = self._events[i]
+        kind = ev.get('event')
+        text = f'({_time_point(ev)}: {kind} family={ev.get("family")} variant={ev.get("variant")})'
+        return _span('model_change', ev, ev, text, {
+            'family': ev.get('family'), 'variant': ev.get('variant'),
+        }), i + 1
 
     def _context_parts(self, *, segment=None, view=None, tool=MISSING,
                        brush_mm=None, slice_idx=None):

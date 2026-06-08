@@ -85,15 +85,20 @@ a clear Slicer limitation.
 
    - `A` / `W`: next / previous loaded volume sequence.
    - `Z` / `C`: previous / next segment.
-   - `Q`: show/hide current segment.
-   - `S`: show/hide saved/other segments.
-   - `E`: reserved; no binding.
+   - `V`: show/hide current segment.
+   - `Q`: show/hide other segments.
+   - `1`: activate Brush tool.
+   - `2`: activate Erase tool.
+   - `3`: toggle positive prompt point placement.
+   - `4`: toggle negative prompt point placement.
+   - `E`: toggle SPX boundary visibility.
 
 7. Audio recording is wired to the recording UI via `_AudioSubprocess`.
 
-   The Recording section has two rows:
-   - Row 1: `Start/Stop Recording` toggle · `Mouse+Key` checkbox · `Audio` checkbox
-   - Row 2: `Audio Device:` label · device dropdown · `Export` button
+   The Recording section has three rows:
+   - Row 1: `Record` toggle · `M+K` checkbox · `Audio` checkbox
+   - Row 2: `Pause` button · `Export` button
+   - Row 3: `Audio Input:` label · device dropdown
 
    Checking only `Audio` enters audio-only mode: no mouse events are recorded,
    and all annotation tools are locked (read-only) for the session. A popup

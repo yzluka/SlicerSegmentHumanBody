@@ -23,6 +23,23 @@ class _FakeModel:
         return labels
 
 
+class _FakeVolumeNode:
+    """Minimal stub for a Slicer vtkMRMLScalarVolumeNode used in cache-key tests."""
+
+    def __init__(self, node_id='vol-1', mtime=100):
+        self._id = node_id
+        self._mtime = mtime
+
+    def GetID(self):
+        return self._id
+
+    def GetMTime(self):
+        return self._mtime
+
+    def bump_mtime(self):
+        self._mtime += 1
+
+
 class TestBaseModelFamily(unittest.TestCase):
 
     def setUp(self):
@@ -50,25 +67,29 @@ class TestDefaultFamily(unittest.TestCase):
     def tearDown(self):
         ModelRegistry.model_cache.clear()
 
-    def test_registry_exposes_default_family(self):
-        self.assertIs(FAMILY_REGISTRY['Default'], DefaultFamily)
+    def test_registry_exposes_basic_family(self):
+        self.assertIs(FAMILY_REGISTRY['Basic'], DefaultFamily)
 
-    def test_default_family_declares_identity_variant(self):
-        self.assertEqual(DefaultFamily.VARIANTS, ['Identity'])
+    def test_registry_does_not_expose_default_or_none(self):
+        self.assertNotIn('Default', FAMILY_REGISTRY)
+        self.assertNotIn('None', FAMILY_REGISTRY)
+
+    def test_default_family_declares_basic_variant(self):
+        self.assertEqual(DefaultFamily.VARIANTS, ['Basic'])
 
     def test_confirm_model_loads_identity_model(self):
-        fam = DefaultFamily(variant='Identity')
+        fam = DefaultFamily(variant='Basic')
         fam.confirm_model()
         self.assertIsNotNone(fam.model)
 
     def test_identity_on_render_returns_input_image(self):
-        fam = DefaultFamily(variant='Identity')
+        fam = DefaultFamily(variant='Basic')
         fam.confirm_model()
         img = np.arange(9, dtype=np.uint8).reshape(3, 3)
         self.assertIs(fam.onRender(img=img), img)
 
     def test_identity_on_expand_returns_input_image(self):
-        fam = DefaultFamily(variant='Identity')
+        fam = DefaultFamily(variant='Basic')
         fam.confirm_model()
         img = np.arange(4, dtype=np.uint8).reshape(2, 2)
         self.assertIs(fam.on_expand(img=img), img)
@@ -124,7 +145,7 @@ class TestSPXModelFamily(unittest.TestCase):
         return fam
 
     def test_cache_hit_skips_forward(self):
-        """Same img buffer + same kwargs → model.forward called exactly once."""
+        """Same volume/axis/slice/kwargs → model.forward called exactly once."""
         call_count = [0]
         original_forward = _FakeModel.forward
 
@@ -135,16 +156,20 @@ class TestSPXModelFamily(unittest.TestCase):
 
         fam = SPXModelFamily(variant='Naive_Grid-2D')
         fam.model = _CountingModel()
-
+        vol = _FakeVolumeNode()
         img = np.zeros((10, 20), dtype=np.uint8)
-        fam.on_expand(img=img)
-        fam.on_expand(img=img)
-        fam.on_expand(img=img)
+
+        fam.on_expand(volume_node=vol, axis='ax', slice_idx=5, img=img)
+        fam.on_expand(volume_node=vol, axis='ax', slice_idx=5, img=img)
+        fam.on_expand(volume_node=vol, axis='ax', slice_idx=5, img=img)
 
         self.assertEqual(call_count[0], 1, "forward() should be called once for repeated calls on the same slice")
 
-    def test_cache_miss_on_different_image(self):
-        """Different image buffer → forward called again."""
+    def test_cache_stable_on_mtime_bump(self):
+        """MTime bump alone must NOT bust the cache.
+        Slicer's display pipeline increments MTime after every
+        modifySelectedSegmentByLabelmap call, so including it would force
+        SLIC/Felzenszwalb to re-run on every stroke (~1-2 s each)."""
         call_count = [0]
         original_forward = _FakeModel.forward
 
@@ -155,17 +180,17 @@ class TestSPXModelFamily(unittest.TestCase):
 
         fam = SPXModelFamily(variant='Naive_Grid-2D')
         fam.model = _CountingModel()
+        vol = _FakeVolumeNode()
+        img = np.zeros((10, 20), dtype=np.uint8)
 
-        img1 = np.zeros((10, 20), dtype=np.uint8)
-        img2 = np.ones((10, 20), dtype=np.uint8)  # different buffer
+        fam.on_expand(volume_node=vol, axis='ax', slice_idx=5, img=img)
+        vol.bump_mtime()  # rendering pipeline side-effect — must not invalidate
+        fam.on_expand(volume_node=vol, axis='ax', slice_idx=5, img=img)
 
-        fam.on_expand(img=img1)
-        fam.on_expand(img=img2)
-
-        self.assertEqual(call_count[0], 2)
+        self.assertEqual(call_count[0], 1)
 
     def test_cache_miss_on_different_kwargs(self):
-        """Same image but different user params → forward called again."""
+        """Same volume/axis/slice but different user params → forward called again."""
         call_count = [0]
         original_forward = _FakeModel.forward
 
@@ -176,10 +201,11 @@ class TestSPXModelFamily(unittest.TestCase):
 
         fam = SPXModelFamily(variant='Naive_Grid-2D')
         fam.model = _CountingModel()
-
+        vol = _FakeVolumeNode()
         img = np.zeros((10, 20), dtype=np.uint8)
-        fam.on_expand(img=img, n_segments=50)
-        fam.on_expand(img=img, n_segments=100)
+
+        fam.on_expand(volume_node=vol, axis='ax', slice_idx=5, img=img, n_segments=50)
+        fam.on_expand(volume_node=vol, axis='ax', slice_idx=5, img=img, n_segments=100)
 
         self.assertEqual(call_count[0], 2)
 
@@ -187,9 +213,9 @@ class TestSPXModelFamily(unittest.TestCase):
         """confirm_model() must wipe _cache_key and _cache_labels."""
         fam = SPXModelFamily(variant='Naive_Grid-2D')
         fam.model = _FakeModel()
-
+        vol = _FakeVolumeNode()
         img = np.zeros((10, 20), dtype=np.uint8)
-        fam.on_expand(img=img)
+        fam.on_expand(volume_node=vol, axis='ax', slice_idx=5, img=img)
         self.assertIsNotNone(fam._cache_key)
         self.assertIsNotNone(fam._cache_labels)
 
@@ -223,29 +249,32 @@ class TestSPXModelFamily(unittest.TestCase):
         """kwargs containing an unhashable value (e.g. a list) must use
         the str() fallback rather than raising TypeError."""
         fam = SPXModelFamily(variant='Naive_Grid-2D')
-        img = np.zeros((10, 10), dtype=np.uint8)
+        vol = _FakeVolumeNode()
         # A list value is unhashable → triggers the except TypeError branch.
-        key = fam._make_cache_key(img, {'weights': [1, 2, 3]})
+        key = fam._make_cache_key(vol, 'ax', 0, {'weights': [1, 2, 3]})
         self.assertIsNotNone(key)
 
     # ---- on_expand ----
 
     def test_on_expand_raises_without_model(self):
         fam = SPXModelFamily(variant='Naive_Grid-2D')
+        vol = _FakeVolumeNode()
         with self.assertRaises(RuntimeError):
-            fam.on_expand(img=np.zeros((10, 10)))
+            fam.on_expand(volume_node=vol, axis='ax', slice_idx=0, img=np.zeros((10, 10)))
 
     def test_on_expand_raises_without_img(self):
         fam = SPXModelFamily(variant='Naive_Grid-2D')
         fam.model = _FakeModel()
+        vol = _FakeVolumeNode()
         with self.assertRaises(ValueError):
-            fam.on_expand()
+            fam.on_expand(volume_node=vol, axis='ax', slice_idx=0)
 
     def test_on_expand_returns_label_map(self):
         fam = SPXModelFamily(variant='Naive_Grid-2D')
         fam.model = _FakeModel()
+        vol = _FakeVolumeNode()
         img = np.zeros((10, 20), dtype=np.uint8)
-        result = fam.on_expand(img=img)
+        result = fam.on_expand(volume_node=vol, axis='ax', slice_idx=5, img=img)
         self.assertIsNotNone(result)
         self.assertEqual(result.shape, (10, 20))
 
@@ -260,8 +289,10 @@ class TestSPXModelFamily(unittest.TestCase):
 
         fam = SPXModelFamily(variant='Naive_Grid-2D')
         fam.model = _ParamCapture()
+        vol = _FakeVolumeNode()
         img = np.zeros((10, 20), dtype=np.uint8)
-        fam.on_expand(img=img, n_segments=42, compactness=5)
+        fam.on_expand(volume_node=vol, axis='ax', slice_idx=5,
+                      img=img, n_segments=42, compactness=5)
 
         self.assertEqual(received.get('n_segments'), 42)
         self.assertEqual(received.get('compactness'), 5)
@@ -280,12 +311,13 @@ class TestSPXModelFamily(unittest.TestCase):
 
         fam = SPXModelFamily(variant='Naive_Grid-2D')
         fam.model = _CountingModel()
+        vol = _FakeVolumeNode()
         img = np.zeros((10, 20), dtype=np.uint8)
 
-        fam.on_expand(img=img)
+        fam.on_expand(volume_node=vol, axis='ax', slice_idx=5, img=img)
         self.assertEqual(call_count[0], 1)
 
-        fam.on_expand(img=img)
+        fam.on_expand(volume_node=vol, axis='ax', slice_idx=5, img=img)
         self.assertEqual(call_count[0], 1, "on_expand should reuse the cache, not call forward() again")
 
 

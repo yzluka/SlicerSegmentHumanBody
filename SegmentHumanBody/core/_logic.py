@@ -8,6 +8,9 @@ import logging
 import vtk
 import slicer
 import numpy as np
+
+# Set True to print per-phase timing inside apply_spx_labels_batch to the Python console.
+SPX_DEBUG_TIMING = True
 from slicer.ScriptedLoadableModule import ScriptedLoadableModuleLogic
 
 from core.modelFamilies import SPXModelFamily
@@ -443,55 +446,6 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
         return tracker.write_slice(axis, slice_idx, new_data, source=source)
 
     # -------------------------
-    # SPX boundary
-    # -------------------------
-
-    def compute_spx_boundary(self, widget):
-        """Compute SPX superpixel boundary pixels for the current slice.
-
-        Reuses the SPX label-map cache when available (no extra forward pass
-        if the user is already in interactive mode or has expanded).  Falls
-        back to running the model if the cache is empty.
-
-        Returns ``(boundary_uint8_2d, axis, sliceIndex)``.
-
-        Raises
-        ------
-        ValueError
-            With a user-readable message when the boundary cannot be computed
-            (wrong model family, no model confirmed, no volume, bad params).
-        """
-        modelFamily = widget.modelFamily
-        if not isinstance(modelFamily, SPXModelFamily):
-            raise ValueError("Please select an SPX model family first.")
-        if not modelFamily.model:
-            raise ValueError("Please confirm a model first (click 'Confirm Model').")
-
-        volumeNode, _, _ = self._get_context(widget)
-        if not volumeNode:
-            raise ValueError("Please select an image volume first.")
-
-        axis, sliceIndex = self.getAxisAndSlice(widget, volumeNode)
-
-        # Always go through on_expand so its cache key (which includes
-        # img.shape) is validated against the current axis/slice.  Bypassing
-        # it with a raw _cache_labels check causes a shape mismatch when the
-        # user switches slice planes (e.g. Red → Green) after the model ran.
-        volumeArray = slicer.util.arrayFromVolume(volumeNode)
-        if volumeArray is None:
-            raise ValueError("Volume has no image data.")
-        img = get_slice_from_volume(volumeArray, axis, sliceIndex)
-        img = self._apply_wl_to_slice(img)
-        params = widget.getUserParameters()
-        if params is None:
-            raise ValueError("Invalid model parameters.")
-        labels = modelFamily.on_expand(img=img, **params)
-
-        if labels is None:
-            raise ValueError("SPX model returned no labels for this slice.")
-
-        return spx_boundary_mask(labels), axis, sliceIndex
-
     # -------------------------
     # Model actions
     # -------------------------
@@ -554,7 +508,9 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
 
         # Delegate to the family so the correct algorithm and user params are
         # used, and the SPX label cache is consulted before recomputing.
-        labels = call_if_exists(modelFamily, 'on_expand', img=img, **params)
+        labels = call_if_exists(modelFamily, 'on_expand',
+                                volume_node=volumeNode, axis=axis,
+                                slice_idx=sliceIndex, img=img, **params)
 
         if labels is None:
             slicer.util.warningDisplay("This model does not support propagation.")
@@ -621,3 +577,564 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
             neg_points=neg_points,
         )
         return tracker.write_slice(axis, sliceIndex, expanded, source='expand')
+
+
+# ---------------------------------------------------------------------------
+# Module-level SPX helpers — imported directly by core/_input.py
+# ---------------------------------------------------------------------------
+
+def _build_slice_modifier_labelmap(vol, axis, slice_idx, mask2d,
+                                   row_offset=0, col_offset=0,
+                                   ijk_to_ras_mat=None, modifier=None):
+    """Build a sub-window vtkOrientedImageData for modifySelectedSegmentByLabelmap.
+
+    mask2d is the (cropped) 2-D uint8 mask to write.  row_offset / col_offset are the
+    top-left corner of that crop within the full slice in slice-local 2-D coordinates:
+      axis 0: row=J, col=I  →  origin_ijk = (col_offset, row_offset, slice_idx)
+      axis 1: row=K, col=I  →  origin_ijk = (col_offset, slice_idx,  row_offset)
+      axis 2: row=K, col=J  →  origin_ijk = (slice_idx,  col_offset, row_offset)
+
+    ijk_to_ras_mat: optional pre-fetched vtkMatrix4x4 from vol.GetIJKToRASMatrix().
+                    When provided, the per-call GetIJKToRASMatrix() read is skipped.
+    modifier:       optional vtkOrientedImageData to reuse.  When its total voxel
+                    count matches slim_dims, scalars are updated in-place (no new
+                    VTK array, no deep copy).  Caller should cache the returned
+                    modifier and pass it on the next stroke.
+
+    Callers that pass the full slice (fill_hole_2d) leave offsets at 0 — same behaviour.
+    modifySelectedSegmentByLabelmap handles partial-extent modifiers via
+    vtkOrientedImageDataResample::ModifyImage — only the overlap region is written.
+    """
+    from vtk.util.numpy_support import vtk_to_numpy
+    m  = mask2d.astype(np.uint8)
+    nr = m.shape[0]   # rows in cropped mask
+    nc = m.shape[1]   # cols in cropped mask
+
+    # numpy layout (nk,nj,ni) → ravel C-order → VTK expects i varies fastest, matching.
+    if axis == 0:          # axial K: one K-slice → shape (1, nj_crop, ni_crop)
+        arr        = m[np.newaxis, :, :]
+        slim_dims  = (nc, nr, 1)
+        origin_ijk = (float(col_offset), float(row_offset), float(slice_idx), 1.0)
+    elif axis == 1:        # coronal J: one J-slice → shape (nk_crop, 1, ni_crop)
+        arr        = m[:, np.newaxis, :]
+        slim_dims  = (nc, 1, nr)
+        origin_ijk = (float(col_offset), float(slice_idx), float(row_offset), 1.0)
+    else:                  # sagittal I: one I-slice → shape (nk_crop, nj_crop, 1)
+        arr        = m[:, :, np.newaxis]
+        slim_dims  = (1, nc, nr)
+        origin_ijk = (float(slice_idx), float(col_offset), float(row_offset), 1.0)
+
+    # Use cached matrix when available; otherwise read from volume node.
+    if ijk_to_ras_mat is None:
+        ijk_to_ras_mat = vtk.vtkMatrix4x4()
+        vol.GetIJKToRASMatrix(ijk_to_ras_mat)
+
+    origin_ras = [0.0, 0.0, 0.0, 0.0]
+    ijk_to_ras_mat.MultiplyPoint(origin_ijk, origin_ras)
+    slim_mat = vtk.vtkMatrix4x4()
+    slim_mat.DeepCopy(ijk_to_ras_mat)
+    slim_mat.SetElement(0, 3, origin_ras[0])
+    slim_mat.SetElement(1, 3, origin_ras[1])
+    slim_mat.SetElement(2, 3, origin_ras[2])
+
+    # Reuse the modifier object when the total voxel count matches (most strokes).
+    # Otherwise create or resize, then allocate.
+    total = slim_dims[0] * slim_dims[1] * slim_dims[2]
+    if modifier is None:
+        modifier = slicer.vtkOrientedImageData()
+    existing = modifier.GetPointData().GetScalars()
+    if existing is None or existing.GetNumberOfTuples() != total:
+        modifier.SetDimensions(slim_dims)
+        modifier.AllocateScalars(vtk.VTK_UNSIGNED_CHAR, 1)
+        existing = modifier.GetPointData().GetScalars()
+    else:
+        modifier.SetDimensions(slim_dims)  # update shape metadata; scalars stay
+
+    # Write mask data directly into the allocated buffer — no new VTK array.
+    np_scalars = vtk_to_numpy(existing)
+    np_scalars[:] = arr.ravel()
+    existing.Modified()
+
+    modifier.SetGeometryFromImageToWorldMatrix(slim_mat)
+    return modifier
+
+
+def _read_segment_slice(seg, seg_id, vol, axis, slice_idx):
+    """Read the current binary mask for one segment/slice as a 2-D bool array."""
+    arr3d = slicer.util.arrayFromSegmentBinaryLabelmap(seg, seg_id, vol)
+    if arr3d is None:
+        dims = vol.GetImageData().GetDimensions()  # (ni, nj, nk)
+        if axis == 0:
+            return np.zeros((dims[2], dims[1]), dtype=bool)
+        elif axis == 1:
+            return np.zeros((dims[2], dims[0]), dtype=bool)
+        else:
+            return np.zeros((dims[1], dims[0]), dtype=bool)
+    if axis == 0:
+        return arr3d[slice_idx, :, :].astype(bool)
+    elif axis == 1:
+        return arr3d[:, slice_idx, :].astype(bool)
+    else:
+        return arr3d[:, :, slice_idx].astype(bool)
+
+
+def _count_delta(delta):
+    """Pixel count from modifySelectedSegmentByLabelmap (int) or 0 if unavailable."""
+    return delta if isinstance(delta, int) else 0
+
+
+def apply_spx_label(widget, label_id, axis, slice_idx, additive):
+    """Fill or erase one superpixel (label_id) in the active segment.
+
+    Calls widget.modelFamily.on_expand to get the cached label map, extracts
+    the mask for label_id, and applies it via the Segment Editor effect API.
+    All mask writes go through modifySelectedSegmentByLabelmap so Slicer's
+    masking rules, observers, and undo snapshot are honoured automatically.
+    """
+    editor = widget.logic.get_segment_editor()
+    if editor is None:
+        return None
+    seg    = editor.segmentationNode()
+    seg_id = editor.currentSegmentID()
+    vol    = editor.sourceVolumeNode()
+    if not (seg and seg_id and vol):
+        return None
+
+    vol_arr = slicer.util.arrayFromVolume(vol)
+    img = get_slice_from_volume(vol_arr, axis, int(slice_idx))
+    labels = widget.modelFamily.on_expand(
+        volume_node=vol, axis=axis, slice_idx=int(slice_idx),
+        img=img, **widget.getUserParameters())
+    if labels is None:
+        return None
+    mask2d = (labels == label_id)
+    if not mask2d.any():
+        return None
+
+    modifier = _build_slice_modifier_labelmap(vol, axis, int(slice_idx), mask2d)
+    from slicer import qSlicerSegmentEditorAbstractEffect as _Eff
+    mode = _Eff.ModificationModeAdd if additive else _Eff.ModificationModeRemove
+    effect = editor.effectByName('Paint')
+    if effect is None:
+        return None
+    delta = effect.modifySelectedSegmentByLabelmap(modifier, mode)
+
+    if widget._recorder.is_active:
+        widget._recorder.record_spx_fill(
+            additive=additive,
+            label_id=int(label_id),
+            view=widget.currentViewName,
+            axis=axis,
+            slice_idx=int(slice_idx),
+            delta_pixels=_count_delta(delta),
+            model_key=widget.modelFamily._get_model_key(),
+            params=widget.getUserParameters() or {},
+            segment_id=seg_id,
+            segmentation_id=seg.GetID(),
+            volume_id=vol.GetID())
+    return delta
+
+
+def _spx_apply_direct(seg, seg_id, axis, slice_idx, combined_mask2d,
+                       row_offset, col_offset, additive, ijk_to_ras_mat):
+    """Write combined mask directly into the segment's binary labelmap numpy array.
+
+    Uses the same coordinate mapping as _spx_read_native_slice: maps the labelmap's
+    (0,0,0) voxel through its world matrix into reference-volume IJK to find where
+    the labelmap sits, then offsets the modifier into the labelmap-local array.
+
+    Returns True and fires Modified events on success.
+    Returns False when the modifier extends beyond the current labelmap bounding box
+    (caller must fall back to SetBinaryLabelmapToSegment for the expansion).
+
+    O(modifier_size) — no VTK allocation, no reallocation.
+    """
+    import vtkSegmentationCorePython as vsc
+    from vtk.util.numpy_support import vtk_to_numpy
+
+    seg_obj = seg.GetSegmentation().GetSegment(seg_id)
+    if seg_obj is None:
+        return False
+    rep_name = vsc.vtkSegmentationConverter.GetBinaryLabelmapRepresentationName()
+    lm = seg_obj.GetRepresentation(rep_name)
+    if lm is None:
+        return False
+    scalars = lm.GetPointData().GetScalars()
+    if scalars is None or scalars.GetNumberOfTuples() == 0:
+        return False
+
+    # Map labelmap local (0,0,0) → ref-vol IJK (mirrors _spx_read_native_slice)
+    lm_to_world = vtk.vtkMatrix4x4()
+    lm.GetImageToWorldMatrix(lm_to_world)
+    ref_ras_to_ijk = vtk.vtkMatrix4x4()
+    vtk.vtkMatrix4x4.Invert(ijk_to_ras_mat, ref_ras_to_ijk)
+    origin_ras = [0.0, 0.0, 0.0, 0.0]
+    lm_to_world.MultiplyPoint([0.0, 0.0, 0.0, 1.0], origin_ras)
+    ref_ijk_o  = [0.0, 0.0, 0.0, 0.0]
+    ref_ras_to_ijk.MultiplyPoint(origin_ras, ref_ijk_o)
+    ref_i = int(round(ref_ijk_o[0]))
+    ref_j = int(round(ref_ijk_o[1]))
+    ref_k = int(round(ref_ijk_o[2]))
+
+    ext = lm.GetExtent()                  # (li0, li1, lj0, lj1, lk0, lk1)
+    li0, li1, lj0, lj1, lk0, lk1 = ext
+    ni_s = li1 - li0 + 1
+    nj_s = lj1 - lj0 + 1
+    nk_s = lk1 - lk0 + 1
+    nr, nc = combined_mask2d.shape
+
+    if axis == 0:   # Red/axial: K fixed, rows=J, cols=I
+        arr_k = (slice_idx - ref_k) - lk0
+        if not (0 <= arr_k < nk_s):
+            return False
+        lm_j0 = (row_offset - ref_j) - lj0
+        lm_i0 = (col_offset - ref_i) - li0
+        if lm_j0 < 0 or lm_j0 + nr > nj_s or lm_i0 < 0 or lm_i0 + nc > ni_s:
+            return False
+        arr = vtk_to_numpy(scalars).reshape(nk_s, nj_s, ni_s)
+        target = arr[arr_k, lm_j0:lm_j0 + nr, lm_i0:lm_i0 + nc]
+    elif axis == 1:  # Green/coronal: J fixed, rows=K, cols=I
+        arr_j = (slice_idx - ref_j) - lj0
+        if not (0 <= arr_j < nj_s):
+            return False
+        lm_k0 = (row_offset - ref_k) - lk0
+        lm_i0 = (col_offset - ref_i) - li0
+        if lm_k0 < 0 or lm_k0 + nr > nk_s or lm_i0 < 0 or lm_i0 + nc > ni_s:
+            return False
+        arr = vtk_to_numpy(scalars).reshape(nk_s, nj_s, ni_s)
+        target = arr[lm_k0:lm_k0 + nr, arr_j, lm_i0:lm_i0 + nc]
+    else:            # Yellow/sagittal: I fixed, rows=K, cols=J
+        arr_i = (slice_idx - ref_i) - li0
+        if not (0 <= arr_i < ni_s):
+            return False
+        lm_k0 = (row_offset - ref_k) - lk0
+        lm_j0 = (col_offset - ref_j) - lj0
+        if lm_k0 < 0 or lm_k0 + nr > nk_s or lm_j0 < 0 or lm_j0 + nc > nj_s:
+            return False
+        arr = vtk_to_numpy(scalars).reshape(nk_s, nj_s, ni_s)
+        target = arr[lm_k0:lm_k0 + nr, lm_j0:lm_j0 + nc, arr_i]
+
+    m = combined_mask2d.astype(np.uint8)
+    if additive:
+        target |= m
+    else:
+        target &= ~m
+
+    scalars.Modified()
+    seg.GetSegmentation().Modified()
+    return True
+
+
+def _spx_preallocate_full_labelmap(seg, seg_id, vol, ijk_to_ras_mat):
+    """Pre-allocate the segment's binary labelmap to the full reference-volume extent.
+
+    Uses seg_obj.AddRepresentation to set a fresh full-size vtkOrientedImageData
+    directly on the segment — bypassing SetBinaryLabelmapToSegment and all its
+    Modified event chains that would otherwise cause Slicer to reset or re-trim the
+    labelmap before the first SPX stroke.
+
+    Existing painted data is copied into the new full-size buffer.  No Modified()
+    events are fired here; the first _spx_apply_direct call provides display
+    notification (scalars.Modified + seg.GetSegmentation().Modified).
+
+    After this call, _spx_apply_direct always succeeds for any view/slice, so
+    SetBinaryLabelmapToSegment is never called during annotation strokes.
+    """
+    import vtkSegmentationCorePython as vsc
+    from vtk.util.numpy_support import vtk_to_numpy
+
+    seg_obj = seg.GetSegmentation().GetSegment(seg_id)
+    if seg_obj is None:
+        return
+    rep_name = vsc.vtkSegmentationConverter.GetBinaryLabelmapRepresentationName()
+
+    dims = vol.GetImageData().GetDimensions()   # (ni, nj, nk)
+    ni, nj, nk = dims
+
+    existing_lm = seg_obj.GetRepresentation(rep_name)
+    if existing_lm is not None:
+        ext = existing_lm.GetExtent()
+        li0, li1, lj0, lj1, lk0, lk1 = ext
+        if li1 - li0 + 1 >= ni and lj1 - lj0 + 1 >= nj and lk1 - lk0 + 1 >= nk:
+            if SPX_DEBUG_TIMING:
+                print(f'[SPX prealloc] already full: {dims}')
+            return
+
+    if SPX_DEBUG_TIMING:
+        import time as _time
+        _tp0 = _time.perf_counter()
+
+    # Allocate a fresh full-size labelmap (all zeros, geometry = reference volume).
+    new_lm = slicer.vtkOrientedImageData()
+    new_lm.SetDimensions(ni, nj, nk)
+    new_lm.AllocateScalars(vtk.VTK_UNSIGNED_CHAR, 1)
+    new_scalars = new_lm.GetPointData().GetScalars()
+    new_arr = vtk_to_numpy(new_scalars).reshape(nk, nj, ni)
+    new_arr[:] = 0
+
+    # Copy existing painted data into the correct position in the new buffer.
+    if existing_lm is not None:
+        old_scalars = existing_lm.GetPointData().GetScalars()
+        if old_scalars and old_scalars.GetNumberOfTuples() > 0:
+            lm_to_world = vtk.vtkMatrix4x4()
+            existing_lm.GetImageToWorldMatrix(lm_to_world)
+            ref_ras_to_ijk = vtk.vtkMatrix4x4()
+            vtk.vtkMatrix4x4.Invert(ijk_to_ras_mat, ref_ras_to_ijk)
+            origin_ras = [0.0, 0.0, 0.0, 0.0]
+            lm_to_world.MultiplyPoint([0.0, 0.0, 0.0, 1.0], origin_ras)
+            ref_ijk_o = [0.0, 0.0, 0.0, 0.0]
+            ref_ras_to_ijk.MultiplyPoint(origin_ras, ref_ijk_o)
+            ref_i = int(round(ref_ijk_o[0]))
+            ref_j = int(round(ref_ijk_o[1]))
+            ref_k = int(round(ref_ijk_o[2]))
+            ext = existing_lm.GetExtent()
+            li0, li1, lj0, lj1, lk0, lk1 = ext
+            ni_s = li1 - li0 + 1
+            nj_s = lj1 - lj0 + 1
+            nk_s = lk1 - lk0 + 1
+            old_arr = vtk_to_numpy(old_scalars).reshape(nk_s, nj_s, ni_s)
+            dst_i0 = ref_i + li0; dst_j0 = ref_j + lj0; dst_k0 = ref_k + lk0
+            si0 = max(0, dst_i0); si1 = min(ni, dst_i0 + ni_s)
+            sj0 = max(0, dst_j0); sj1 = min(nj, dst_j0 + nj_s)
+            sk0 = max(0, dst_k0); sk1 = min(nk, dst_k0 + nk_s)
+            if si0 < si1 and sj0 < sj1 and sk0 < sk1:
+                new_arr[sk0:sk1, sj0:sj1, si0:si1] = old_arr[
+                    sk0 - dst_k0:sk1 - dst_k0,
+                    sj0 - dst_j0:sj1 - dst_j0,
+                    si0 - dst_i0:si1 - dst_i0]
+
+    # Geometry: new labelmap spans the entire reference volume.
+    # ijk_to_ras_mat maps (0,0,0) → RAS origin, same spacing and directions.
+    new_lm.SetGeometryFromImageToWorldMatrix(ijk_to_ras_mat)
+    new_scalars.Modified()
+
+    # Set directly on the segment — bypasses SetBinaryLabelmapToSegment and its
+    # Modified chain so Slicer cannot reset or re-trim the labelmap.
+    # No seg.GetSegmentation().Modified() here; the first _spx_apply_direct
+    # stroke fires the display notification.
+    seg_obj.AddRepresentation(rep_name, new_lm)
+
+    if SPX_DEBUG_TIMING:
+        _tp1 = _time.perf_counter()
+        print(f'[SPX prealloc] AddRepresentation total={(_tp1-_tp0)*1000:.0f}ms  '
+              f'lm_dims={(ni, nj, nk)}')
+
+
+def apply_spx_labels_batch(widget, label_ids, combined_mask2d,
+                           axis, slice_idx, additive, view_name,
+                           row_offset=0, col_offset=0,
+                           ijk_to_ras_mat=None, modifier_box=None):
+    """Apply a pre-built combined SPX mask in one modifySelectedSegmentByLabelmap call.
+
+    combined_mask2d may be a bbox-cropped sub-window; row_offset / col_offset give its
+    position within the full slice.  Recording still emits one event per label.
+
+    ijk_to_ras_mat: optional pre-fetched vtkMatrix4x4 (skips GetIJKToRASMatrix per call).
+    modifier_box:   optional [vtkOrientedImageData] for modifier reuse across strokes.
+                    modifier_box[0] is used as the initial modifier and updated in-place.
+    """
+    editor = widget.logic.get_segment_editor()
+    if editor is None:
+        return
+    seg    = editor.segmentationNode()
+    seg_id = editor.currentSegmentID()
+    vol    = editor.sourceVolumeNode()
+    if not (seg and seg_id and vol):
+        return
+    if SPX_DEBUG_TIMING:
+        import time as _time
+        _t0 = _time.perf_counter()
+
+    # Fast path: write directly into the segment's binary labelmap numpy array.
+    # O(modifier_size) — no VTK reallocation, no undo serialization.
+    # Works whenever the modifier fits within the current labelmap bounding box.
+    # Falls back to SetBinaryLabelmapToSegment only when new territory is covered
+    # (which triggers a VTK reallocation proportional to the new union extent).
+    direct_ok = _spx_apply_direct(
+        seg, seg_id, axis, int(slice_idx), combined_mask2d,
+        row_offset, col_offset, additive, ijk_to_ras_mat)
+
+    if SPX_DEBUG_TIMING:
+        _t1 = _time.perf_counter()
+
+    if not direct_ok:
+        # Modifier extends beyond existing labelmap bbox — fall back to VTK API.
+        seg_logic = slicer.modules.segmentations.logic()
+        modifier_in = modifier_box[0] if modifier_box is not None else None
+        modifier = _build_slice_modifier_labelmap(
+            vol, axis, int(slice_idx), combined_mask2d,
+            row_offset=row_offset, col_offset=col_offset,
+            ijk_to_ras_mat=ijk_to_ras_mat, modifier=modifier_in)
+        if modifier_box is not None:
+            modifier_box[0] = modifier
+        merge_mode = seg_logic.MODE_MERGE_MAX if additive else seg_logic.MODE_MERGE_MIN
+        ok = seg_logic.SetBinaryLabelmapToSegment(modifier, seg, seg_id, merge_mode)
+        if not ok:
+            import logging
+            logging.warning(f'[SPX] SetBinaryLabelmapToSegment failed: seg_id={seg_id!r}')
+            return
+
+    delta_pixels = int(combined_mask2d.astype(bool).sum())
+
+    if SPX_DEBUG_TIMING:
+        _t2 = _time.perf_counter()
+        import vtkSegmentationCorePython as _vsc
+        _seg_lm = seg.GetSegmentation().GetSegment(seg_id).GetRepresentation(
+            _vsc.vtkSegmentationConverter.GetBinaryLabelmapRepresentationName())
+        _lm_dims = _seg_lm.GetDimensions() if _seg_lm else None
+        _lm_info = (f'lm_dims={_lm_dims} ({_lm_dims[0]*_lm_dims[1]*_lm_dims[2]/1e6:.1f}M vox)'
+                    if _lm_dims else 'no_lm')
+        _path = 'direct' if direct_ok else 'SetBinaryLabelmapToSegment'
+        print(f'  [apply_batch] {_path}={(_t2-_t0)*1000:.1f}ms  {_lm_info}')
+
+    if widget._recorder.is_active:
+        model_key = widget.modelFamily._get_model_key()
+        params    = widget.getUserParameters() or {}
+        for i, label_id in enumerate(label_ids):
+            widget._recorder.record_spx_fill(
+                additive=additive,
+                label_id=int(label_id),
+                view=view_name,
+                axis=axis,
+                slice_idx=int(slice_idx),
+                delta_pixels=delta_pixels if i == 0 else 0,
+                model_key=model_key,
+                params=params,
+                segment_id=seg_id,
+                segmentation_id=seg.GetID(),
+                volume_id=vol.GetID())
+
+
+def fill_hole_2d(widget):
+    """Fill enclosed holes in the active segment on the current slice (2D only).
+
+    Uses scipy.ndimage.binary_fill_holes then writes through the Segment Editor
+    effect API so Slicer's undo stack captures the operation.
+    """
+    editor = widget.logic.get_segment_editor()
+    if editor is None:
+        return None
+    seg    = editor.segmentationNode()
+    seg_id = editor.currentSegmentID()
+    vol    = editor.sourceVolumeNode()
+    if not (seg and seg_id and vol):
+        slicer.util.warningDisplay('Fill Hole: no active segment or volume.')
+        return None
+
+    viewName = widget.currentViewName
+    axis = VIEW_TO_AXIS.get(viewName, 2)
+    lm = slicer.app.layoutManager()
+    sw = lm.sliceWidget(viewName)
+    sliceNode = sw.mrmlSliceNode()
+    sliceToRAS = sliceNode.GetSliceToRAS()
+    ras = [sliceToRAS.GetElement(r, 3) for r in range(3)]
+    rasToIjk = vtk.vtkMatrix4x4()
+    vol.GetRASToIJKMatrix(rasToIjk)
+    ijk = rasToIjk.MultiplyPoint(ras + [1])
+    slice_idx = int(round(ijk[AXIS_TO_IJK_COMPONENT[axis]]))
+
+    current = _read_segment_slice(seg, seg_id, vol, axis, slice_idx)
+
+    try:
+        from scipy.ndimage import binary_fill_holes
+        filled = binary_fill_holes(current)
+    except ImportError:
+        slicer.util.warningDisplay('Fill Hole requires scipy. Install it to use this tool.')
+        return None
+
+    if not np.any(filled != current):
+        return None
+
+    editor.saveStateForUndo()
+    modifier = _build_slice_modifier_labelmap(vol, axis, slice_idx, filled.astype(np.uint8))
+    from slicer import qSlicerSegmentEditorAbstractEffect as _Eff
+    effect = editor.effectByName('Paint')
+    if effect is None:
+        return None
+    delta = effect.modifySelectedSegmentByLabelmap(modifier, _Eff.ModificationModeSet)
+
+    if widget._recorder.is_active:
+        widget._recorder.record_fill_hole(
+            view=viewName, axis=axis,
+            slice_idx=int(slice_idx), delta_pixels=_count_delta(delta),
+            segment_id=seg_id, segmentation_id=seg.GetID(),
+            volume_id=vol.GetID())
+    return delta
+
+
+def compute_spx_boundary(widget):
+    """Compute SPX superpixel boundary pixels for the current slice.
+
+    Returns ``(boundary_uint8_2d, axis, slice_idx)``.
+
+    Raises ValueError with a user-readable message when the boundary cannot be
+    computed (wrong family, no model, no volume, bad params).
+    """
+    modelFamily = widget.modelFamily
+    if not isinstance(modelFamily, SPXModelFamily):
+        raise ValueError("Please select an SPX model family first.")
+    if not modelFamily.model:
+        raise ValueError("Please confirm a model first.")
+
+    volumeNode = widget.ui.sourceVolumeSelector.currentNode()
+    if not volumeNode:
+        raise ValueError("Please select an image volume first.")
+
+    viewName = widget.currentViewName
+    axis = VIEW_TO_AXIS.get(viewName, 2)
+    lm = slicer.app.layoutManager()
+    sw = lm.sliceWidget(viewName)
+    sliceNode = sw.mrmlSliceNode()
+    sliceToRAS = sliceNode.GetSliceToRAS()
+    ras = [sliceToRAS.GetElement(r, 3) for r in range(3)]
+    rasToIjk = vtk.vtkMatrix4x4()
+    volumeNode.GetRASToIJKMatrix(rasToIjk)
+    ijk = rasToIjk.MultiplyPoint(ras + [1])
+    slice_idx = int(round(ijk[AXIS_TO_IJK_COMPONENT[axis]]))
+
+    volumeArray = slicer.util.arrayFromVolume(volumeNode)
+    if volumeArray is None:
+        raise ValueError("Volume has no image data.")
+    img = get_slice_from_volume(volumeArray, axis, slice_idx)
+    params = widget.getUserParameters()
+    if params is None:
+        raise ValueError("Invalid model parameters.")
+    labels = modelFamily.on_expand(
+        volume_node=volumeNode, axis=axis, slice_idx=slice_idx,
+        img=img, **params)
+    if labels is None:
+        raise ValueError("SPX model returned no labels for this slice.")
+
+    return spx_boundary_mask(labels), axis, slice_idx
+
+
+def compute_spx_boundary_for_volume(widget, volume, boundary_node):
+    """Compute SPX boundaries for the current slice and write into boundary_node.
+
+    boundary_node is a vtkMRMLLabelMapVolumeNode.  The full volume geometry is
+    initialised on first call; subsequent calls update only the target slice so
+    switching slices is cheap.
+    """
+    try:
+        boundary_2d, axis, slice_idx = compute_spx_boundary(widget)
+    except ValueError as exc:
+        log.warning('compute_spx_boundary_for_volume: %s', exc)
+        return
+
+    vol_arr = slicer.util.arrayFromVolume(volume)
+
+    # Allocate or re-allocate boundary node to match source volume geometry.
+    existing = boundary_node.GetImageData()
+    if existing is None or existing.GetDimensions() != volume.GetImageData().GetDimensions():
+        zeros = np.zeros(vol_arr.shape, dtype=np.uint8)
+        slicer.util.updateVolumeFromArray(boundary_node, zeros)
+        mat = vtk.vtkMatrix4x4()
+        volume.GetIJKToRASMatrix(mat)
+        boundary_node.SetIJKToRASMatrix(mat)
+        if boundary_node.GetDisplayNode() is None:
+            boundary_node.CreateDefaultDisplayNodes()
+
+    arr = slicer.util.arrayFromVolume(boundary_node).copy()
+    m = boundary_2d.astype(np.uint8)
+    write_slice_to_volume(arr, m, axis, slice_idx)
+    slicer.util.updateVolumeFromArray(boundary_node, arr)

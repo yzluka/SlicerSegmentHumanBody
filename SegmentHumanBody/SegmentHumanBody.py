@@ -18,10 +18,14 @@ import subprocess
 import sys
 import tempfile
 
-from core.utils import next_segment_name
-from core.modelFamilies import FAMILY_REGISTRY
+from core.utils import next_segment_name, parse_user_parameters
+from core.modelFamilies import FAMILY_REGISTRY, SPXModelFamily
+from core.modelRegistry import ModelRegistry
 from core._mouse_recorder import get_recorder
-from core._input import StrokeHandler, BrushHandler, EraseHandler, PointHandler
+from core._input import (StrokeHandler,
+                         BrushHandler, Brush2DHandler, Brush3DHandler,
+                         EraseHandler, Erase2DHandler, Erase3DHandler,
+                         PointHandler, SpxBrushHandler, SpxEraseHandler)
 
 _MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 _AUDIO_SCRIPT = os.path.join(_MODULE_DIR, 'core', '_audio_subprocess.py')
@@ -149,13 +153,12 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     Every tool delegates directly to the Segment Editor effect.
     """
 
-    # Widgets that belong to model features.
-    # Hidden in this branch — layout preserved for future re-enabling.
+    # Widgets hidden in this branch — layout preserved for future families.
+    # modelFamilyDropdown, modelVariantDropdown, paramTextEdit, docLinkLabel,
+    # spxBrushToolButton, spxEraseToolButton, showSPXBoundaryCheckBox and
+    # fillHoleButton are now VISIBLE (managed by updateUIVisibility / always-on).
     _HIDDEN_WIDGETS = frozenset({
-        'modelFamilyDropdown', 'modelVariantDropdown',
-        'confirmModelSelection', 'paramTextEdit', 'docLinkLabel',
         'assignLabel2D', 'assignLabel3D', 'runAutomaticSegmentation',
-        'expandSelectedLabelButton', 'showSPXBoundaryCheckBox',
         'goToMarkupsButton', 'samMaskDropdown', 'sliceViewDropdown',
         'exportAnnotationLogButton', 'importAnnotationLogButton',
     })
@@ -164,17 +167,22 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         ScriptedLoadableModuleWidget.__init__(self, parent)
         VTKObservationMixin.__init__(self)
         self.logic = SegmentHumanBodyLogic()
-        self.modelFamily = FAMILY_REGISTRY['Default']('Identity')
+        self.modelFamily = FAMILY_REGISTRY['Basic']('Basic')
         self.modelFamily.confirm_model()
         self._parameterNode         = None
-        self._savedSegmentsVisible  = False
-        self._currentSegmentVisible = True
+        self._saved_segments_visible  = False
+        self._current_segment_visible = True
         self.currentViewName        = 'Red'
         self._recorder              = get_recorder()
         self._eof_widget            = None   # borrowed EffectsOptionsFrame
         self._eof_orig_parent       = None   # original parent to return it to
         self._active_handler        = None   # current InputHandler subclass instance
         self._attaching_handler     = None   # set during InputHandler.attach() to suppress spurious detach events
+        self._handler_brush_2d      = Brush2DHandler()
+        self._handler_erase_2d      = Erase2DHandler()
+        self._handler_spx_brush     = SpxBrushHandler()
+        self._handler_spx_erase     = SpxEraseHandler()
+        self._handler_point         = PointHandler()
         self._active_prompt_widget  = None   # positivePrompts or negativePrompts last activated
         self._suppressing_place_mode = False  # True while segment creation is in progress
         self._observed_segmentation = None   # vtkMRMLSegmentationNode being tracked
@@ -233,6 +241,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._connectSignals(uiWidget)
         self._observeVolumeImports()
         self.initializeParameterNode()
+        self.initializeModelUI()
+        self.onModelFamilyChanged()
         self._update_record_ui()
         self._recorder.context_fn = self._recorder_context
         self._recorder.on_record_appended = self._onRecorderAppended
@@ -485,10 +495,32 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             'activated()', lambda: self._select_relative_segment(-1))
         sc(qt.QKeySequence('C'), uiWidget).connect(
             'activated()', lambda: self._select_relative_segment(1))
-        sc(qt.QKeySequence('Q'), uiWidget).connect(
+        sc(qt.QKeySequence('V'), uiWidget).connect(
             'activated()', self._toggle_current_segment_visibility)
-        sc(qt.QKeySequence('S'), uiWidget).connect(
+        sc(qt.QKeySequence('Q'), uiWidget).connect(
             'activated()', self._toggle_saved_segments_visibility)
+
+        # Tool hotkeys — generic brush/erase/point; E toggles SPX boundary.
+        sc(qt.QKeySequence('1'), uiWidget).connect('activated()', self._activateBrushFromHotkey)
+        sc(qt.QKeySequence('2'), uiWidget).connect('activated()', self._activateEraseFromHotkey)
+        sc(qt.QKeySequence('3'), uiWidget).connect('activated()', self._activatePosPointFromHotkey)
+        sc(qt.QKeySequence('4'), uiWidget).connect('activated()', self._activateNegPointFromHotkey)
+        sc(qt.QKeySequence('E'), uiWidget).connect('activated()', self._toggleSPXBoundaryFromHotkey)
+
+        # Model selection signals.
+        ui.modelFamilyDropdown.connect('currentIndexChanged(int)', self.onModelFamilyChanged)
+        ui.modelVariantDropdown.connect('currentIndexChanged(int)', self.onVariantChanged)
+        ui.showSPXBoundaryCheckBox.connect('toggled(bool)', self.onToggleSPXBoundary)
+
+        # SPX / fill-hole tool buttons.
+        if hasattr(ui, 'spxBrushToolButton'):
+            ui.spxBrushToolButton.connect('clicked(bool)', self._onSpxBrushToggle)
+        if hasattr(ui, 'spxEraseToolButton'):
+            ui.spxEraseToolButton.connect('clicked(bool)', self._onSpxEraseToggle)
+        if hasattr(ui, 'fillHoleButton'):
+            ui.fillHoleButton.connect('clicked(bool)', lambda _=None: self._onFillHoleClicked())
+        if hasattr(ui, 'paramTextEdit'):
+            ui.paramTextEdit.connect('textChanged()', self._onSpxParamsChanged)
 
     # ------------------------------------------------------------------ #
     # Parameter node                                                       #
@@ -531,11 +563,11 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.ui.showCurrentSegmentCheckBox.setChecked(True)
             self.ui.showCurrentSegmentCheckBox.blockSignals(False)
             self.ui.showSegmentsCheckBox.blockSignals(True)
-            self.ui.showSegmentsCheckBox.setChecked(self._savedSegmentsVisible)
+            self.ui.showSegmentsCheckBox.setChecked(self._saved_segments_visible)
             self.ui.showSegmentsCheckBox.blockSignals(False)
             segID = self.ui.segmentSelector.currentSegmentID() if seg else None
             self.logic.set_saved_segments_visibility(
-                seg, segID, self._savedSegmentsVisible)
+                seg, segID, self._saved_segments_visible)
             if seg and segID:
                 pos_node, neg_node = self.logic.create_segment_prompt_nodes(seg, segID)
             else:
@@ -909,10 +941,18 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self._recorder.clear()
             vol = self._parameterNode.GetNodeReference(_INPUT_VOLUME) if self._parameterNode else None
             seg = self._parameterNode.GetNodeReference(_SEGMENTATION) if self._parameterNode else None
+            _ow_idx = self.ui.overwriteModeDropdown.currentIndex
+            _ow_key = (self._OVERWRITE_MODE_KEYS[_ow_idx]
+                       if 0 <= _ow_idx < len(self._OVERWRITE_MODE_KEYS)
+                       else 'OverwriteNone')
             self._recorder.start(
-                volume_node       = vol,
-                segmentation_name = seg.GetName() if seg else None,
-                volume_sequences  = self._volume_sequence_metadata(),
+                volume_node           = vol,
+                segmentation_name     = seg.GetName() if seg else None,
+                volume_sequences      = self._volume_sequence_metadata(),
+                initial_overwrite_mode= {
+                    'mode':       _ow_key,
+                    'mode_label': self.ui.overwriteModeDropdown.itemText(_ow_idx),
+                },
             )
             self._set_prompt_place_states(place_states)
 
@@ -1023,7 +1063,11 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         enabled = not locked
         for name in ('brushToolButton', 'eraseToolButton',
                      'addSegmentButton', 'removeSegmentButton',
-                     'positivePrompts', 'negativePrompts'):
+                     'positivePrompts', 'negativePrompts',
+                     'spxBrushToolButton', 'spxEraseToolButton',
+                     'fillHoleButton',
+                     'modelFamilyDropdown', 'modelVariantDropdown',
+                     'paramTextEdit'):
             w = getattr(self.ui, name, None)
             if w is not None:
                 w.setEnabled(enabled)
@@ -1717,8 +1761,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # Cache the active handler before creation, detach cleanly, then restore.
         # Suppress place-mode signals during creation so setCurrentNode calls inside
         # _set_prompt_nodes don't spuriously re-activate the wrong widget.
-        prev_was_point  = isinstance(self._active_handler, PointHandler)
-        prev_stroke_cls = type(self._active_handler) if isinstance(self._active_handler, StrokeHandler) else None
+        prev_was_point    = isinstance(self._active_handler, PointHandler)
+        prev_stroke_handler = self._active_handler if isinstance(self._active_handler, StrokeHandler) else None
         prev_prompt_widget = self._active_prompt_widget if prev_was_point else None
         if prev_was_point and prev_prompt_widget is None:
             raise RuntimeError('_onAddSegment: PointHandler active with no _active_prompt_widget')
@@ -1732,8 +1776,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                     self.ui.segmentSelector.setCurrentSegmentID(new_id)
         finally:
             self._suppressing_place_mode = False
-            if prev_stroke_cls is not None:
-                prev_stroke_cls().attach(self)
+            if prev_stroke_handler is not None:
+                prev_stroke_handler.attach(self)
             elif prev_was_point:
                 for child in prev_prompt_widget.findChildren(qt.QWidget):
                     if hasattr(child, 'setPlaceModeEnabled'):
@@ -1754,8 +1798,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # Removing markup nodes from the scene while they are wired to the prompt
         # widgets fires activeMarkupsFiducialPlaceModeChanged, which would
         # otherwise install a PointHandler and discard whatever tool was active.
-        prev_was_point  = isinstance(self._active_handler, PointHandler)
-        prev_stroke_cls = type(self._active_handler) if isinstance(self._active_handler, StrokeHandler) else None
+        prev_was_point      = isinstance(self._active_handler, PointHandler)
+        prev_stroke_handler = self._active_handler if isinstance(self._active_handler, StrokeHandler) else None
         prev_prompt_widget = self._active_prompt_widget if prev_was_point else None
         if prev_was_point and prev_prompt_widget is None:
             raise RuntimeError('_onRemoveSegment: PointHandler active with no _active_prompt_widget')
@@ -1776,8 +1820,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                     self.ui.segmentSelector.setCurrentSegmentID(next_id)
         finally:
             self._suppressing_place_mode = False
-            if prev_stroke_cls is not None:
-                prev_stroke_cls().attach(self)
+            if prev_stroke_handler is not None:
+                prev_stroke_handler.attach(self)
             elif prev_was_point:
                 if next_id:
                     for child in prev_prompt_widget.findChildren(qt.QWidget):
@@ -1817,8 +1861,8 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if editor and editor.currentSegmentID() != segmentID:
             editor.setCurrentSegmentID(segmentID)
         self.logic.set_saved_segments_visibility(seg, segmentID,
-                                                 self._savedSegmentsVisible)
-        self._currentSegmentVisible = True
+                                                 self._saved_segments_visible)
+        self._current_segment_visible = True
         self.logic.set_segment_visibility(seg, segmentID, True)
         self.ui.showCurrentSegmentCheckBox.blockSignals(True)
         self.ui.showCurrentSegmentCheckBox.setChecked(True)
@@ -1828,18 +1872,225 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     # Brush / Erase tools                                                  #
     # ------------------------------------------------------------------ #
 
+    # MaskMode integers from vtkMRMLSegmentEditorNode.h (not exposed as Python class attrs)
+    _MASK_MODE_EVERYWHERE          = 0  # PaintAllowedEverywhere
+    _MASK_MODE_OUTSIDE_ALL         = 3  # PaintAllowedOutsideAllSegments
+
     def _applyOverwriteMode(self):
         pn_ed = slicer.mrmlScene.GetSingletonNode('SegmentEditor', 'vtkMRMLSegmentEditorNode')
         if not pn_ed:
             return
-        cls   = slicer.vtkMRMLSegmentEditorNode
-        modes = [cls.OverwriteNone, cls.OverwriteVisibleSegments, cls.OverwriteAllSegments]
-        idx   = self.ui.overwriteModeDropdown.currentIndex
-        mode  = modes[idx] if 0 <= idx < len(modes) else cls.OverwriteNone
-        pn_ed.SetOverwriteMode(mode)
+        cls = slicer.vtkMRMLSegmentEditorNode
+        idx = self.ui.overwriteModeDropdown.currentIndex
+        if idx == 1:   # Aggressive
+            pn_ed.SetMaskMode(self._MASK_MODE_EVERYWHERE)
+            pn_ed.SetOverwriteMode(cls.OverwriteAllSegments)
+        elif idx == 2:  # Defensive — restrict to voxels outside all other segments
+            pn_ed.SetMaskMode(self._MASK_MODE_OUTSIDE_ALL)
+            pn_ed.SetOverwriteMode(cls.OverwriteNone)
+        else:           # Coexist (idx == 0 or fallback)
+            pn_ed.SetMaskMode(self._MASK_MODE_EVERYWHERE)
+            pn_ed.SetOverwriteMode(cls.OverwriteNone)
+
+    # ------------------------------------------------------------------ #
+    # Model selection — auto-confirm, dep-filtered dropdowns             #
+    # ------------------------------------------------------------------ #
+
+    def _available_families(self):
+        """Return list of (display_name, family_cls) with satisfied deps."""
+        result = []
+        for name, cls in FAMILY_REGISTRY.items():
+            reqs = getattr(cls, 'REQUIRES_DISTRIBUTIONS', ())
+            if not reqs:
+                result.append((name, cls))
+                continue
+            from core._deps import DependencyCheck
+            ok = all(DependencyCheck.check_distribution(d, min_version=v)[0]
+                     for d, v in reqs)
+            if ok:
+                result.append((name, cls))
+        return result
+
+    def _available_variants(self, family_cls):
+        """Return list of variant names with satisfied model deps."""
+        model_map = getattr(family_cls, 'MODEL_MAP', None)
+        if model_map is None:
+            return list(getattr(family_cls, 'VARIANTS', []))
+        return [v for v, k in model_map.items() if ModelRegistry.is_model_available(k)]
+
+    def initializeModelUI(self):
+        """Populate the family dropdown with available families."""
+        dd = self.ui.modelFamilyDropdown
+        dd.blockSignals(True)
+        dd.clear()
+        self._family_display_names = []
+        for name, _cls in self._available_families():
+            dd.addItem(name)
+            self._family_display_names.append(name)
+        dd.blockSignals(False)
+
+    def onModelFamilyChanged(self, _index=None):
+        dd = self.ui.modelFamilyDropdown
+        name = dd.currentText
+        family_cls = FAMILY_REGISTRY.get(name)
+        if family_cls is None:
+            return
+        self.modelFamily = family_cls()
+        self.updateModelVariants(family_cls)
+        self._autoConfirmCurrentSelection()
+        self.updateUIVisibility()
+
+    def updateModelVariants(self, family_cls):
+        dd = self.ui.modelVariantDropdown
+        dd.blockSignals(True)
+        dd.clear()
+        variants = self._available_variants(family_cls)
+        for v in variants:
+            dd.addItem(v)
+        dd.setVisible(bool(variants))
+        dd.blockSignals(False)
+
+    def onVariantChanged(self, _index=None):
+        self._autoConfirmCurrentSelection()
+
+    def _autoConfirmCurrentSelection(self):
+        family_cls = FAMILY_REGISTRY.get(self.ui.modelFamilyDropdown.currentText)
+        if family_cls is None:
+            return
+        variant = self.ui.modelVariantDropdown.currentText or None
+        self.modelFamily = family_cls(variant)
+        try:
+            self.modelFamily.confirm_model()
+        except Exception:
+            pass  # family has no model (e.g. SAM stub) — proceed without confirmed model
+        self._update_param_hint()
+        self._update_doc_link()
+        self.updateUIVisibility()
+        if self._recorder.is_active:
+            family_name = self.ui.modelFamilyDropdown.currentText
+            self._recorder.record_model_confirmed(family_name, variant or '')
+
+    def _update_param_hint(self):
+        if not hasattr(self.ui, 'paramTextEdit'):
+            return
+        hint = ''
+        model_map = getattr(type(self.modelFamily), 'MODEL_MAP', None)
+        if model_map:
+            variant = self.ui.modelVariantDropdown.currentText
+            key = model_map.get(variant)
+            if key:
+                hint = ModelRegistry.get_param_hint(key)
+        if hint:
+            self.ui.paramTextEdit.setPlaceholderText(hint)
+
+    def _update_doc_link(self):
+        if not hasattr(self.ui, 'docLinkLabel'):
+            return
+        self.ui.docLinkLabel.setText('')
+
+    def updateUIVisibility(self):
+        """Show/hide SPX-specific buttons based on the active family."""
+        visible = getattr(type(self.modelFamily), 'VISIBLE_BUTTONS', frozenset())
+        spx_buttons = ('spxBrushToolButton', 'spxEraseToolButton', 'showSPXBoundaryCheckBox')
+        for btn_name in spx_buttons:
+            w = getattr(self.ui, btn_name, None)
+            if w:
+                w.setVisible(btn_name in visible)
+
+    def getUserParameters(self):
+        """Parse user parameter text into a dict."""
+        if not hasattr(self.ui, 'paramTextEdit'):
+            return {}
+        return parse_user_parameters(self.ui.paramTextEdit.toPlainText()) or {}
+
+    # ------------------------------------------------------------------ #
+    # SPX boundary overlay                                                #
+    # ------------------------------------------------------------------ #
+
+    def _spx_boundary_node_for(self, volume):
+        if volume is None:
+            return None
+        return slicer.mrmlScene.GetFirstNodeByName(f'SPX_Boundary_{volume.GetID()}')
+
+    def _get_spx_boundary_visibility(self, volume):
+        node = self._spx_boundary_node_for(volume)
+        if node is None:
+            return False
+        dn = node.GetDisplayNode()
+        return bool(dn and dn.GetVisibility())
+
+    def _ensure_spx_boundary_node(self, volume):
+        if volume is None:
+            return None
+        node = self._spx_boundary_node_for(volume)
+        if node is None:
+            node = slicer.mrmlScene.AddNewNodeByClass(
+                'vtkMRMLLabelMapVolumeNode', f'SPX_Boundary_{volume.GetID()}')
+        return node
+
+    def _paint_spx_boundary(self, volume):
+        if not volume:
+            return
+        if not isinstance(self.modelFamily, SPXModelFamily) or not self.modelFamily.model:
+            return
+        from core._logic import compute_spx_boundary_for_volume
+        boundary_node = self._ensure_spx_boundary_node(volume)
+        compute_spx_boundary_for_volume(self, volume, boundary_node)
+
+    def _pin_spx_boundary_to_view(self, view_name, volume=None):
+        if volume is None:
+            editor = self.logic.get_segment_editor()
+            volume = editor.sourceVolumeNode() if editor else None
+        if volume is None:
+            volume = self.ui.sourceVolumeSelector.currentNode()
+        boundary_node = self._spx_boundary_node_for(volume)
+        if boundary_node is None:
+            return
+        lm = slicer.app.layoutManager()
+        if lm is None:
+            return
+        for vn in ('Red', 'Green', 'Yellow'):
+            sw = lm.sliceWidget(vn)
+            if sw:
+                sw.sliceLogic().GetSliceCompositeNode().SetLabelVolumeID(
+                    boundary_node.GetID())
+
+    def onToggleSPXBoundary(self, checked):
+        volume = self.ui.sourceVolumeSelector.currentNode()
+        if checked:
+            self._paint_spx_boundary(volume)
+            self._pin_spx_boundary_to_view(self.currentViewName, volume=volume)
+        else:
+            boundary_node = self._spx_boundary_node_for(volume)
+            lm = slicer.app.layoutManager()
+            if lm:
+                for vn in ('Red', 'Green', 'Yellow'):
+                    sw = lm.sliceWidget(vn)
+                    if sw:
+                        comp = sw.sliceLogic().GetSliceCompositeNode()
+                        if boundary_node and comp.GetLabelVolumeID() == boundary_node.GetID():
+                            comp.SetLabelVolumeID(None)
+        if self._recorder.is_active:
+            slice_idx = None
+            self._recorder.record_spx_boundary_toggled(
+                visible=checked, view=self.currentViewName,
+                slice_idx=slice_idx,
+                model_key=getattr(self.modelFamily, '_get_model_key', lambda: '')(),
+            )
+
+    def _resolveActiveView(self):
+        """Return the last interacted slice view name (Red/Green/Yellow)."""
+        return self.currentViewName
+
+    _OVERWRITE_MODE_KEYS = ('OverwriteNone', 'OverwriteAllSegments', 'PaintAllowedOutsideAllSegments')
 
     def _onOverwriteModeChanged(self, _index):
         self._applyOverwriteMode()
+        idx = self.ui.overwriteModeDropdown.currentIndex
+        mode_label = self.ui.overwriteModeDropdown.itemText(idx) if idx >= 0 else ''
+        mode_key   = (self._OVERWRITE_MODE_KEYS[idx]
+                      if 0 <= idx < len(self._OVERWRITE_MODE_KEYS) else 'OverwriteNone')
+        self._recorder.record_overwrite_mode_changed(mode_label, mode_key)
 
     def _onPlaceModeChanged(self, active, src_widget):
         if self._suppressing_place_mode:
@@ -1847,23 +2098,75 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if active:
             self._deactivateEffect()
             self._active_prompt_widget = src_widget
-            PointHandler().attach(self)
-        elif isinstance(self._active_handler, PointHandler):
+            self._handler_point.attach(self)
+        elif self._active_handler is self._handler_point:
             self._active_handler.detach(self)
             self._active_prompt_widget = None
 
-    def _onStrokeToggled(self, handler_cls, checked):
+    def _onStrokeToggled(self, handler, checked):
         if checked:
-            handler_cls().attach(self)
+            handler.attach(self)
             self._applyOverwriteMode()
-        elif isinstance(self._active_handler, handler_cls):
+        elif self._active_handler is handler:
             self._active_handler.detach(self)
 
     def _onBrushToggled(self, checked):
-        self._onStrokeToggled(BrushHandler, checked)
+        self._onStrokeToggled(self._handler_brush_2d, checked)
 
     def _onEraseToggled(self, checked):
-        self._onStrokeToggled(EraseHandler, checked)
+        self._onStrokeToggled(self._handler_erase_2d, checked)
+
+    def _onSpxBrushToggle(self, checked):
+        if checked:
+            self._handler_spx_brush.attach(self)
+        elif self._active_handler is self._handler_spx_brush:
+            self._active_handler.detach(self)
+
+    def _onSpxEraseToggle(self, checked):
+        if checked:
+            self._handler_spx_erase.attach(self)
+        elif self._active_handler is self._handler_spx_erase:
+            self._active_handler.detach(self)
+
+    def _onSpxParamsChanged(self):
+        """Deactivate the active SPX tool when parameters change.
+
+        Forces the user to re-click the SPX button, which re-triggers
+        labelmap pre-expansion and ensures the new parameters take effect.
+        Also clears the per-handler label cache to avoid stale SPX maps.
+        """
+        ah = self._active_handler
+        if ah is self._handler_spx_brush or ah is self._handler_spx_erase:
+            ah.detach(self)
+        self._handler_spx_brush._spx_label_cache.clear()
+        self._handler_spx_erase._spx_label_cache.clear()
+
+    def _onFillHoleClicked(self):
+        if not self.ui.segmentSelector.currentSegmentID():
+            slicer.util.warningDisplay('Fill hole: no active segment selected.')
+            return
+        from core._logic import fill_hole_2d as _fill_hole_2d
+        _fill_hole_2d(self)
+
+    def _activateBrushFromHotkey(self):
+        if not self._audio_only_mode:
+            self.ui.brushToolButton.setChecked(True)
+
+    def _activateEraseFromHotkey(self):
+        if not self._audio_only_mode:
+            self.ui.eraseToolButton.setChecked(True)
+
+    def _activatePosPointFromHotkey(self):
+        if not self._audio_only_mode and hasattr(self.ui, 'positivePrompts'):
+            self.ui.positivePrompts.setVisible(not self.ui.positivePrompts.isVisible())
+
+    def _activateNegPointFromHotkey(self):
+        if not self._audio_only_mode and hasattr(self.ui, 'negativePrompts'):
+            self.ui.negativePrompts.setVisible(not self.ui.negativePrompts.isVisible())
+
+    def _toggleSPXBoundaryFromHotkey(self):
+        cb = self.ui.showSPXBoundaryCheckBox
+        cb.setChecked(not cb.isChecked())
 
     def _borrowEffectsOptionsFrame(self):
         """Move the Segment Editor's EffectsOptionsFrame into our panel.
@@ -1994,17 +2297,46 @@ class SegmentHumanBodyWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     # Segment visibility                                                   #
     # ------------------------------------------------------------------ #
 
-    def _onToggleCurrentSegment(self, visible):
-        self._currentSegmentVisible = visible
+    def onToggleCurrentSegment(self, visible=None):
+        if visible is None:
+            visible = not self._current_segment_visible
+        self._current_segment_visible = visible
         seg   = self.ui.segmentationNodeSelector.currentNode()
         segID = self.ui.segmentSelector.currentSegmentID()
-        self.logic.set_segment_visibility(seg, segID, visible)
+        if seg and segID:
+            dn = seg.GetDisplayNode()
+            if dn:
+                dn.SetSegmentVisibility(segID, visible)
+        self._sync_annotation_visibility()
+
+    def _onToggleCurrentSegment(self, visible):
+        self.onToggleCurrentSegment(visible=visible)
+
+    def onToggleSavedSegments(self, visible=None):
+        if visible is None:
+            visible = not self._saved_segments_visible
+        self._saved_segments_visible = visible
+        segID = self.ui.segmentSelector.currentSegmentID()
+        self._apply_saved_segments_visibility(exclude=segID)
 
     def _onToggleSavedSegments(self, visible):
-        self._savedSegmentsVisible = visible
-        seg   = self.ui.segmentationNodeSelector.currentNode()
-        segID = self.ui.segmentSelector.currentSegmentID()
-        self.logic.set_saved_segments_visibility(seg, segID, visible)
+        self.onToggleSavedSegments(visible=visible)
+
+    def _apply_saved_segments_visibility(self, exclude=None):
+        seg = self.ui.segmentationNodeSelector.currentNode()
+        if not seg:
+            return
+        dn = seg.GetDisplayNode()
+        if not dn:
+            return
+        segmentation = seg.GetSegmentation()
+        for i in range(segmentation.GetNumberOfSegments()):
+            sid = segmentation.GetNthSegmentID(i)
+            if sid != exclude:
+                dn.SetSegmentVisibility(sid, self._saved_segments_visible)
+
+    def _sync_annotation_visibility(self):
+        pass
 
 
 #
@@ -2320,6 +2652,8 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
 
         Only fires the heavyweight setters when the value actually changed so
         that Slicer's slice-refitting pipeline is not re-queued on every click.
+        segment_id is always set unconditionally after node changes because
+        setSegmentationNode can fire deferred signals that reset currentSegmentID.
         """
         if not editor or not vol or not seg:
             return
@@ -2329,7 +2663,7 @@ class SegmentHumanBodyLogic(ScriptedLoadableModuleLogic):
             editor.setSourceVolumeNode(vol)
         editor.setUndoEnabled(True)
         editor.setMaximumNumberOfUndoStates(50)
-        if segment_id and editor.currentSegmentID() != segment_id:
+        if segment_id:
             editor.setCurrentSegmentID(segment_id)
 
     # ------------------------------------------------------------------ #

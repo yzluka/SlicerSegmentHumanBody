@@ -20,6 +20,7 @@
       <property name="contentsMargins">
        <number>4</number><number>4</number><number>4</number><number>4</number>
       </property>
+      <!-- Row 1: Record + mode checkboxes -->
       <item>
        <layout class="QHBoxLayout">
         <property name="spacing"><number>2</number></property>
@@ -27,29 +28,13 @@
          <widget class="QPushButton" name="recordToggleButton">
           <property name="text"><string>Record</string></property>
           <property name="toolTip"><string>Start or stop recording</string></property>
-          <property name="sizePolicy">
-           <sizepolicy hsizetype="Minimum" vsizetype="Fixed"/>
-          </property>
-         </widget>
-        </item>
-        <item>
-         <widget class="QPushButton" name="pauseRecordButton">
-          <property name="text"><string>Pause</string></property>
-          <property name="toolTip"><string>Pause or resume the current recording</string></property>
-          <property name="enabled"><bool>false</bool></property>
-          <property name="sizePolicy">
-           <sizepolicy hsizetype="Minimum" vsizetype="Fixed"/>
-          </property>
          </widget>
         </item>
         <item>
          <widget class="QCheckBox" name="recordMouseKeyCheckBox">
-          <property name="text"><string>Mouse+Key</string></property>
+          <property name="text"><string>M+K</string></property>
           <property name="checked"><bool>true</bool></property>
           <property name="toolTip"><string>Record mouse and keyboard events</string></property>
-          <property name="sizePolicy">
-           <sizepolicy hsizetype="Minimum" vsizetype="Fixed"/>
-          </property>
          </widget>
         </item>
         <item>
@@ -57,9 +42,19 @@
           <property name="text"><string>Audio</string></property>
           <property name="checked"><bool>true</bool></property>
           <property name="toolTip"><string>Record microphone audio. Check only this box for audio-only mode.</string></property>
-          <property name="sizePolicy">
-           <sizepolicy hsizetype="Minimum" vsizetype="Fixed"/>
-          </property>
+         </widget>
+        </item>
+       </layout>
+      </item>
+      <!-- Row 2: Pause + Export -->
+      <item>
+       <layout class="QHBoxLayout">
+        <property name="spacing"><number>2</number></property>
+        <item>
+         <widget class="QPushButton" name="pauseRecordButton">
+          <property name="text"><string>Pause</string></property>
+          <property name="toolTip"><string>Pause or resume the current recording</string></property>
+          <property name="enabled"><bool>false</bool></property>
          </widget>
         </item>
         <item>
@@ -67,19 +62,17 @@
           <property name="text"><string>Export</string></property>
           <property name="enabled"><bool>false</bool></property>
           <property name="toolTip"><string>Save recording to file</string></property>
-          <property name="sizePolicy">
-           <sizepolicy hsizetype="Minimum" vsizetype="Fixed"/>
-          </property>
          </widget>
         </item>
        </layout>
       </item>
+      <!-- Row 3: Audio device -->
       <item>
        <layout class="QHBoxLayout">
         <property name="spacing"><number>2</number></property>
         <item>
-         <widget class="QLabel" name="audioDeviceLabel">
-          <property name="text"><string>Device:</string></property>
+         <widget class="QLabel">
+          <property name="text"><string>Audio Input:</string></property>
           <property name="sizePolicy">
            <sizepolicy hsizetype="Minimum" vsizetype="Fixed"/>
           </property>
@@ -89,7 +82,7 @@
          <widget class="QComboBox" name="audioDeviceComboBox">
           <property name="toolTip"><string>Select microphone input device</string></property>
           <property name="sizeAdjustPolicy"><enum>QComboBox::AdjustToMinimumContentsLengthWithIcon</enum></property>
-          <property name="minimumContentsLength"><number>4</number></property>
+          <property name="minimumContentsLength"><number>0</number></property>
           <property name="sizePolicy">
            <sizepolicy hsizetype="Expanding" vsizetype="Fixed"/>
           </property>
@@ -107,236 +100,7 @@
     </widget>
    </item>
 
-   <!-- Model selection -->
-   <item>
-    <widget class="QLabel" name="label_1">
-     <property name="text"><string>Select the model:</string></property>
-    </widget>
-   </item>
-   <item>
-    <layout class="QHBoxLayout">
-     <property name="spacing"><number>2</number></property>
-     <item><widget class="QComboBox" name="modelFamilyDropdown"/></item>
-     <item>
-      <widget class="QComboBox" name="samMaskDropdown">
-       <property name="toolTip"><string>Select SAM output mask</string></property>
-      </widget>
-     </item>
-    </layout>
-   </item>
-   <item>
-    <layout class="QHBoxLayout">
-     <property name="spacing"><number>2</number></property>
-     <item><widget class="QComboBox" name="modelVariantDropdown"/></item>
-     <item>
-      <widget class="QPushButton" name="confirmModelSelection">
-       <property name="text"><string>Confirm Model</string></property>
-       <property name="sizePolicy">
-        <sizepolicy hsizetype="Minimum" vsizetype="Fixed"/>
-       </property>
-      </widget>
-     </item>
-    </layout>
-   </item>
-
-   <!-- Hyper-parameters -->
-   <item>
-    <widget class="QLabel" name="paramLabel">
-     <property name="text"><string>Hyper-Parameters (sample format):</string></property>
-     <property name="wordWrap"><bool>true</bool></property>
-    </widget>
-   </item>
-   <item>
-    <widget class="QPlainTextEdit" name="paramTextEdit">
-     <property name="placeholderText"><string>param1=value1, param2=value2</string></property>
-     <property name="sizePolicy">
-      <sizepolicy hsizetype="Expanding" vsizetype="Minimum"/>
-     </property>
-     <property name="minimumWidth"><number>0</number></property>
-    </widget>
-   </item>
-   <item>
-    <widget class="QLabel" name="docLinkLabel">
-     <property name="text"><string></string></property>
-    </widget>
-   </item>
-
-   <!-- Slice view -->
-   <item>
-    <layout class="QHBoxLayout">
-     <property name="spacing"><number>2</number></property>
-     <item>
-      <widget class="QLabel" name="label">
-       <property name="text"><string>Slice View:</string></property>
-       <property name="sizePolicy">
-        <sizepolicy hsizetype="Minimum" vsizetype="Fixed"/>
-       </property>
-      </widget>
-     </item>
-     <item><widget class="QComboBox" name="sliceViewDropdown"/></item>
-    </layout>
-   </item>
-
-   <!-- Annotation buttons -->
-   <item>
-    <layout class="QHBoxLayout">
-     <property name="spacing"><number>2</number></property>
-     <item>
-      <widget class="QPushButton" name="assignLabel2D">
-       <property name="text"><string>Assign Label (2D)</string></property>
-       <property name="sizePolicy">
-        <sizepolicy hsizetype="Minimum" vsizetype="Fixed"/>
-       </property>
-      </widget>
-     </item>
-     <item>
-      <widget class="QPushButton" name="assignLabel3D">
-       <property name="text"><string>Assign Label (3D)</string></property>
-       <property name="sizePolicy">
-        <sizepolicy hsizetype="Minimum" vsizetype="Fixed"/>
-       </property>
-      </widget>
-     </item>
-    </layout>
-   </item>
-   <item>
-    <widget class="QPushButton" name="goToMarkupsButton">
-     <property name="text"><string>Create Box Prompt</string></property>
-     <property name="sizePolicy">
-      <sizepolicy hsizetype="Minimum" vsizetype="Fixed"/>
-     </property>
-    </widget>
-   </item>
-   <item>
-    <layout class="QHBoxLayout">
-     <property name="spacing"><number>2</number></property>
-     <item>
-      <widget class="QPushButton" name="expandSelectedLabelButton">
-       <property name="text"><string>Expand (E)</string></property>
-       <property name="sizePolicy">
-        <sizepolicy hsizetype="Minimum" vsizetype="Fixed"/>
-       </property>
-      </widget>
-     </item>
-     <item>
-      <widget class="QCheckBox" name="showSPXBoundaryCheckBox">
-       <property name="text"><string>Show SPX</string></property>
-       <property name="sizePolicy">
-        <sizepolicy hsizetype="Minimum" vsizetype="Fixed"/>
-       </property>
-      </widget>
-     </item>
-     <item>
-      <widget class="QPushButton" name="runAutomaticSegmentation">
-       <property name="text"><string>Run Auto</string></property>
-       <property name="sizePolicy">
-        <sizepolicy hsizetype="Minimum" vsizetype="Fixed"/>
-       </property>
-      </widget>
-     </item>
-    </layout>
-   </item>
-   <item>
-    <widget class="QPushButton" name="exportAnnotationLogButton">
-     <property name="text"><string>Export Annotation Log</string></property>
-     <property name="toolTip"><string>Save all placed points with timestamps to a JSON file</string></property>
-     <property name="sizePolicy">
-      <sizepolicy hsizetype="Minimum" vsizetype="Fixed"/>
-     </property>
-    </widget>
-   </item>
-   <item>
-    <widget class="QPushButton" name="importAnnotationLogButton">
-     <property name="text"><string>Import Annotation Log</string></property>
-     <property name="toolTip"><string>Load a previously exported annotation log JSON and replay the points</string></property>
-     <property name="sizePolicy">
-      <sizepolicy hsizetype="Minimum" vsizetype="Fixed"/>
-     </property>
-    </widget>
-   </item>
-
    <!-- Volume / segmentation selectors -->
-   <item>
-    <widget class="QLabel" name="label_2">
-     <property name="text"><string>Select Image Volume and Segmentation Mask:</string></property>
-     <property name="wordWrap"><bool>true</bool></property>
-    </widget>
-   </item>
-
-   <!-- Window / Level -->
-   <item>
-    <widget class="QLabel" name="windowLevelLabel">
-     <property name="text"><string>Window / Level (for model input):</string></property>
-    </widget>
-   </item>
-   <item>
-    <layout class="QHBoxLayout">
-     <property name="spacing"><number>2</number></property>
-     <item>
-      <widget class="QLabel">
-       <property name="text"><string>W</string></property>
-       <property name="minimumWidth"><number>10</number></property>
-      </widget>
-     </item>
-     <item>
-      <widget class="QSlider" name="windowSlider">
-       <property name="orientation"><enum>Qt::Horizontal</enum></property>
-       <property name="minimum"><number>1</number></property>
-       <property name="maximum"><number>4000</number></property>
-       <property name="value"><number>400</number></property>
-       <property name="minimumWidth"><number>30</number></property>
-      </widget>
-     </item>
-     <item>
-      <widget class="QSpinBox" name="windowSpinBox">
-       <property name="minimum"><number>1</number></property>
-       <property name="maximum"><number>4000</number></property>
-       <property name="value"><number>400</number></property>
-       <property name="minimumWidth"><number>44</number></property>
-       <property name="maximumWidth"><number>52</number></property>
-      </widget>
-     </item>
-    </layout>
-   </item>
-   <item>
-    <layout class="QHBoxLayout">
-     <property name="spacing"><number>2</number></property>
-     <item>
-      <widget class="QLabel">
-       <property name="text"><string>L</string></property>
-       <property name="minimumWidth"><number>10</number></property>
-      </widget>
-     </item>
-     <item>
-      <widget class="QSlider" name="levelSlider">
-       <property name="orientation"><enum>Qt::Horizontal</enum></property>
-       <property name="minimum"><number>-1000</number></property>
-       <property name="maximum"><number>3000</number></property>
-       <property name="value"><number>40</number></property>
-       <property name="minimumWidth"><number>30</number></property>
-      </widget>
-     </item>
-     <item>
-      <widget class="QSpinBox" name="levelSpinBox">
-       <property name="minimum"><number>-1000</number></property>
-       <property name="maximum"><number>3000</number></property>
-       <property name="value"><number>40</number></property>
-       <property name="minimumWidth"><number>44</number></property>
-       <property name="maximumWidth"><number>52</number></property>
-      </widget>
-     </item>
-    </layout>
-   </item>
-   <item>
-    <widget class="QPushButton" name="applyWindowLevelButton">
-     <property name="text"><string>Apply Window / Level</string></property>
-     <property name="toolTip"><string>Confirm these W/L values for model inference. Original volume data is never modified.</string></property>
-     <property name="sizePolicy">
-      <sizepolicy hsizetype="Minimum" vsizetype="Fixed"/>
-     </property>
-    </widget>
-   </item>
-
    <item>
     <layout class="QHBoxLayout">
      <property name="spacing"><number>2</number></property>
@@ -355,7 +119,7 @@
      <item>
       <widget class="QPushButton" name="clearVolumesButton">
        <property name="text"><string>Clear</string></property>
-       <property name="toolTip"><string>Remove all loaded scalar volume nodes. Segmentations are left for manual deletion.</string></property>
+       <property name="toolTip"><string>Remove all loaded scalar volume nodes.</string></property>
        <property name="sizePolicy">
         <sizepolicy hsizetype="Minimum" vsizetype="Fixed"/>
        </property>
@@ -390,20 +154,20 @@
       <widget class="QPushButton" name="addSegmentButton">
        <property name="text"><string>+</string></property>
        <property name="toolTip"><string>Add new segment</string></property>
-       <property name="maximumWidth"><number>28</number></property>
+       <property name="maximumWidth"><number>24</number></property>
       </widget>
      </item>
      <item>
       <widget class="QPushButton" name="removeSegmentButton">
        <property name="text"><string>-</string></property>
        <property name="toolTip"><string>Remove selected segment</string></property>
-       <property name="maximumWidth"><number>28</number></property>
+       <property name="maximumWidth"><number>24</number></property>
       </widget>
      </item>
     </layout>
    </item>
 
-   <!-- Brush tools -->
+   <!-- Brush / Erase / Fill Hole tools -->
    <item>
     <layout class="QHBoxLayout">
      <property name="spacing"><number>2</number></property>
@@ -411,29 +175,35 @@
       <widget class="QPushButton" name="brushToolButton">
        <property name="text"><string>Brush</string></property>
        <property name="checkable"><bool>true</bool></property>
-       <property name="sizePolicy">
-        <sizepolicy hsizetype="Minimum" vsizetype="Fixed"/>
-       </property>
+       <property name="maximumWidth"><number>60</number></property>
       </widget>
      </item>
      <item>
       <widget class="QPushButton" name="eraseToolButton">
        <property name="text"><string>Erase</string></property>
        <property name="checkable"><bool>true</bool></property>
-       <property name="sizePolicy">
-        <sizepolicy hsizetype="Minimum" vsizetype="Fixed"/>
-       </property>
+       <property name="maximumWidth"><number>60</number></property>
       </widget>
      </item>
      <item>
-      <widget class="QComboBox" name="overwriteModeDropdown">
-       <property name="toolTip"><string>Controls whether the brush/erase can paint over other segments</string></property>
-       <item><property name="text"><string>No Overwrite</string></property></item>
-       <item><property name="text"><string>Ovr Visible</string></property></item>
-       <item><property name="text"><string>Ovr All</string></property></item>
+      <widget class="QPushButton" name="fillHoleButton">
+       <property name="text"><string>Fill Hole</string></property>
+       <property name="toolTip"><string>Fill enclosed holes in the current segment on the active slice</string></property>
+       <property name="maximumWidth"><number>60</number></property>
       </widget>
      </item>
     </layout>
+   </item>
+   <!-- Overwrite mode: full-width row -->
+   <item>
+    <widget class="QComboBox" name="overwriteModeDropdown">
+     <property name="toolTip"><string>Controls how the brush/erase interacts with other segments</string></property>
+     <property name="sizeAdjustPolicy"><enum>QComboBox::AdjustToMinimumContentsLengthWithIcon</enum></property>
+     <property name="minimumContentsLength"><number>0</number></property>
+     <item><property name="text"><string>Coexist — never erase others</string></property></item>
+     <item><property name="text"><string>Aggressive — overwrite all</string></property></item>
+     <item><property name="text"><string>Defensive — blank areas only</string></property></item>
+    </widget>
    </item>
    <item>
     <widget class="QFrame" name="brushOptionsContainer">
@@ -450,18 +220,237 @@
 
    <!-- Visibility toggles -->
    <item>
-    <widget class="QCheckBox" name="showCurrentSegmentCheckBox">
-     <property name="text"><string>Show Current Seg (Q)</string></property>
-     <property name="checked"><bool>true</bool></property>
-     <property name="toolTip"><string>Toggle visibility of the segment currently being edited (hotkey: Q)</string></property>
+    <layout class="QHBoxLayout">
+     <property name="spacing"><number>4</number></property>
+     <item>
+      <widget class="QCheckBox" name="showCurrentSegmentCheckBox">
+       <property name="text"><string>Show Current (V)</string></property>
+       <property name="checked"><bool>true</bool></property>
+       <property name="toolTip"><string>Toggle visibility of the active segment (hotkey: V)</string></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QCheckBox" name="showSegmentsCheckBox">
+       <property name="text"><string>Show Other (Q)</string></property>
+       <property name="checked"><bool>false</bool></property>
+       <property name="toolTip"><string>Show/hide all other segments (hotkey: Q)</string></property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+
+   <!-- Assistive model label + dropdowns -->
+   <item>
+    <widget class="QLabel">
+     <property name="text"><string>Assistive model:</string></property>
     </widget>
    </item>
    <item>
-    <widget class="QCheckBox" name="showSegmentsCheckBox">
-     <property name="text"><string>Show Saved Segments (S)</string></property>
-     <property name="checked"><bool>false</bool></property>
-     <property name="toolTip"><string>Show/hide all segments except the one currently being edited (hotkey: S).</string></property>
+    <layout class="QHBoxLayout">
+     <property name="spacing"><number>2</number></property>
+     <item>
+      <widget class="QComboBox" name="modelFamilyDropdown">
+       <property name="sizeAdjustPolicy"><enum>QComboBox::AdjustToMinimumContentsLengthWithIcon</enum></property>
+       <property name="minimumContentsLength"><number>0</number></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QComboBox" name="samMaskDropdown">
+       <property name="toolTip"><string>Select SAM output mask</string></property>
+       <property name="sizeAdjustPolicy"><enum>QComboBox::AdjustToMinimumContentsLengthWithIcon</enum></property>
+       <property name="minimumContentsLength"><number>0</number></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QComboBox" name="modelVariantDropdown">
+       <property name="sizeAdjustPolicy"><enum>QComboBox::AdjustToMinimumContentsLengthWithIcon</enum></property>
+       <property name="minimumContentsLength"><number>0</number></property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+
+   <!-- Hyper-parameters: short fixed-height box -->
+   <item>
+    <widget class="QPlainTextEdit" name="paramTextEdit">
+     <property name="placeholderText"><string>param1=value1, param2=value2</string></property>
+     <property name="sizePolicy">
+      <sizepolicy hsizetype="Preferred" vsizetype="Fixed"/>
+     </property>
+     <property name="maximumHeight"><number>48</number></property>
     </widget>
+   </item>
+   <item>
+    <widget class="QLabel" name="docLinkLabel">
+     <property name="text"><string></string></property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QLabel" name="paramLabel">
+     <property name="text"><string></string></property>
+     <property name="visible"><bool>false</bool></property>
+    </widget>
+   </item>
+
+   <!-- Window / Level -->
+   <item>
+    <widget class="QLabel" name="windowLevelLabel">
+     <property name="text"><string>Window / Level:</string></property>
+    </widget>
+   </item>
+   <item>
+    <layout class="QHBoxLayout">
+     <property name="spacing"><number>2</number></property>
+     <item>
+      <widget class="QLabel">
+       <property name="text"><string>W</string></property>
+       <property name="maximumWidth"><number>12</number></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QSlider" name="windowSlider">
+       <property name="orientation"><enum>Qt::Horizontal</enum></property>
+       <property name="minimum"><number>1</number></property>
+       <property name="maximum"><number>4000</number></property>
+       <property name="value"><number>400</number></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QSpinBox" name="windowSpinBox">
+       <property name="minimum"><number>1</number></property>
+       <property name="maximum"><number>4000</number></property>
+       <property name="value"><number>400</number></property>
+       <property name="maximumWidth"><number>52</number></property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <layout class="QHBoxLayout">
+     <property name="spacing"><number>2</number></property>
+     <item>
+      <widget class="QLabel">
+       <property name="text"><string>L</string></property>
+       <property name="maximumWidth"><number>12</number></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QSlider" name="levelSlider">
+       <property name="orientation"><enum>Qt::Horizontal</enum></property>
+       <property name="minimum"><number>-1000</number></property>
+       <property name="maximum"><number>3000</number></property>
+       <property name="value"><number>40</number></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QSpinBox" name="levelSpinBox">
+       <property name="minimum"><number>-1000</number></property>
+       <property name="maximum"><number>3000</number></property>
+       <property name="value"><number>40</number></property>
+       <property name="maximumWidth"><number>52</number></property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <widget class="QPushButton" name="applyWindowLevelButton">
+     <property name="text"><string>Apply W/L</string></property>
+     <property name="toolTip"><string>Confirm these W/L values for model inference. Original volume data is never modified.</string></property>
+    </widget>
+   </item>
+
+   <!-- Slice view -->
+   <item>
+    <layout class="QHBoxLayout">
+     <property name="spacing"><number>2</number></property>
+     <item>
+      <widget class="QLabel" name="label">
+       <property name="text"><string>View:</string></property>
+       <property name="sizePolicy">
+        <sizepolicy hsizetype="Minimum" vsizetype="Fixed"/>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QComboBox" name="sliceViewDropdown">
+       <property name="sizeAdjustPolicy"><enum>QComboBox::AdjustToMinimumContentsLengthWithIcon</enum></property>
+       <property name="minimumContentsLength"><number>0</number></property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+
+   <!-- SPX tools -->
+   <item>
+    <layout class="QHBoxLayout">
+     <property name="spacing"><number>2</number></property>
+     <item>
+      <widget class="QPushButton" name="spxBrushToolButton">
+       <property name="text"><string>SPX Brush</string></property>
+       <property name="checkable"><bool>true</bool></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="spxEraseToolButton">
+       <property name="text"><string>SPX Erase</string></property>
+       <property name="checkable"><bool>true</bool></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QCheckBox" name="showSPXBoundaryCheckBox">
+       <property name="text"><string>Boundary (E)</string></property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+
+   <!-- Annotation buttons (family-specific, hidden by default) -->
+   <item>
+    <layout class="QHBoxLayout">
+     <property name="spacing"><number>2</number></property>
+     <item>
+      <widget class="QPushButton" name="assignLabel2D">
+       <property name="text"><string>Assign 2D</string></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="assignLabel3D">
+       <property name="text"><string>Assign 3D</string></property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <layout class="QHBoxLayout">
+     <property name="spacing"><number>2</number></property>
+     <item>
+      <widget class="QPushButton" name="goToMarkupsButton">
+       <property name="text"><string>Box Prompt</string></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="runAutomaticSegmentation">
+       <property name="text"><string>Run Auto</string></property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <layout class="QHBoxLayout">
+     <property name="spacing"><number>2</number></property>
+     <item>
+      <widget class="QPushButton" name="exportAnnotationLogButton">
+       <property name="text"><string>Export Log</string></property>
+       <property name="toolTip"><string>Save all placed points with timestamps to a JSON file</string></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="importAnnotationLogButton">
+       <property name="text"><string>Import Log</string></property>
+       <property name="toolTip"><string>Load a previously exported annotation log JSON and replay the points</string></property>
+      </widget>
+     </item>
+    </layout>
    </item>
 
    <!-- Prompts -->
@@ -533,6 +522,36 @@
    <sender>SegmentHumanBody</sender>
    <signal>mrmlSceneChanged(vtkMRMLScene*)</signal>
    <receiver>negativePrompts</receiver>
+   <slot>setMRMLScene(vtkMRMLScene*)</slot>
+   <hints>
+    <hint type="sourcelabel"><x>20</x><y>20</y></hint>
+    <hint type="destinationlabel"><x>20</x><y>20</y></hint>
+   </hints>
+  </connection>
+  <connection>
+   <sender>SegmentHumanBody</sender>
+   <signal>mrmlSceneChanged(vtkMRMLScene*)</signal>
+   <receiver>segmentationNodeSelector</receiver>
+   <slot>setMRMLScene(vtkMRMLScene*)</slot>
+   <hints>
+    <hint type="sourcelabel"><x>20</x><y>20</y></hint>
+    <hint type="destinationlabel"><x>20</x><y>20</y></hint>
+   </hints>
+  </connection>
+  <connection>
+   <sender>SegmentHumanBody</sender>
+   <signal>mrmlSceneChanged(vtkMRMLScene*)</signal>
+   <receiver>segmentSelector</receiver>
+   <slot>setMRMLScene(vtkMRMLScene*)</slot>
+   <hints>
+    <hint type="sourcelabel"><x>20</x><y>20</y></hint>
+    <hint type="destinationlabel"><x>20</x><y>20</y></hint>
+   </hints>
+  </connection>
+  <connection>
+   <sender>SegmentHumanBody</sender>
+   <signal>mrmlSceneChanged(vtkMRMLScene*)</signal>
+   <receiver>sourceVolumeSelector</receiver>
    <slot>setMRMLScene(vtkMRMLScene*)</slot>
    <hints>
     <hint type="sourcelabel"><x>20</x><y>20</y></hint>

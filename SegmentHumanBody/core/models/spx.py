@@ -48,6 +48,7 @@ class SPX_Tester2D(SPXModel):
 
     DOC_URL = None
     PARAM_HINT = 'gh=9, gw=9'
+    REQUIRES_DISTRIBUTIONS: tuple = ()
 
     def forward(self, img: np.ndarray, **kwargs) -> np.ndarray:
         H, W = img.shape[:2]
@@ -66,6 +67,7 @@ class SPX_SLIC2D(SPXModel):
 
     DOC_URL = "https://scikit-image.org/docs/stable/api/skimage.segmentation.html#skimage.segmentation.slic"
     PARAM_HINT = "n_segments=100, compactness=10, sigma=1"
+    REQUIRES_DISTRIBUTIONS: tuple = (('scikit-image', None),)
 
     def __init__(self):
         DependencyCheck.require_package('skimage', display_name='scikit-image')
@@ -87,6 +89,7 @@ class SPX_Felzenszwalb2D(SPXModel):
 
     DOC_URL = "https://scikit-image.org/docs/stable/api/skimage.segmentation.html#skimage.segmentation.felzenszwalb"
     PARAM_HINT = "scale=100, sigma=0.5, min_size=50"
+    REQUIRES_DISTRIBUTIONS: tuple = (('scikit-image', None),)
 
     def __init__(self):
         DependencyCheck.require_package('skimage', display_name='scikit-image')

@@ -11,6 +11,7 @@ class IdentityModel:
 
     PARAM_HINT = "No parameters. Returns the input image unchanged."
     DOC_URL = ""
+    REQUIRES_DISTRIBUTIONS: tuple = ()
 
     def forward(self, **kwargs):
         if "img" not in kwargs:

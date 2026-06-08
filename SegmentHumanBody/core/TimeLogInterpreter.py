@@ -194,6 +194,57 @@ class TimeLogInterpreter:
                     ev['id'] = export_id
                     export_id += 1
                     events.append(ev)
+
+            elif evt in ('model_family_changed', 'model_variant_changed', 'model_confirmed'):
+                ev = {'id': export_id, 'event': evt,
+                      'timestamp': raw.get('timestamp')}
+                for key in ('family', 'variant'):
+                    if raw.get(key) is not None:
+                        ev[key] = raw[key]
+                export_id += 1
+                events.append(ev)
+
+            elif evt == 'overwrite_mode_changed':
+                ev = {'id': export_id, 'event': 'overwrite_mode_change',
+                      'timestamp': raw.get('timestamp'),
+                      'mode': raw.get('mode', raw.get('mode_label', ''))}
+                if raw.get('mode_label'):
+                    ev['mode_label'] = raw['mode_label']
+                export_id += 1
+                events.append(ev)
+
+            elif evt in ('spx_brush_fill', 'spx_erase_fill'):
+                ev = {'id': export_id, 'event': evt,
+                      'timestamp': raw.get('timestamp')}
+                for key in ('label_id', 'delta_pixels', 'view', 'axis',
+                            'slice_idx', 'model_key', 'params',
+                            'segment_id', 'segmentation_id', 'volume_id',
+                            'operation', 'additive'):
+                    if raw.get(key) is not None:
+                        ev[key] = raw[key]
+                export_id += 1
+                events.append(ev)
+
+            elif evt == 'fill_hole':
+                ev = {'id': export_id, 'event': 'fill_hole',
+                      'timestamp': raw.get('timestamp')}
+                for key in ('view', 'axis', 'slice_idx', 'delta_pixels',
+                            'segment_id', 'segmentation_id', 'volume_id'):
+                    if raw.get(key) is not None:
+                        ev[key] = raw[key]
+                export_id += 1
+                events.append(ev)
+
+            elif evt == 'spx_boundary_toggled':
+                sub = 'spx_boundary_on' if raw.get('visible') else 'spx_boundary_off'
+                ev = {'id': export_id, 'event': sub,
+                      'timestamp': raw.get('timestamp')}
+                for key in ('view', 'slice_idx', 'model_key'):
+                    if raw.get(key) is not None:
+                        ev[key] = raw[key]
+                export_id += 1
+                events.append(ev)
+
             # point_drag_move, point_drag_start, segment_created/selected/renamed,
             # etc.: not in annotation-process log
 
@@ -554,4 +605,7 @@ def _compact_metadata(meta):
         out['move_thinning'] = meta['move_thinning']
     if meta.get('volume_sequences'):
         out['volume_sequences'] = list(meta['volume_sequences'])
+    out['initial_overwrite_mode'] = meta.get('initial_overwrite_mode') or {
+        'mode': 'OverwriteNone', 'mode_label': 'Coexist — never erase others',
+    }
     return out

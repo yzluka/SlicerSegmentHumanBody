@@ -52,6 +52,11 @@ POINT_DRAG_START       = 'point_drag_start'
 POINT_DRAG_MOVE        = 'point_drag_move'
 POINT_DRAG_END         = 'point_drag_end'
 TOOL_SELECTED          = 'tool_selected'
+SPX_BRUSH_FILL         = 'spx_brush_fill'
+SPX_ERASE_FILL         = 'spx_erase_fill'
+FILL_HOLE              = 'fill_hole'
+SPX_BOUNDARY_TOGGLED   = 'spx_boundary_toggled'
+OVERWRITE_MODE_CHANGED = 'overwrite_mode_changed'
 
 EXPORT_TYPE            = 'SegmentHumanBody.annotation_process'
 VTK_OBSERVER_PRIORITY  = 1000.0
@@ -300,7 +305,8 @@ class MouseEventRecorder:
         self._paused = False
 
     def start(self, volume_node=None, segmentation_name: str | None = None,
-              volume_sequences: list | None = None):
+              volume_sequences: list | None = None,
+              initial_overwrite_mode: dict | None = None):
         if self._active:
             return
         self._active = True
@@ -361,6 +367,10 @@ class MouseEventRecorder:
                     'view_changed events with visual_state during recording.'
                 ),
             },
+            'initial_overwrite_mode': (
+                initial_overwrite_mode
+                or {'mode': 'OverwriteNone', 'mode_label': ''}
+            ),
         }
         self._active_region_gate = _ActiveRegionGate(metadata)
         self._append(METADATA, None, metadata)
@@ -482,6 +492,55 @@ class MouseEventRecorder:
     def record_model_confirmed(self, family: str, variant: str):
         self._append(MODEL_CONFIRMED, None, {
             'family': family, 'variant': variant})
+
+    def record_overwrite_mode_changed(self, mode_label: str, mode_key: str):
+        self._append(OVERWRITE_MODE_CHANGED, None,
+                     {'mode': mode_key, 'mode_label': mode_label})
+
+    def record_spx_fill(self, *, additive, label_id, view, axis, slice_idx,
+                        delta_pixels, model_key, params, segment_id,
+                        segmentation_id, volume_id):
+        event_type = SPX_BRUSH_FILL if additive else SPX_ERASE_FILL
+        payload = {
+            'operation': 'spx_expand',
+            'additive': bool(additive),
+            'label_id': int(label_id),
+            'view': view,
+            'axis': axis,
+            'slice_idx': int(slice_idx),
+            'delta_pixels': int(delta_pixels) if delta_pixels is not None else None,
+            'model_key': model_key,
+            'params': dict(params or {}),
+            'segment_id': segment_id,
+            'segmentation_id': segmentation_id,
+            'volume_id': volume_id,
+            'analysis_event_type': BOUNDARY_EVENT,
+        }
+        self._append(event_type, None, payload)
+
+    def record_fill_hole(self, *, view, axis, slice_idx, delta_pixels,
+                         segment_id, segmentation_id, volume_id):
+        payload = {
+            'view': view,
+            'axis': axis,
+            'slice_idx': int(slice_idx),
+            'delta_pixels': int(delta_pixels) if delta_pixels is not None else None,
+            'segment_id': segment_id,
+            'segmentation_id': segmentation_id,
+            'volume_id': volume_id,
+            'analysis_event_type': BOUNDARY_EVENT,
+        }
+        self._append(FILL_HOLE, None, payload)
+
+    def record_spx_boundary_toggled(self, *, visible, view, slice_idx, model_key):
+        payload = {
+            'visible': bool(visible),
+            'view': view,
+            'slice_idx': int(slice_idx) if slice_idx is not None else None,
+            'model_key': model_key,
+            'analysis_event_type': BOUNDARY_EVENT,
+        }
+        self._append(SPX_BOUNDARY_TOGGLED, None, payload)
 
     def record_brush_diameter_changed(self, diameter_mm: float):
         payload = self._current_brush_param_payload()
@@ -1560,6 +1619,11 @@ _RAW_SOURCE_TYPES = (
     POINT_REMOVED,
     POINT_DRAG_START,
     POINT_DRAG_MOVE,
+    SPX_BRUSH_FILL,
+    SPX_ERASE_FILL,
+    FILL_HOLE,
+    SPX_BOUNDARY_TOGGLED,
+    OVERWRITE_MODE_CHANGED,
 )
 
 _INTERPRETED_TYPE_MAP = {
@@ -1716,7 +1780,9 @@ def _raw_event(record, context=None) -> dict | None:
             SEGMENT_SELECTED, VOLUME_CHANGED,
             MODEL_FAMILY_CHANGED, MODEL_VARIANT_CHANGED, MODEL_CONFIRMED,
             POINT_PLACED, POINT_REPLACED, POINT_REMOVED,
-            POINT_DRAG_START, POINT_DRAG_MOVE):
+            POINT_DRAG_START, POINT_DRAG_MOVE,
+            SPX_BRUSH_FILL, SPX_ERASE_FILL, FILL_HOLE, SPX_BOUNDARY_TOGGLED,
+            OVERWRITE_MODE_CHANGED):
         ev.setdefault('event_type', BOUNDARY_EVENT)
         _copy_raw_payload_fields(ev, payload)
         if record.event_type in (
@@ -1851,6 +1917,8 @@ def _copy_raw_payload_fields(ev, payload):
         ('point_drag_phase', 'point_drag_phase'),
         ('mouse_pressed', 'mouse_pressed'),
         ('sphere', 'sphere'),
+        ('mode', 'mode'),
+        ('mode_label', 'mode_label'),
     )
     if 'tool' in payload:
         ev['tool'] = payload.get('tool')
@@ -1861,6 +1929,14 @@ def _copy_raw_payload_fields(ev, payload):
     for src, dst in field_map:
         if src in payload and payload.get(src) is not None:
             ev[dst] = payload.get(src)
+    # SPX / fill-hole specific fields
+    for key in ('operation', 'additive', 'label_id', 'delta_pixels',
+                'model_key', 'params', 'axis', 'slice_idx', 'visible'):
+        if key in payload and payload.get(key) is not None:
+            ev[key] = payload[key]
+    # SPX events store view under 'view' (not 'view_name') — copy it directly.
+    if 'view' in payload and 'view' not in ev:
+        ev['view'] = payload['view']
     diameter_mm = _brush_diameter_mm(payload)
     if diameter_mm is not None:
         ev['diameter_mm'] = diameter_mm

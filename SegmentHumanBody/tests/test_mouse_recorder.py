@@ -1885,3 +1885,177 @@ def test_save_to_file_writes_raw_semantic_and_summary(tmp_path):
     assert json.loads(raw_path.read_text(encoding='utf-8'))['type'] == 'SegmentHumanBody.raw_input'
     assert json.loads(semantic_path.read_text(encoding='utf-8'))['type'] == 'SegmentHumanBody.annotation_process'
     assert 'click=(1,2,3)' in summary_path.read_text(encoding='utf-8')
+
+
+# ---------------------------------------------------------------------------
+# SPX / fill-hole recording
+# ---------------------------------------------------------------------------
+
+from core._mouse_recorder import (
+    SPX_BRUSH_FILL, SPX_ERASE_FILL, FILL_HOLE, SPX_BOUNDARY_TOGGLED,
+)
+
+
+def _make_active_recorder():
+    r = MouseEventRecorder(sample_rate_hz=60)
+    r._active = True
+    return r
+
+
+def test_record_spx_fill_brush_emits_spx_brush_fill_event():
+    r = _make_active_recorder()
+    r.record_spx_fill(
+        additive=True, label_id=3, view='Red', axis='ax', slice_idx=5,
+        delta_pixels=42, model_key='SPX_Tester2D', params={'gh': 9},
+        segment_id='seg-1', segmentation_id='seg-node-1', volume_id='vol-1',
+    )
+    assert len(r.records) == 1
+    rec = r.records[0]
+    assert rec.event_type == SPX_BRUSH_FILL
+    assert rec.payload['operation'] == 'spx_expand'
+    assert rec.payload['additive'] is True
+    assert rec.payload['label_id'] == 3
+    assert rec.payload['delta_pixels'] == 42
+    assert rec.payload['model_key'] == 'SPX_Tester2D'
+
+
+def test_record_spx_fill_erase_emits_spx_erase_fill_event():
+    r = _make_active_recorder()
+    r.record_spx_fill(
+        additive=False, label_id=7, view='Red', axis='ax', slice_idx=3,
+        delta_pixels=10, model_key='SPX_Tester2D', params={},
+        segment_id='seg-1', segmentation_id='seg-node-1', volume_id='vol-1',
+    )
+    assert r.records[0].event_type == SPX_ERASE_FILL
+    assert r.records[0].payload['additive'] is False
+
+
+def test_record_fill_hole_emits_fill_hole_event():
+    r = _make_active_recorder()
+    r.record_fill_hole(
+        view='Green', axis='cor', slice_idx=10, delta_pixels=200,
+        segment_id='seg-1', segmentation_id='seg-node-1', volume_id='vol-1',
+    )
+    assert len(r.records) == 1
+    rec = r.records[0]
+    assert rec.event_type == FILL_HOLE
+    assert rec.payload['view'] == 'Green'
+    assert rec.payload['slice_idx'] == 10
+    assert rec.payload['delta_pixels'] == 200
+
+
+def test_record_spx_boundary_toggled_visible_true():
+    r = _make_active_recorder()
+    r.record_spx_boundary_toggled(visible=True, view='Red', slice_idx=5, model_key='SPX_Tester2D')
+    assert len(r.records) == 1
+    rec = r.records[0]
+    assert rec.event_type == SPX_BOUNDARY_TOGGLED
+    assert rec.payload['visible'] is True
+
+
+def test_record_spx_boundary_toggled_visible_false():
+    r = _make_active_recorder()
+    r.record_spx_boundary_toggled(visible=False, view='Yellow', slice_idx=0, model_key='SPX_SLIC2D')
+    assert r.records[0].payload['visible'] is False
+
+
+def test_spx_record_methods_no_op_when_paused():
+    r = _make_active_recorder()
+    r._paused = True
+    r.record_spx_fill(
+        additive=True, label_id=1, view='Red', axis='ax', slice_idx=0,
+        delta_pixels=5, model_key='k', params={},
+        segment_id='s', segmentation_id='sn', volume_id='v',
+    )
+    r.record_fill_hole(
+        view='Red', axis='ax', slice_idx=0, delta_pixels=5,
+        segment_id='s', segmentation_id='sn', volume_id='v',
+    )
+    r.record_spx_boundary_toggled(visible=True, view='Red', slice_idx=0, model_key='k')
+    assert len(r.records) == 0
+
+
+def test_spx_brush_fill_appears_in_raw_export():
+    r = _make_active_recorder()
+    r.record_spx_fill(
+        additive=True, label_id=2, view='Red', axis='ax', slice_idx=5,
+        delta_pixels=15, model_key='SPX_Tester2D', params={'gh': 9},
+        segment_id='seg-1', segmentation_id='sn', volume_id='vol-1',
+    )
+    raw = r.export_raw_data()
+    events = raw['events']
+    assert len(events) == 1
+    assert events[0]['event'] == SPX_BRUSH_FILL
+    assert events[0]['operation'] == 'spx_expand'
+
+
+# ---------------------------------------------------------------------------
+# Overwrite mode recording
+# ---------------------------------------------------------------------------
+
+from core._mouse_recorder import OVERWRITE_MODE_CHANGED
+
+
+def test_record_overwrite_mode_changed_emits_event_with_stable_key_and_label():
+    r = _make_active_recorder()
+    r.record_overwrite_mode_changed('Aggressive — overwrite all', 'OverwriteAllSegments')
+    assert len(r.records) == 1
+    rec = r.records[0]
+    assert rec.event_type == OVERWRITE_MODE_CHANGED
+    assert rec.payload['mode'] == 'OverwriteAllSegments'
+    assert rec.payload['mode_label'] == 'Aggressive — overwrite all'
+
+
+def test_record_overwrite_mode_coexist():
+    r = _make_active_recorder()
+    r.record_overwrite_mode_changed('Coexist — never erase others', 'OverwriteNone')
+    rec = r.records[0]
+    assert rec.payload['mode'] == 'OverwriteNone'
+    assert rec.payload['mode_label'] == 'Coexist — never erase others'
+
+
+def test_record_overwrite_mode_defensive():
+    r = _make_active_recorder()
+    r.record_overwrite_mode_changed('Defensive — blank areas only', 'PaintAllowedOutsideAllSegments')
+    rec = r.records[0]
+    assert rec.payload['mode'] == 'PaintAllowedOutsideAllSegments'
+    assert rec.payload['mode_label'] == 'Defensive — blank areas only'
+
+
+def test_overwrite_mode_changed_appears_in_raw_export():
+    r = _make_active_recorder()
+    r.record_overwrite_mode_changed('Aggressive — overwrite all', 'OverwriteAllSegments')
+    events = r.export_raw_data()['events']
+    assert len(events) == 1
+    assert events[0]['event'] == OVERWRITE_MODE_CHANGED
+    assert events[0]['mode'] == 'OverwriteAllSegments'
+    assert events[0]['mode_label'] == 'Aggressive — overwrite all'
+
+
+def test_overwrite_mode_no_op_when_paused():
+    r = _make_active_recorder()
+    r._paused = True
+    r.record_overwrite_mode_changed('Aggressive — overwrite all', 'OverwriteAllSegments')
+    assert len(r.records) == 0
+
+
+def test_initial_overwrite_mode_stored_in_recording_metadata(monkeypatch):
+    monkeypatch.setattr(recorder_mod, '_all_slice_visual_state', lambda volume_node=None: {})
+    r = MouseEventRecorder()
+    r.start(
+        volume_node=None,
+        initial_overwrite_mode={'mode': 'OverwriteNone', 'mode_label': 'Coexist — never erase others'},
+    )
+    meta = r.export_raw_data()['metadata']
+    assert meta['initial_overwrite_mode'] == {
+        'mode': 'OverwriteNone',
+        'mode_label': 'Coexist — never erase others',
+    }
+
+
+def test_initial_overwrite_mode_defaults_when_omitted(monkeypatch):
+    monkeypatch.setattr(recorder_mod, '_all_slice_visual_state', lambda volume_node=None: {})
+    r = MouseEventRecorder()
+    r.start(volume_node=None)
+    meta = r.export_raw_data()['metadata']
+    assert meta['initial_overwrite_mode']['mode'] == 'OverwriteNone'

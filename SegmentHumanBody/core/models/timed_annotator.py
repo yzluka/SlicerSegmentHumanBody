@@ -12,6 +12,7 @@ class TimedAnnotatorModel:
 
     PARAM_HINT: str = ''
     DOC_URL: str | None = None
+    REQUIRES_DISTRIBUTIONS: tuple = ()
 
     # Distinguishable palette cycled across segments (RGB 0–1).
     _PALETTE: tuple = (

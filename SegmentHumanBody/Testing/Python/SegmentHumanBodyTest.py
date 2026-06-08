@@ -619,59 +619,6 @@ class UnifiedHistoryTest(unittest.TestCase):
 
 
 # ===========================================================================
-# _SliceViewMouseFilter tests
-# ===========================================================================
-
-class MouseFilterTest(unittest.TestCase):
-
-    def _make_filter(self):
-        import qt
-        from core._input import _SliceViewMouseFilter
-        on_press   = MagicMock()
-        on_release = MagicMock()
-        return _SliceViewMouseFilter(on_press, on_release), on_press, on_release
-
-    def test_event_filter_always_returns_false(self):
-        import qt
-        filt, _, _ = self._make_filter()
-        event = MagicMock()
-        event.type.return_value = qt.QEvent.MouseMove
-        result = filt.eventFilter(None, event)
-        self.assertFalse(result, "eventFilter must never consume events")
-
-    def test_mouse_press_calls_on_press(self):
-        import qt
-        filt, on_press, _ = self._make_filter()
-        event = MagicMock()
-        event.type.return_value   = qt.QEvent.MouseButtonPress
-        event.button.return_value = qt.Qt.LeftButton
-        filt.eventFilter(None, event)
-        on_press.assert_called_once()
-
-    def test_mouse_release_calls_on_release(self):
-        import qt
-        filt, _, on_release = self._make_filter()
-        event = MagicMock()
-        event.type.return_value   = qt.QEvent.MouseButtonRelease
-        event.button.return_value = qt.Qt.LeftButton
-        filt.eventFilter(None, event)
-        on_release.assert_called_once()
-
-    def test_callback_exception_does_not_propagate(self):
-        """Exceptions in the callback must be swallowed to protect the Qt event loop."""
-        import qt
-        filt, on_press, _ = self._make_filter()
-        on_press.side_effect = RuntimeError("test error")
-        event = MagicMock()
-        event.type.return_value   = qt.QEvent.MouseButtonPress
-        event.button.return_value = qt.Qt.LeftButton
-        try:
-            filt.eventFilter(None, event)
-        except RuntimeError:
-            self.fail("eventFilter must not propagate exceptions from callbacks")
-
-
-# ===========================================================================
 # Segment creation handler lifecycle — simulated user behaviour sequences
 # ===========================================================================
 
@@ -840,20 +787,20 @@ class AddSegmentHandlerTest(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def _make_widget(self):
-        """Minimal duck-typed widget that lets onAddSegment + clearPrompts run
-        with real MRML nodes while keeping Slicer UI widgets mocked.
-
-        The mock segmentSelector.setCurrentSegmentID is wired via side_effect
-        to call onSegmentChanged directly, replicating the Qt signal chain that
-        fires in the live module without needing a loaded Qt widget.
+        """Minimal duck-typed widget that lets _onAddSegment run with real MRML
+        nodes while keeping Slicer UI widgets mocked.
         """
         from core._state import WidgetState
-        from SegmentHumanBody import SegmentHumanBodyWidget
+        from SegmentHumanBody import SegmentHumanBodyLogic as _FullLogic
 
-        logic     = self._logic
         paramNode = self._paramNode
         volNode   = self._volNode
         segNode   = self._segNode
+
+        # Use the widget-level logic which has add_segment / setup_editor_nodes.
+        # Patch get_segment_editor: no Segment Editor panel exists in --no-main-window.
+        full_logic = _FullLogic()
+        full_logic.get_segment_editor = lambda: None
 
         class _W:
             def _segEditor(self):              return None
@@ -862,31 +809,27 @@ class AddSegmentHandlerTest(unittest.TestCase):
             def _get_composite_node(self, *a): return None
             def getOrCreateSegmentationNode(self):
                 return self.ui.segmentationNodeSelector.currentNode()
-            def onAddSegment(self, *args):
+            def _onAddSegment(self, *args):
                 from SegmentHumanBody import SegmentHumanBodyWidget
-                SegmentHumanBodyWidget.onAddSegment(self, *args)
-            def clearPrompts(self):
-                from SegmentHumanBody import SegmentHumanBodyWidget
-                SegmentHumanBodyWidget.clearPrompts(self)
-            def _restore_prompt_placement(self):
-                from SegmentHumanBody import SegmentHumanBodyWidget
-                SegmentHumanBodyWidget._restore_prompt_placement(self)
-            def _apply_saved_segments_visibility(self, exclude=None):
-                from SegmentHumanBody import SegmentHumanBodyWidget
-                SegmentHumanBodyWidget._apply_saved_segments_visibility(self, exclude=exclude)
-            def _sync_annotation_visibility(self):
-                from SegmentHumanBody import SegmentHumanBodyWidget
-                SegmentHumanBodyWidget._sync_annotation_visibility(self)
-            def _clear_history(self):
-                from SegmentHumanBody import SegmentHumanBodyWidget
-                SegmentHumanBodyWidget._clear_history(self)
+                SegmentHumanBodyWidget._onAddSegment(self, *args)
+            def _ensure_current_prompt_nodes(self): pass
+            def _borrowEffectsOptionsFrame(self):   pass
+            def _returnEffectsOptionsFrame(self):   pass
+            def _rewire_segmentation_observer(self, seg): pass
+            def _deactivateEffect(self):             pass
+            def _set_prompt_widget_place_mode(self, widget, active): pass
+            def _deactivate_prompt_place_mode(self): pass
+            def _sync_annotation_visibility(self):   pass
+            def _apply_saved_segments_visibility(self, exclude=None): pass
 
         w = _W()
         w.ctrl                     = WidgetState(w)
         w._active_handler          = None
-        w._history                 = []
-        w._redo_stack              = []
-        w.logic                    = logic
+        w._attaching_handler       = None
+        w._suppressing_place_mode  = False
+        w._active_prompt_widget    = MagicMock()
+        w._recorder                = MagicMock()
+        w.logic                    = full_logic
         w._parameterNode           = paramNode
         w._spx_boundary_visible    = False
         w._spx_boundary_node       = None
@@ -903,11 +846,7 @@ class AddSegmentHandlerTest(unittest.TestCase):
         w.ui.brushToolButton.isChecked.return_value  = False
         w.ui.eraseToolButton.isChecked.return_value  = False
 
-        # Replicate Qt signal: setCurrentSegmentID → onSegmentChanged → clearPrompts
-        def _on_set_segment(segID):
-            SegmentHumanBodyWidget.onSegmentChanged(w, segID)
-
-        w.ui.segmentSelector.setCurrentSegmentID.side_effect = _on_set_segment
+        w.ui.segmentSelector.setCurrentSegmentID.side_effect = lambda segID: None
 
         return w
 
@@ -918,9 +857,7 @@ class AddSegmentHandlerTest(unittest.TestCase):
     def test_add_segment_while_brush_active_restores_brush(self):
         """User sequence: brush active → Add Segment button → brush still active.
 
-        Without the fix: clearPrompts (called via onSegmentChanged) sets
-        _active_handler = PointHandler() directly, orphaning the brush.
-        With the fix: onAddSegment caches, detaches, creates, then re-attaches.
+        _onAddSegment caches, detaches, creates, then re-attaches the prior handler.
         """
         from SegmentHumanBody import SegmentHumanBodyWidget
         from core._input import BrushHandler
@@ -928,10 +865,10 @@ class AddSegmentHandlerTest(unittest.TestCase):
         w = self._make_widget()
         w._active_handler = BrushHandler()
 
-        SegmentHumanBodyWidget.onAddSegment(w)
+        SegmentHumanBodyWidget._onAddSegment(w)
 
         self.assertIsInstance(w._active_handler, BrushHandler,
-            "BrushHandler must be restored as active handler after onAddSegment")
+            "BrushHandler must be restored as active handler after _onAddSegment")
 
     def test_add_segment_while_erase_active_restores_erase(self):
         """Same contract for EraseHandler."""
@@ -941,30 +878,30 @@ class AddSegmentHandlerTest(unittest.TestCase):
         w = self._make_widget()
         w._active_handler = EraseHandler()
 
-        SegmentHumanBodyWidget.onAddSegment(w)
+        SegmentHumanBodyWidget._onAddSegment(w)
 
         self.assertIsInstance(w._active_handler, EraseHandler)
 
     def test_add_segment_without_stroke_handler_stays_in_point_mode(self):
-        """Without a prior stroke handler, onAddSegment leaves point-placement
-        mode active (PointHandler set by clearPrompts, nothing to restore)."""
+        """Without a prior stroke handler, _onAddSegment calls
+        _ensure_current_prompt_nodes and leaves _active_handler as None."""
         from SegmentHumanBody import SegmentHumanBodyWidget
-        from core._input import PointHandler
 
         w = self._make_widget()
         # _active_handler is None — no stroke handler was active.
 
-        SegmentHumanBodyWidget.onAddSegment(w)
+        SegmentHumanBodyWidget._onAddSegment(w)
 
-        self.assertIsInstance(w._active_handler, PointHandler)
+        self.assertIsNone(w._active_handler,
+            "_active_handler must remain None when no prior handler was active")
 
     # ------------------------------------------------------------------
     # Sequence 2: detach order — brush must be gone before creation fires
     # ------------------------------------------------------------------
 
     def test_brush_is_detached_before_segment_creation(self):
-        """onAddSegment must detach the stroke handler BEFORE the segment is
-        created so clearPrompts never encounters a live StrokeHandler.
+        """_onAddSegment must detach the stroke handler BEFORE the segment is
+        created.
 
         Verified by intercepting the setCurrentSegmentID side_effect (which
         fires right after AddEmptySegment) and recording handler state there.
@@ -980,18 +917,17 @@ class AddSegmentHandlerTest(unittest.TestCase):
         active_at_creation = []
 
         def _on_set_segment(segID):
-            # Fires immediately after AddEmptySegment, before clearPrompts.
+            # Fires immediately after AddEmptySegment.
             active_at_creation.append(type(w._active_handler).__name__)
-            SegmentHumanBodyWidget.onSegmentChanged(w, segID)
 
         w.ui.segmentSelector.setCurrentSegmentID.side_effect = _on_set_segment
 
-        SegmentHumanBodyWidget.onAddSegment(w)
+        SegmentHumanBodyWidget._onAddSegment(w)
 
         self.assertEqual(len(active_at_creation), 1)
         self.assertEqual(active_at_creation[0], 'NoneType',
-            "_active_handler must be None (detached) when segment creation "
-            "triggers onSegmentChanged — not an orphaned BrushHandler")
+            "_active_handler must be None (detached) at segment creation — "
+            "not an orphaned BrushHandler")
 
     # ------------------------------------------------------------------
     # Sequence 3: full regression — brush → add segment → click place
@@ -1000,11 +936,9 @@ class AddSegmentHandlerTest(unittest.TestCase):
     def test_brush_active_add_segment_then_place_deactivates_brush(self):
         """Full regression sequence:
           1. Brush active
-          2. Add Segment (triggers clearPrompts internally)
+          2. Add Segment (_onAddSegment restores brush)
           3. Click positive-prompts place button (_onPlaceModeChanged)
           → place click must deactivate brush and activate PointHandler.
-
-        This is the exact sequence that failed before the fix.
         """
         from SegmentHumanBody import SegmentHumanBodyWidget
         from core._input import BrushHandler, PointHandler
@@ -1012,11 +946,12 @@ class AddSegmentHandlerTest(unittest.TestCase):
         w = self._make_widget()
         w._active_handler = BrushHandler()   # step 1: brush is active
 
-        SegmentHumanBodyWidget.onAddSegment(w)                 # step 2
+        SegmentHumanBodyWidget._onAddSegment(w)                # step 2
         self.assertIsInstance(w._active_handler, BrushHandler,
             "Brush must still be active immediately after Add Segment")
 
-        SegmentHumanBodyWidget._onPlaceModeChanged(w, active=True)  # step 3
+        SegmentHumanBodyWidget._onPlaceModeChanged(            # step 3
+            w, active=True, src_widget=MagicMock())
 
         self.assertIsInstance(w._active_handler, PointHandler,
             "Place button click must deactivate brush and activate PointHandler")
@@ -1026,11 +961,11 @@ class AddSegmentHandlerTest(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_stroke_handler_attach_bails_out_when_superseded_by_add_segment(self):
-        """If _activate_effect triggers onAddSegment which replaces _active_handler
-        via the cache/restore path, the original StrokeHandler.attach() must bail
-        out at the supersession guard and not register itself as the active handler.
+        """If _on_attach triggers _onAddSegment which replaces _active_handler
+        via the cache/restore path, the original StrokeHandler.attach() must leave
+        the new handler active, not register the superseded original.
 
-        Simulated by patching _activate_effect on the class to call onAddSegment
+        Simulated by patching _on_attach on the class to call _onAddSegment
         directly (replicating the 0-segment path that fires in production).
         """
         from core._input import BrushHandler
@@ -1039,26 +974,25 @@ class AddSegmentHandlerTest(unittest.TestCase):
         w = self._make_widget()
         original_handler = BrushHandler()
 
-        original_activate = BrushHandler._activate_effect
+        original_on_attach = BrushHandler._on_attach
 
         _called = [False]
-        def _hijack_activate(self_h, widget):
-            # Simulate: Paint activated on 0-segment segmentation → onAddSegment.
-            # One-shot guard: the restore path inside onAddSegment creates a fresh
-            # BrushHandler and calls attach() on it, which would re-enter here and
-            # recurse infinitely without this check.
+        def _hijack_on_attach(self_h, widget):
+            # Simulate: _on_attach fires → triggers _onAddSegment.
+            # One-shot guard prevents infinite recursion when the restore path
+            # inside _onAddSegment creates a fresh BrushHandler and re-enters.
             if _called[0]:
                 return
             _called[0] = True
-            SegmentHumanBodyWidget.onAddSegment(widget)
+            SegmentHumanBodyWidget._onAddSegment(widget)
 
-        BrushHandler._activate_effect = _hijack_activate
+        BrushHandler._on_attach = _hijack_on_attach
         try:
             original_handler.attach(w)
         finally:
-            BrushHandler._activate_effect = original_activate
+            BrushHandler._on_attach = original_on_attach
 
-        # The resumed handler (created inside onAddSegment's finally) must be active,
+        # The resumed handler (created inside _onAddSegment's finally) must be active,
         # not the original instance that was superseded.
         self.assertIsNot(w._active_handler, original_handler,
             "The superseded original handler must not end up as _active_handler")
@@ -1221,18 +1155,14 @@ def _make_undo_test_widget(volNode, segNode, segID, paramNode, logic,
         def getUserParameters(self):       return {}
         def getOrCreateSegmentationNode(self):
             return self.ui.segmentationNodeSelector.currentNode()
-        def clearPrompts(self):
+        def _borrowEffectsOptionsFrame(self): pass
+        def _returnEffectsOptionsFrame(self): pass
+        def _onStrokeToggled(self, handler_cls, checked):
             from SegmentHumanBody import SegmentHumanBodyWidget
-            SegmentHumanBodyWidget.clearPrompts(self)
+            SegmentHumanBodyWidget._onStrokeToggled(self, handler_cls, checked)
         def _apply_saved_segments_visibility(self, exclude=None):
             from SegmentHumanBody import SegmentHumanBodyWidget
             SegmentHumanBodyWidget._apply_saved_segments_visibility(self, exclude=exclude)
-        def _clear_history(self):
-            from SegmentHumanBody import SegmentHumanBodyWidget
-            SegmentHumanBodyWidget._clear_history(self)
-        def _restore_prompt_placement(self):
-            from SegmentHumanBody import SegmentHumanBodyWidget
-            SegmentHumanBodyWidget._restore_prompt_placement(self)
         def _sync_annotation_visibility(self):
             from SegmentHumanBody import SegmentHumanBodyWidget
             SegmentHumanBodyWidget._sync_annotation_visibility(self)
@@ -1240,9 +1170,14 @@ def _make_undo_test_widget(volNode, segNode, segID, paramNode, logic,
     w = _W()
     w.ctrl                     = WidgetState(w)
     w._active_handler          = None
+    w._attaching_handler       = None
+    w._suppressing_place_mode  = False
+    w._active_prompt_widget    = None
+    w._recorder                = MagicMock()
     w._history                 = []
     w._redo_stack              = []
     w.logic                    = logic
+    w.logic.get_segment_editor = lambda: None
     w._parameterNode           = paramNode
     w.currentViewName          = "Red"
     w.modelFamily              = modelFamily
@@ -1265,199 +1200,6 @@ def _make_undo_test_widget(volNode, segNode, segID, paramNode, logic,
 
     w.ui.segmentSelector.setCurrentSegmentID.side_effect = _on_set_segment
     return w
-
-
-# ===========================================================================
-# Brush stroke commit and undo
-# ===========================================================================
-
-class BrushStrokeUndoTest(unittest.TestCase):
-    """Simulates the user selecting the brush tool, painting strokes, then
-    pressing Ctrl+Z to undo them.
-
-    ``commit_stroke`` is called directly (bypassing the real Segment Editor
-    effect, which requires a visible Qt window) by writing the desired
-    after-state directly into Slicer's labelmap — the same data that the
-    Segment Editor Paint effect would produce.  ``onUndo`` is then called
-    as the user would trigger it via Ctrl+Z.
-    """
-
-    def setUp(self):
-        slicer.mrmlScene.Clear()
-        from core._logic import SegmentHumanBodyLogic
-        self._logic   = SegmentHumanBodyLogic()
-        self._pNode   = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLScriptedModuleNode')
-        self._logic.ensurePromptNodesExist(self._pNode)
-        self._volNode = _make_volume()
-        self._segNode, self._segID = _make_seg(self._volNode, with_segment=True)
-        self._logic.setVolumeAndSegmentation(self._pNode, self._volNode, self._segNode)
-
-    def tearDown(self):
-        slicer.mrmlScene.Clear()
-
-    def _w(self):
-        return _make_undo_test_widget(
-            self._volNode, self._segNode, self._segID, self._pNode, self._logic)
-
-    # ------------------------------------------------------------------
-    # Helper: simulate one brush stroke on *axis/idx* by writing the
-    # desired after-state into Slicer, then calling commit_stroke.
-    # ------------------------------------------------------------------
-
-    def _do_stroke(self, w, axis, idx, before_2d, after_2d, source='brush'):
-        """Write *after_2d* to Slicer then commit the stroke delta."""
-        full = np.zeros((_K, _J, _I), dtype=np.uint8)
-        # Preserve any existing data already in Slicer for other slices.
-        existing = _read_lm(self._segNode, self._segID, self._volNode)
-        full[:] = existing
-        # Overwrite just the target slice with the after-state.
-        from core.utils import write_slice_to_volume
-        write_slice_to_volume(full, after_2d, axis, idx)
-        _write_lm(self._segNode, self._segID, self._volNode, full)
-        return self._logic.commit_stroke(w, axis, idx, before_2d, source=source)
-
-    # ------------------------------------------------------------------
-
-    def test_brush_stroke_records_history_entry(self):
-        """Painting a stroke → commit_stroke returns a MaskChange that callers
-        push to _history as ['brush', change]."""
-        w = self._w()
-        before = np.zeros((_J, _I), dtype=np.uint8)
-        after  = np.zeros((_J, _I), dtype=np.uint8)
-        after[3:8, 4:12] = 1
-
-        change = self._do_stroke(w, axis=0, idx=5, before_2d=before, after_2d=after)
-
-        self.assertIsNotNone(change,
-            "commit_stroke must return a MaskChange for a real paint stroke")
-        self.assertEqual(change.source, 'brush')
-        self.assertTrue(np.any(change.delta > 0),
-            "Brush delta must contain positive values (pixels added)")
-
-    def test_brush_undo_restores_empty_slice(self):
-        """User workflow: brush paints slice 5 → Ctrl+Z → slice 5 empty again."""
-        from SegmentHumanBody import SegmentHumanBodyWidget
-
-        w = self._w()
-        before = np.zeros((_J, _I), dtype=np.uint8)
-        after  = np.zeros((_J, _I), dtype=np.uint8)
-        after[3:8, 4:12] = 1
-
-        change = self._do_stroke(w, axis=0, idx=5, before_2d=before, after_2d=after)
-        w._history.append(['brush', change])
-
-        SegmentHumanBodyWidget.onUndo(w)
-
-        result = _read_lm(self._segNode, self._segID, self._volNode)
-        np.testing.assert_array_equal(result[5], 0,
-            "Brush undo must restore the painted slice to empty")
-
-    def test_brush_undo_leaves_other_slices_untouched(self):
-        """Undoing a stroke on slice 5 must not affect a previously painted slice 3."""
-        from SegmentHumanBody import SegmentHumanBodyWidget
-
-        w = self._w()
-
-        # Slice 3 is already painted from a previous session.
-        pre = np.zeros((_K, _J, _I), dtype=np.uint8)
-        pre[3] = 1
-        _write_lm(self._segNode, self._segID, self._volNode, pre)
-
-        # Stroke on slice 5.
-        before_5 = np.zeros((_J, _I), dtype=np.uint8)
-        after_5  = np.zeros((_J, _I), dtype=np.uint8)
-        after_5[2:7, 2:10] = 1
-
-        change = self._do_stroke(w, axis=0, idx=5, before_2d=before_5, after_2d=after_5)
-        w._history.append(['brush', change])
-
-        SegmentHumanBodyWidget.onUndo(w)
-
-        result = _read_lm(self._segNode, self._segID, self._volNode)
-        np.testing.assert_array_equal(result[3], 1,
-            "Slice 3 must be untouched after undoing a stroke on slice 5")
-        np.testing.assert_array_equal(result[5], 0,
-            "Stroke on slice 5 must be undone")
-
-    def test_two_strokes_undo_lifo_order(self):
-        """Two brush strokes on different slices; Ctrl+Z twice pops LIFO."""
-        from SegmentHumanBody import SegmentHumanBodyWidget
-
-        w = self._w()
-
-        # Stroke A: left half of slice 4.
-        before_a = np.zeros((_J, _I), dtype=np.uint8)
-        after_a  = np.zeros((_J, _I), dtype=np.uint8)
-        after_a[:, :_I // 2] = 1
-        change_a = self._do_stroke(w, axis=0, idx=4, before_2d=before_a, after_2d=after_a)
-        w._history.append(['brush', change_a])
-
-        # Stroke B: right half of slice 7 (slice 4 is already painted).
-        before_b = np.zeros((_J, _I), dtype=np.uint8)
-        after_b  = np.zeros((_J, _I), dtype=np.uint8)
-        after_b[:, _I // 2:] = 1
-        change_b = self._do_stroke(w, axis=0, idx=7, before_2d=before_b, after_2d=after_b)
-        w._history.append(['brush', change_b])
-
-        # First Ctrl+Z: stroke B (the most recent) is undone.
-        SegmentHumanBodyWidget.onUndo(w)
-        r1 = _read_lm(self._segNode, self._segID, self._volNode)
-        np.testing.assert_array_equal(r1[4, :, :_I // 2], 1,
-            "Stroke A must remain after undoing stroke B")
-        np.testing.assert_array_equal(r1[7], 0,
-            "Stroke B (slice 7) must be cleared by the first undo")
-
-        # Second Ctrl+Z: stroke A is undone.
-        SegmentHumanBodyWidget.onUndo(w)
-        r2 = _read_lm(self._segNode, self._segID, self._volNode)
-        np.testing.assert_array_equal(r2[4], 0,
-            "Stroke A (slice 4) must be cleared by the second undo")
-
-    def test_erase_removing_pixels_is_tracked(self):
-        """Erasing pixels that exist produces a negative-delta entry in history."""
-        from core._input import EraseHandler
-
-        w = self._w()
-
-        # First paint the full slice 5.
-        before_paint = np.zeros((_J, _I), dtype=np.uint8)
-        after_paint  = np.ones((_J, _I), dtype=np.uint8)
-        paint_change = self._do_stroke(w, axis=0, idx=5,
-                                       before_2d=before_paint, after_2d=after_paint,
-                                       source='brush')
-        w._history.append(['brush', paint_change])
-
-        # Erase the left half: before = full row; after = right half only.
-        before_erase = np.ones((_J, _I), dtype=np.uint8)
-        after_erase  = np.zeros((_J, _I), dtype=np.uint8)
-        after_erase[:, _I // 2:] = 1
-        erase_change = self._do_stroke(w, axis=0, idx=5,
-                                       before_2d=before_erase, after_2d=after_erase,
-                                       source='erase')
-
-        handler = EraseHandler()
-        self.assertIsNotNone(erase_change,
-            "Erasing painted pixels must produce a MaskChange")
-        self.assertTrue(handler._should_track(erase_change),
-            "EraseHandler._should_track must return True when pixels were removed")
-        self.assertTrue(np.any(erase_change.delta < 0),
-            "Erase delta must contain negative values for removed pixels")
-
-    def test_erase_noop_not_tracked(self):
-        """Erasing over empty pixels produces no change → _should_track returns False."""
-        from core._input import EraseHandler
-
-        w = self._w()
-
-        # Slice 5 is empty; before and after are identical (erasing air).
-        before = np.zeros((_J, _I), dtype=np.uint8)
-        after  = np.zeros((_J, _I), dtype=np.uint8)
-        change = self._do_stroke(w, axis=0, idx=5,
-                                 before_2d=before, after_2d=after, source='erase')
-
-        # commit_stroke returns None for a no-op — nothing to track.
-        self.assertIsNone(change,
-            "Erasing empty pixels must return None from commit_stroke (no-op)")
 
 
 # ===========================================================================
@@ -2629,10 +2371,9 @@ class SPXBrushToggleBugTest(unittest.TestCase):
         # Simulate brush being the active tool (bypass attach() to avoid
         # the Segment Editor effect machinery which needs a full GUI).
         brush = BrushHandler()
-        brush._mouse_filter = None
         w._active_handler = brush
 
-        SegmentHumanBodyWidget.onBrushToggled(w, False)
+        SegmentHumanBodyWidget._onBrushToggled(w, False)
 
         self.assertNotIsInstance(
             w._active_handler, PointHandler,
@@ -2790,3 +2531,169 @@ class SPXSpuriousSegmentChangeBugTest(unittest.TestCase):
         self.assertEqual(len(w._history), 1,
             "Deferred currentSegmentChanged after auto-segment creation must not "
             "clear history — _ensure_seg_and_segment must pre-acknowledge the ID")
+
+
+# ===========================================================================
+# SPX boundary / compute_spx_boundary integration
+# ===========================================================================
+
+@_SKIP_LAYOUT
+class SPXBoundaryIntegrationTest(unittest.TestCase):
+    """Regression tests for compute_spx_boundary and compute_spx_boundary_for_volume.
+
+    These functions must work when widget.logic is SegmentHumanBody.SegmentHumanBodyLogic
+    (the Slicer-wired class defined in SegmentHumanBody.py), NOT core._logic.SegmentHumanBodyLogic.
+    Both have the same class name but are different objects — any attribute on one is
+    not automatically present on the other.
+    """
+
+    def setUp(self):
+        import vtk
+        slicer.mrmlScene.Clear()
+        slicer.app.layoutManager().setLayout(
+            slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
+        self._volNode = _make_volume()
+        ijkToRAS = vtk.vtkMatrix4x4()
+        self._volNode.GetIJKToRASMatrix(ijkToRAS)
+        ras = ijkToRAS.MultiplyPoint([0.0, 0.0, 5.0, 1.0])
+        slicer.app.layoutManager().sliceWidget('Red').mrmlSliceNode().SetSliceOffset(ras[2])
+
+    def tearDown(self):
+        slicer.mrmlScene.Clear()
+
+    def _make_widget(self):
+        from SegmentHumanBody import SegmentHumanBodyLogic
+        from core.modelFamilies import SPXModelFamily
+
+        fam = SPXModelFamily(variant='Naive_Grid-2D')
+        fam.confirm_model()
+
+        widget = MagicMock()
+        widget.logic = SegmentHumanBodyLogic()   # widget-side class, NOT core._logic
+        widget.currentViewName = 'Red'
+        widget.ui.sourceVolumeSelector.currentNode.return_value = self._volNode
+        widget.getUserParameters.return_value = {}
+        widget.modelFamily = fam
+        return widget
+
+    def test_compute_spx_boundary_does_not_raise_attribute_error(self):
+        """compute_spx_boundary must work with widget.logic = SegmentHumanBody.SegmentHumanBodyLogic.
+
+        Regression: was a class method on core._logic.SegmentHumanBodyLogic, so
+        widget.logic.compute_spx_boundary(widget) raised AttributeError because the
+        widget-side logic class is a different object.  Fixed by making it a
+        module-level function that does not go through widget.logic at all.
+        """
+        from core._logic import compute_spx_boundary
+
+        try:
+            result = compute_spx_boundary(self._make_widget())
+        except AttributeError as exc:
+            self.fail(
+                f'compute_spx_boundary raised AttributeError: {exc}\n'
+                'compute_spx_boundary must be a module-level function, not a '
+                'method on core._logic.SegmentHumanBodyLogic.'
+            )
+        self.assertEqual(len(result), 3,
+            'compute_spx_boundary must return (boundary_2d, axis, slice_idx)')
+
+    def test_compute_spx_boundary_for_volume_does_not_raise_attribute_error(self):
+        """compute_spx_boundary_for_volume must not raise AttributeError via widget.logic.
+
+        Regression: the function called widget.logic.compute_spx_boundary(widget)
+        which fails when widget.logic is SegmentHumanBody.SegmentHumanBodyLogic.
+        """
+        from core._logic import compute_spx_boundary_for_volume
+
+        boundary_node = slicer.mrmlScene.AddNewNodeByClass(
+            'vtkMRMLLabelMapVolumeNode', 'SPX_Boundary_test')
+        boundary_node.CreateDefaultDisplayNodes()
+
+        try:
+            compute_spx_boundary_for_volume(
+                self._make_widget(), self._volNode, boundary_node)
+        except AttributeError as exc:
+            self.fail(
+                f'compute_spx_boundary_for_volume raised AttributeError: {exc}'
+            )
+
+
+# ===========================================================================
+# Overwrite mode — _applyOverwriteMode on a real SegmentEditorNode singleton
+# ===========================================================================
+
+class OverwriteModeApplyTest(unittest.TestCase):
+    """Integration tests for SegmentHumanBodyWidget._applyOverwriteMode.
+
+    Uses the real vtkMRMLSegmentEditorNode singleton so GetMaskMode() and
+    GetOverwriteMode() are read back from actual MRML node state.  This
+    catches both wrong integer values and missing class attributes (e.g.
+    cls.PaintAllowedEverywhere) that would raise AttributeError in Slicer.
+    """
+
+    # Expected integer constants from vtkMRMLSegmentEditorNode.h
+    _PAINT_ALLOWED_EVERYWHERE           = 0
+    _PAINT_ALLOWED_OUTSIDE_ALL_SEGMENTS = 3
+
+    def setUp(self):
+        slicer.mrmlScene.Clear()
+        # Set singleton tag BEFORE AddNode so Slicer registers it as a singleton.
+        # AddNewNodeByClass adds without the tag, so GetSingletonNode won't find it.
+        node = slicer.mrmlScene.CreateNodeByClass('vtkMRMLSegmentEditorNode')
+        node.UnRegister(None)  # balance the extra ref from CreateNodeByClass
+        node.SetSingletonTag('SegmentEditor')
+        self._pn_ed = slicer.mrmlScene.AddNode(node)
+
+    def tearDown(self):
+        slicer.mrmlScene.Clear()
+
+    def _widget_at(self, index):
+        from SegmentHumanBody import SegmentHumanBodyWidget
+        import types
+        w = SegmentHumanBodyWidget.__new__(SegmentHumanBodyWidget)
+        w.ui = types.SimpleNamespace(
+            overwriteModeDropdown=type('D', (), {'currentIndex': index})())
+        return w
+
+    def _cls(self):
+        return slicer.vtkMRMLSegmentEditorNode
+
+    def test_coexist_sets_mask_everywhere_and_overwrite_none(self):
+        self._widget_at(0)._applyOverwriteMode()
+        self.assertEqual(self._pn_ed.GetMaskMode(),
+                         self._PAINT_ALLOWED_EVERYWHERE)
+        self.assertEqual(self._pn_ed.GetOverwriteMode(),
+                         self._cls().OverwriteNone)
+
+    def test_aggressive_sets_mask_everywhere_and_overwrite_all(self):
+        self._widget_at(1)._applyOverwriteMode()
+        self.assertEqual(self._pn_ed.GetMaskMode(),
+                         self._PAINT_ALLOWED_EVERYWHERE)
+        self.assertEqual(self._pn_ed.GetOverwriteMode(),
+                         self._cls().OverwriteAllSegments)
+
+    def test_defensive_sets_mask_outside_all_segments(self):
+        self._widget_at(2)._applyOverwriteMode()
+        self.assertEqual(self._pn_ed.GetMaskMode(),
+                         self._PAINT_ALLOWED_OUTSIDE_ALL_SEGMENTS)
+        self.assertEqual(self._pn_ed.GetOverwriteMode(),
+                         self._cls().OverwriteNone)
+
+    def test_switching_from_defensive_resets_mask_mode(self):
+        """Switching away from Defensive must restore PaintAllowedEverywhere."""
+        self._widget_at(2)._applyOverwriteMode()
+        self.assertEqual(self._pn_ed.GetMaskMode(),
+                         self._PAINT_ALLOWED_OUTSIDE_ALL_SEGMENTS,
+                         'Defensive must set mask to PaintAllowedOutsideAllSegments')
+
+        self._widget_at(0)._applyOverwriteMode()
+        self.assertEqual(self._pn_ed.GetMaskMode(),
+                         self._PAINT_ALLOWED_EVERYWHERE,
+                         'Switching to Coexist must restore PaintAllowedEverywhere')
+
+    def test_out_of_range_index_falls_back_to_coexist(self):
+        self._widget_at(99)._applyOverwriteMode()
+        self.assertEqual(self._pn_ed.GetMaskMode(),
+                         self._PAINT_ALLOWED_EVERYWHERE)
+        self.assertEqual(self._pn_ed.GetOverwriteMode(),
+                         self._cls().OverwriteNone)

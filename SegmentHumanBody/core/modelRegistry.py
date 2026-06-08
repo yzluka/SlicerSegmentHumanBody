@@ -1,6 +1,7 @@
 from .models.default import IdentityModel
 from .models.spx import SPX_Tester2D, SPX_SLIC2D, SPX_Felzenszwalb2D
 from .models.timed_annotator import TimedAnnotatorModel
+from ._deps import DependencyCheck
 
 # Maps registry key → model class.
 # Add new models here; do not use globals() lookups.
@@ -42,6 +43,22 @@ class ModelRegistry:
         if factory is None:
             return "Model not available. Please select a different model."
         return getattr(factory, 'PARAM_HINT', 'No parameter hint provided.')
+
+    @classmethod
+    def is_model_available(cls, key: str) -> bool:
+        """Return True if all distributions declared by the model are present.
+
+        Uses metadata-only probes (no import). Models with no
+        ``REQUIRES_DISTRIBUTIONS`` attribute are always available.
+        """
+        factory = _MODEL_FACTORIES.get(key)
+        if factory is None:
+            return False
+        for dist_name, min_ver in getattr(factory, 'REQUIRES_DISTRIBUTIONS', ()):
+            ok, _ = DependencyCheck.check_distribution(dist_name, min_version=min_ver)
+            if not ok:
+                return False
+        return True
 
     @classmethod
     def register(cls, key: str, factory):
