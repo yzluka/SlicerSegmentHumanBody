@@ -14,12 +14,15 @@ powershell -ExecutionPolicy Bypass -File .\install\windows\deploy.ps1
 powershell -ExecutionPolicy Bypass -File .\install\windows\deploy_audio_processor.ps1
 ```
 
-The first installs 3D Slicer's module; the second sets up the audio
-transcription tool (add `-WithGpu` if you have an NVIDIA GPU — it installs
-and *actually verifies* real GPU-accelerated transcription rather than
-assuming it works). Both are part of the normal setup, not an optional
-extra — a recording's narration is only useful once the second script can
-turn it into text.
+The first gets 3D Slicer's module running, two ways: drop a downloaded
+`Slicer-*-win-amd64.exe` installer next to the script and it installs
+Slicer silently for you (verified working), or install Slicer yourself and
+the script finds it automatically (`-SlicerExe` if it's somewhere
+unusual). The second sets up the audio transcription tool (add `-WithGpu`
+if you have an NVIDIA GPU — it installs and *actually verifies* real
+GPU-accelerated transcription rather than assuming it works). Both scripts
+are part of the normal setup, not an optional extra — a recording's
+narration is only useful once the second script can turn it into text.
 
 Full step-by-step walkthrough, troubleshooting, and every script option:
 **[`install/windows/README.md`](install/windows/README.md)**.

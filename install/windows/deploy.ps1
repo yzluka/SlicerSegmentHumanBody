@@ -6,7 +6,12 @@
 .DESCRIPTION
   3D Slicer ships its own bundled Python interpreter (PythonSlicer.exe), so the
   module itself needs no system Python. This script:
-    1. Locates an existing 3D Slicer install (does NOT install Slicer itself).
+    1. Locates an existing 3D Slicer install. If none is found but a Slicer
+       installer .exe (downloaded from download.slicer.org) is sitting next
+       to this script or at the repo root, installs it silently (verified:
+       the installer supports /S). Otherwise prints the download link and
+       stops -- there's no reliable way to fetch the installer itself
+       silently (its own download page isn't a direct download link).
     2. Fetches/updates the module source (git if available, else a zip download
        via .NET so it also works on machines without git).
     3. Installs the module's two optional runtime dependencies (sounddevice for
@@ -108,13 +113,41 @@ if ([string]::IsNullOrWhiteSpace($SlicerExe)) {
     if ($found) { $SlicerExe = $found.FullName }
 }
 
+# If still not found, but a Slicer installer .exe is sitting locally (e.g.
+# downloaded from download.slicer.org into this folder), install it silently
+# -- verified working: Slicer's Windows installer supports /S, and installs
+# to %LocalAppData%\slicer.org\, which is already one of the search
+# locations above, so it's picked up automatically afterward.
+if ([string]::IsNullOrWhiteSpace($SlicerExe) -or -not (Test-Path $SlicerExe)) {
+    $installerCandidates = @()
+    $installerCandidates += Get-ChildItem -Path $ScriptDir -Filter "Slicer-*-win-amd64.exe" -ErrorAction SilentlyContinue
+    if ($DetectedRepoRoot) {
+        $installerCandidates += Get-ChildItem -Path $DetectedRepoRoot -Filter "Slicer-*-win-amd64.exe" -ErrorAction SilentlyContinue
+    }
+    $installer = $installerCandidates | Select-Object -First 1
+    if ($installer) {
+        Write-Ok "Found a local Slicer installer: $($installer.Name) -- installing silently..."
+        $proc = Start-Process -FilePath $installer.FullName -ArgumentList "/S" -Wait -PassThru
+        if ($proc.ExitCode -ne 0) {
+            Write-Warn2 "Installer exited with code $($proc.ExitCode) -- continuing to search anyway."
+        }
+        $installed = Get-ChildItem -Path "$env:LocalAppData\slicer.org" -Filter "Slicer.exe" -Recurse -Depth 2 -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($installed) {
+            $SlicerExe = $installed.FullName
+            Write-Ok "Installed: $SlicerExe"
+        }
+    }
+}
+
 if ([string]::IsNullOrWhiteSpace($SlicerExe) -or -not (Test-Path $SlicerExe)) {
     Write-Warn2 "No 3D Slicer install found automatically."
     Write-Host ""
     Write-Host "This machine needs 3D Slicer itself (it bundles its own Python, so no" -ForegroundColor Yellow
-    Write-Host "separate Python install is required). Download and run the installer from:" -ForegroundColor Yellow
+    Write-Host "separate Python install is required). Download the installer from:" -ForegroundColor Yellow
     Write-Host "  https://download.slicer.org/" -ForegroundColor Yellow
-    Write-Host "Then re-run this script, or pass -SlicerExe `"<path to Slicer.exe>`"." -ForegroundColor Yellow
+    Write-Host "and either run it yourself, or place the downloaded Slicer-*-win-amd64.exe" -ForegroundColor Yellow
+    Write-Host "in this folder and re-run this script to install it automatically." -ForegroundColor Yellow
+    Write-Host "Or pass -SlicerExe `"<path to Slicer.exe>`" if it's installed somewhere unusual." -ForegroundColor Yellow
     exit 1
 }
 $SlicerDir = Split-Path -Parent $SlicerExe

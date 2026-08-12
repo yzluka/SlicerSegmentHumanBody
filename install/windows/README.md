@@ -33,12 +33,22 @@ main [README](../../README.md#installation) for now.)
 
 ---
 
-## Step 1 — Install 3D Slicer
+## Step 1 — Get 3D Slicer ready
 
-Go to **https://download.slicer.org/**, download the Windows installer, and
-run it (default options are fine). `deploy.ps1` looks for it in the usual
-install locations automatically, so it doesn't matter exactly where — the
-repo root is a reasonable choice if you don't already have a preference.
+Two ways to do this — pick whichever you prefer, both lead into the same
+Step 2:
+
+**A) Fully automated.** Go to **https://download.slicer.org/**, download the
+Windows installer, but don't run it — instead drop the downloaded
+`Slicer-*-win-amd64.exe` file into this repo's root folder (or next to
+`deploy.ps1` if you're running standalone). Step 2 below will find it and
+install it silently for you (verified: Slicer's installer supports `/S`).
+
+**B) Install it yourself.** Run the downloaded installer normally and click
+through it (default options are fine). `deploy.ps1` looks for it in the
+usual install locations automatically afterward, so it doesn't matter
+exactly where it ends up — pass `-SlicerExe "C:\path\to\Slicer.exe"` in
+Step 2 if it's installed somewhere unusual and doesn't get found.
 
 ---
 
@@ -50,7 +60,7 @@ From the repo root:
 powershell -ExecutionPolicy Bypass -File .\install\windows\deploy.ps1
 ```
 
-This finds the Slicer you just installed and creates
+This finds (or, per option A above, silently installs) Slicer, then creates
 **`Run_SegmentHumanBody.bat`** at the repo root — your shortcut to open
 Slicer with the module ready to go from now on.
 
@@ -100,8 +110,9 @@ Make sure you copy-pasted the whole command, including
 itself (Windows opens it as a text file instead of running it).
 
 **It says it can't find a 3D Slicer install**
-Go back to Step 1 and make sure the installer finished, or pass
-`-SlicerExe "C:\path\to\Slicer.exe"`.
+Either finish option B from Step 1, place the installer `.exe` in this
+folder for option A, or pass `-SlicerExe "C:\path\to\Slicer.exe"` if it's
+installed somewhere unusual.
 
 **Step 3 says it can't find something from Step 2**
 Run Step 2 again first — Step 3 depends on the module source it fetches.
@@ -116,9 +127,10 @@ as an alternative.
 
 **Want to start over?**
 Delete `Run_SegmentHumanBody.bat`, `tools\audio_processor\launch.bat`, and
-`tools\audio_processor\.venv\`, then re-run Steps 2–3. (The small Python
-program from Step 3 can be removed separately from Windows' "Installed
-Apps" if you want, but it's harmless to leave.)
+`tools\audio_processor\.venv\`, then re-run Steps 2–3. (3D Slicer and the
+small Python program from Step 3 can each be removed separately from
+Windows' "Installed Apps" if you want a fully clean slate, but it's
+harmless to leave them.)
 
 ---
 
@@ -144,12 +156,21 @@ inside a checkout of this repo (as here) and use it directly instead of
 downloading a redundant copy — deliberately without touching its git state
 (no `fetch`/`reset`), so a working copy with local changes is never reset.
 The recording module runs inside 3D Slicer's own built-in Python, so nothing
-separate is installed for it. The audio-to-text tool runs as its own program
-outside Slicer, so it needs a real Python to build a virtual environment
-from; the script checks the repo and a few standard locations first, and
-only downloads and installs one if it can't find one already. If GPU mode is
-requested, it's verified with a real test transcription rather than assumed
-to work, since it's not officially documented as supported on Windows.
+separate is installed for it. `deploy.ps1` looks for Slicer in this order:
+already-registered installs in the usual locations, then a
+`Slicer-*-win-amd64.exe` installer file sitting next to it (installed
+silently via `/S` if found), and only then gives up with a download link.
+The audio-to-text tool runs as its own program outside Slicer, so it needs a
+real Python to build a virtual environment from; the script checks the repo
+and a few standard locations first, and only downloads and installs one if
+it can't find one already. If GPU mode is requested, it's verified with a
+real test transcription rather than assumed to work, since it's not
+officially documented as supported on Windows.
+
+Both the Slicer-auto-install and standalone-Python-install paths were
+verified against a real fully-clean machine state (no prior Slicer, no
+prior Python) — this isn't a theoretical fallback path, the whole chain
+was actually run start to finish.
 
 Both scripts are safe to run again any time — they'll just update what's
 already there.
