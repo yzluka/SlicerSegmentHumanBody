@@ -21,11 +21,8 @@ def transcribe(
     from faster_whisper import WhisperModel  # type: ignore[import]
 
     if device == 'auto':
-        try:
-            import torch  # type: ignore[import]
-            device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        except ImportError:
-            device = 'cpu'
+        import ctranslate2  # type: ignore[import]
+        device = 'cuda' if ctranslate2.get_cuda_device_count() > 0 else 'cpu'
 
     compute_type = 'float16' if device == 'cuda' else 'int8'
 
