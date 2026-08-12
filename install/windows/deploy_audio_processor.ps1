@@ -46,8 +46,10 @@
        not work elsewhere as-is).
 
 .PARAMETER RepoDir
-  Path to the SlicerSegmentHumanBody checkout. Defaults to .\SlicerSegmentHumanBody
-  next to this script (i.e. wherever deploy.ps1 put it).
+  Path to the SlicerSegmentHumanBody checkout. Auto-detected the same way as
+  deploy.ps1: if this script is already sitting inside a checkout of the
+  repo, that's used directly; otherwise defaults to .\SlicerSegmentHumanBody
+  next to this script.
 
 .PARAMETER PythonExe
   Use this specific python.exe as the base interpreter instead of auto-detecting
@@ -77,14 +79,27 @@ function Write-Ok($msg)   { Write-Host "    $msg" -ForegroundColor Green }
 function Write-Warn2($msg) { Write-Host "    $msg" -ForegroundColor Yellow }
 function Write-Err2($msg)  { Write-Host "    $msg" -ForegroundColor Red }
 
+# Walks up from $startDir looking for a folder that looks like the repo root
+# (has SegmentHumanBody/SegmentHumanBody.py). Returns $null if not found
+# within a few levels. Mirrors deploy.ps1's Find-RepoRoot -- not a fixed
+# relative offset, since this script may live at install/windows/ today and
+# move again later (e.g. once install/mac, install/linux exist).
+function Find-RepoRoot([string]$startDir) {
+    $dir = $startDir
+    for ($i = 0; $i -lt 5; $i++) {
+        if (Test-Path (Join-Path $dir "SegmentHumanBody\SegmentHumanBody.py")) { return $dir }
+        $parent = Split-Path -Parent $dir
+        if (-not $parent -or $parent -eq $dir) { break }
+        $dir = $parent
+    }
+    return $null
+}
+
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$ParentDir = Split-Path -Parent $ScriptDir
+$DetectedRepoRoot = Find-RepoRoot $ScriptDir
 if ([string]::IsNullOrWhiteSpace($RepoDir)) {
-    if (Test-Path (Join-Path $ParentDir "SegmentHumanBody\SegmentHumanBody.py")) {
-        # This script is itself sitting inside a checkout of the repo (e.g.
-        # deploy/deploy_audio_processor.ps1) -- use it directly, matching
-        # deploy.ps1's same auto-detection.
-        $RepoDir = $ParentDir
+    if ($DetectedRepoRoot) {
+        $RepoDir = $DetectedRepoRoot
     } else {
         $RepoDir = Join-Path $ScriptDir "SlicerSegmentHumanBody"
     }
@@ -132,6 +147,7 @@ if (-not $baseExe) {
         "$env:ProgramFiles\Python*",
         "${env:ProgramFiles(x86)}\Python*"
     )
+    if ($DetectedRepoRoot) { $searchRoots = @($DetectedRepoRoot) + $searchRoots }
     $found = @()
     foreach ($root in $searchRoots) {
         $found += Get-ChildItem -Path $root -Filter "python.exe" -Recurse -Depth 1 -ErrorAction SilentlyContinue
@@ -150,8 +166,7 @@ if (-not $baseExe) {
     Write-Warn2 "This one piece installs to Windows' standard per-user apps location rather than"
     Write-Warn2 "inside this project folder -- pointing it at a custom folder turned out to be an"
     Write-Warn2 "unreliable silent-install path. Everything built from it (the actual tool and its"
-    Write-Warn2 "~2+ GB of packages, in tools\audio_processor\.venv) still lives entirely inside"
-    Write-Warn2 "SlicerSegmentHumanBody\, next to this script."
+    Write-Warn2 "~2+ GB of packages) still lives entirely inside $RepoDir\tools\audio_processor\.venv."
     $pyVersion = "3.12.10"
     $installerUrl = "https://www.python.org/ftp/python/$pyVersion/python-$pyVersion-amd64.exe"
     $installerPath = Join-Path $env:TEMP "python-$pyVersion-amd64.exe"

@@ -27,9 +27,9 @@
 .PARAMETER RepoDir
   Where to place/update the checkout. Defaults to .\SlicerSegmentHumanBody
   next to this script -- unless this script is itself already sitting inside
-  a checkout of the repo (e.g. you got it via `deploy/deploy.ps1` from a
-  clone or a GitHub zip download), in which case that checkout is used
-  directly and nothing is downloaded.
+  a checkout of the repo (e.g. you got it via `install/windows/deploy.ps1`
+  from a clone or a GitHub zip download), in which case that checkout is
+  used directly and nothing is downloaded.
 
 .PARAMETER WithSuperpixelModels
   Also install scikit-image (needed only for the SPX_SLIC2D / SPX_Felzenszwalb2D
@@ -56,14 +56,29 @@ function Write-Step($msg) { Write-Host "`n==> $msg" -ForegroundColor Cyan }
 function Write-Ok($msg)   { Write-Host "    $msg" -ForegroundColor Green }
 function Write-Warn2($msg) { Write-Host "    $msg" -ForegroundColor Yellow }
 
+# Walks up from $startDir looking for a folder that looks like the repo root
+# (has SegmentHumanBody/SegmentHumanBody.py). Returns $null if not found
+# within a few levels. Not a fixed relative offset -- this script may live at
+# install/windows/deploy.ps1 (repo root two levels up) today, or move again
+# later (e.g. once install/mac, install/linux exist).
+function Find-RepoRoot([string]$startDir) {
+    $dir = $startDir
+    for ($i = 0; $i -lt 5; $i++) {
+        if (Test-Path (Join-Path $dir "SegmentHumanBody\SegmentHumanBody.py")) { return $dir }
+        $parent = Split-Path -Parent $dir
+        if (-not $parent -or $parent -eq $dir) { break }
+        $dir = $parent
+    }
+    return $null
+}
+
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$ParentDir = Split-Path -Parent $ScriptDir
-$AlreadyInCheckout = Test-Path (Join-Path $ParentDir "SegmentHumanBody\SegmentHumanBody.py")
+$DetectedRepoRoot = Find-RepoRoot $ScriptDir
 
 $UseInPlaceCheckout = $false
 if ([string]::IsNullOrWhiteSpace($RepoDir)) {
-    if ($AlreadyInCheckout) {
-        $RepoDir = $ParentDir
+    if ($DetectedRepoRoot) {
+        $RepoDir = $DetectedRepoRoot
         $UseInPlaceCheckout = $true
     } else {
         $RepoDir = Join-Path $ScriptDir "SlicerSegmentHumanBody"
@@ -78,10 +93,12 @@ Write-Step "Looking for a 3D Slicer installation"
 if ([string]::IsNullOrWhiteSpace($SlicerExe)) {
     $candidates = @()
     $candidates += Get-ChildItem -Path $ScriptDir -Filter "Slicer.exe" -Recurse -Depth 2 -ErrorAction SilentlyContinue
-    # Also check one level up: when this script lives at repo_root\deploy\,
-    # a Slicer install placed alongside the repo (repo_root\Slicer\...) is a
-    # sibling of deploy\, not inside it.
-    $candidates += Get-ChildItem -Path $ParentDir -Filter "Slicer.exe" -Recurse -Depth 2 -ErrorAction SilentlyContinue
+    # Also check the repo root: when this script lives at
+    # repo_root\install\windows\, a Slicer install placed alongside the repo
+    # (repo_root\Slicer\...) is nowhere under $ScriptDir.
+    if ($DetectedRepoRoot) {
+        $candidates += Get-ChildItem -Path $DetectedRepoRoot -Filter "Slicer.exe" -Recurse -Depth 2 -ErrorAction SilentlyContinue
+    }
     foreach ($root in @("$env:ProgramFiles", "$env:ProgramFiles(x86)", "$env:LocalAppData\slicer.org", "$env:LocalAppData\NA-MIC")) {
         if (Test-Path $root) {
             $candidates += Get-ChildItem -Path $root -Filter "Slicer.exe" -Recurse -Depth 3 -ErrorAction SilentlyContinue
@@ -203,9 +220,9 @@ if ($WithSuperpixelModels) {
 Write-Step "Writing launcher"
 
 # In standalone mode $ScriptDir IS the top-level project folder -- put it
-# there. In in-place mode $ScriptDir is repo_root\deploy\, one level too
-# deep, so put it at the repo root instead, where it's easy to find.
-$LauncherDir = if ($UseInPlaceCheckout) { $ParentDir } else { $ScriptDir }
+# there. In in-place mode $ScriptDir is repo_root\install\windows\, too deep
+# to be convenient, so put it at the repo root instead, where it's easy to find.
+$LauncherDir = if ($UseInPlaceCheckout) { $DetectedRepoRoot } else { $ScriptDir }
 $LauncherPath = Join-Path $LauncherDir "Run_SegmentHumanBody.bat"
 $launcherContent = "@echo off`r`n`"$SlicerExe`" --additional-module-path `"$ModuleDir`"`r`n"
 Set-Content -Path $LauncherPath -Value $launcherContent -Encoding ASCII
